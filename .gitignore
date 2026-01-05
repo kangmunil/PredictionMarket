@@ -1,0 +1,52 @@
+# --- Security & Secrets ---
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# --- Python & Environments ---
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- Database & Storage (RAG / Local DB) ---
+data/chromadb/
+data/rag_db/
+*.sqlite3
+*.db
+
+# --- Logs & Performance Tracking ---
+logs/
+*.log
+data/sim_trades.csv
+data/trade_history.json
+
+# --- IDE & OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# --- Temporary Files ---
+tmp/
+temp/
+*.tmp
+*.bak
+
+.cluade

@@ -1,0 +1,39 @@
+py-clob-client
+python-dotenv
+web3
+aiohttp
+websockets
+pandas
+numpy
+scikit-learn
+colorama
+requests
+textblob
+rich>=13.0.0
+httpx>=0.24.0
+
+# V2.0: Budget Manager & Rate Limiting
+aioredis==2.0.1
+redis==5.0.1
+
+# V2.0: Statistical Arbitrage & Health Monitoring
+statsmodels>=0.14.0
+scipy>=1.11.0
+python-dateutil>=2.8.0
+
+# V2.0: Agentic RAG System Dependencies
+openai>=1.0.0
+supabase>=2.0.0
+chromadb>=0.4.0
+langchain-openai>=0.1.0
+langchain-core>=0.2.0
+langgraph>=0.1.0
+feedparser>=6.0.0
+
+# V2.1: WebSocket & Pure Arbitrage
+sortedcontainers>=2.4.0
+
+# News Scalping Bot (FinBERT Sentiment Analysis)
+transformers>=4.30.0
+torch>=2.0.0
+sentencepiece>=0.1.99

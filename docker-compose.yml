@@ -1,0 +1,138 @@
+# Docker Compose Configuration (Optional Advanced Setup)
+# =======================================================
+# Use this for production deployment with full isolation
+#
+# Benefits:
+# - Isolated environments for each bot
+# - Easy scaling and resource limits
+# - Automatic restart on failure
+# - Network isolation and security
+#
+# Usage:
+#   docker-compose up -d              # Start all bots
+#   docker-compose logs -f arbhunter  # View specific bot logs
+#   docker-compose stop               # Stop all bots
+#   docker-compose down               # Stop and remove containers
+
+version: '3.8'
+
+services:
+  # ========================================
+  # Bot 1: ArbHunter (High-Frequency)
+  # ========================================
+  arbhunter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polymarket_arbhunter
+    command: python3 run_arbhunter.py
+
+    environment:
+      - PYTHONUNBUFFERED=1
+
+    env_file:
+      - .env
+
+    volumes:
+      - ./logs:/app/logs
+      - ./.env:/app/.env:ro
+
+    restart: unless-stopped
+
+    # Resource limits (prevent memory leaks)
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ========================================
+  # Bot 2: PolyAI (AI Analysis)
+  # ========================================
+  polyai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polymarket_polyai
+    command: python3 run_polyai.py
+
+    environment:
+      - PYTHONUNBUFFERED=1
+
+    env_file:
+      - .env
+
+    volumes:
+      - ./logs:/app/logs
+      - ./.env:/app/.env:ro
+
+    restart: unless-stopped
+
+    # Higher resources for AI
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 1G
+        reservations:
+          cpus: '1.0'
+          memory: 512M
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ========================================
+  # Bot 3: EliteMimic (Copy Trading)
+  # ========================================
+  elitemimic:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polymarket_elitemimic
+    command: python3 run_elitemimic.py
+
+    environment:
+      - PYTHONUNBUFFERED=1
+
+    env_file:
+      - .env
+
+    volumes:
+      - ./logs:/app/logs
+      - ./.env:/app/.env:ro
+
+    restart: unless-stopped
+
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 800M
+        reservations:
+          cpus: '0.75'
+          memory: 400M
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ========================================
+# Shared Network (Optional)
+# ========================================
+networks:
+  default:
+    name: polymarket_network
