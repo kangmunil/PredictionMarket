@@ -4,59 +4,54 @@ import logging
 from typing import List, Dict
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from .memory_manager import MemoryManager
+from .memory_manager import MarketMemory
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("DataSeeder")
 
 class DataSeeder:
-    """
-    Seeds the AI Memory with historical crypto/market events.
-    Crucial for the RAG system to have a baseline for comparison.
-    """
-    
     def __init__(self):
         load_dotenv()
-        self.memory = MemoryManager()
+        self.memory = MarketMemory()
 
-    def seed_initial_crypto_events(self):
-        """Seed hardcoded key events for Bitcoin/Crypto"""
+    def seed_initial_events(self):
+        """Seed hardcoded key events for multiple categories"""
         events = [
+            # Crypto
             {
                 "entity": "Bitcoin",
-                "content": "SEC approves 11 Spot Bitcoin ETFs, marking a historic milestone.",
+                "content": "SEC approves 11 Spot Bitcoin ETFs.",
                 "category": "Crypto",
-                "impact": {"price_change_24h": -0.05, "outcome": "Sell the news", "note": "Price dropped initially due to GBTC outflows"}
-            },
-            {
-                "entity": "Bitcoin",
-                "content": "Tesla purchases $1.5B worth of Bitcoin.",
-                "category": "Crypto",
-                "impact": {"price_change_24h": 0.15, "outcome": "Pump", "note": "Massive rally followed"}
-            },
-            {
-                "entity": "Bitcoin",
-                "content": "China bans cryptocurrency mining and transactions.",
-                "category": "Crypto",
-                "impact": {"price_change_24h": -0.10, "outcome": "Dump", "note": "Short-term panic, long-term recovery"}
-            },
-            {
-                "entity": "Binance",
-                "content": "Binance CEO CZ steps down and pleads guilty to money laundering violations.",
-                "category": "Crypto",
-                "impact": {"price_change_24h": -0.04, "outcome": "Uncertainty", "note": "BNB dropped but market stabilized quickly"}
+                "impact": {"price_change": -0.05, "outcome": "Sell the news"}
             },
             {
                 "entity": "FTX",
-                "content": "FTX files for Chapter 11 bankruptcy protection.",
+                "content": "FTX files for Chapter 11 bankruptcy.",
                 "category": "Crypto",
-                "impact": {"price_change_24h": -0.20, "outcome": "Crash", "note": "Market-wide contagion"}
+                "impact": {"price_change": -0.25, "outcome": "Market Crash"}
+            },
+            # Politics
+            {
+                "entity": "Trump",
+                "content": "Trump wins the Iowa caucus with a landslide.",
+                "category": "Politics",
+                "impact": {"market_move": "Trump tokens up", "outcome": "Bullish for Republican markets"}
+            },
+            # Economics
+            {
+                "entity": "Fed",
+                "content": "Federal Reserve pauses interest rate hikes after 10 consecutive increases.",
+                "category": "Economics",
+                "impact": {"market_move": "Equity markets rally", "outcome": "Dovish Pivot"}
             }
         ]
 
-        logger.info(f"🌱 Seeding {len(events)} initial events...")
-        
+        logger.info(f"🌱 Seeding {len(events)} events...")
+        if not self.memory.enabled:
+            logger.error("❌ Memory system disabled. Check keys.")
+            return
+
         for event in events:
             self.memory.add_memory(
                 category=event["category"],
@@ -64,7 +59,6 @@ class DataSeeder:
                 content=event["content"],
                 impact=event["impact"]
             )
-        
         logger.info("✅ Seeding complete!")
 
 if __name__ == "__main__":

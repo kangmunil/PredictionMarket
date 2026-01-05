@@ -29,14 +29,10 @@ CANDIDATE_PAIRS = [
         "name": "BTC_ETH_Weekly_Correlation",
         "description": "Bitcoin Proxy (MSTR) vs Ethereum Proxy",
         "token_a": {
-            # "MicroStrategy sells any Bitcoin in 2025?"
-            # This is a very active market correlated with BTC price
-            "condition_id": "0x19ee98e348c0ccb341d1b9566fa14521566e9b2ea7aed34dc407a0ec56be36a2", 
+            "condition_id": "0x19ee98e348c0ccb341d1b9566fa14521566e9b2ea7aed34dc407a0ec56be36a2",
             "search_query": "Bitcoin"
         },
         "token_b": {
-            # "Will Ethereum hit $10k in 2025?"
-            # Using a known active ETH market ID
             "condition_id": "0xe6508d867d153a268bdab732aa8abc8cc57e652d28a23aa042da40895bf031b2",
             "search_query": "Ethereum"
         },
@@ -44,6 +40,165 @@ CANDIDATE_PAIRS = [
         "reason": "Strong correlation between major crypto assets",
         "expected_correlation": 0.85,
         "priority": "high"
+    },
+
+    {
+        "name": "BTC_SOL_Correlation",
+        "description": "Bitcoin vs Solana price movement",
+        "token_a": {
+            "condition_id": "",  # Will be dynamically searched
+            "search_query": "Bitcoin 100k"
+        },
+        "token_b": {
+            "condition_id": "",
+            "search_query": "Solana 500"
+        },
+        "category": "crypto",
+        "reason": "BTC and SOL highly correlated altcoin",
+        "expected_correlation": 0.80,
+        "priority": "high"
+    },
+
+    {
+        "name": "ETH_SOL_Altcoin_Pair",
+        "description": "Ethereum vs Solana major altcoins",
+        "token_a": {
+            "condition_id": "",
+            "search_query": "Ethereum 10k"
+        },
+        "token_b": {
+            "condition_id": "",
+            "search_query": "Solana price"
+        },
+        "category": "crypto",
+        "reason": "Leading smart contract platforms",
+        "expected_correlation": 0.75,
+        "priority": "medium"
+    },
+
+    # ========== POLITICAL MARKETS ==========
+    {
+        "name": "Presidential_Senate_Correlation",
+        "description": "Presidential winner vs Senate control",
+        "token_a": {
+            "condition_id": "",
+            "search_query": "Trump win 2024"
+        },
+        "token_b": {
+            "condition_id": "",
+            "search_query": "Republican Senate 2024"
+        },
+        "category": "politics",
+        "reason": "Presidential coattails effect",
+        "expected_correlation": 0.75,
+        "priority": "medium"
+    },
+
+    {
+        "name": "GOP_Control_Both_Chambers",
+        "description": "GOP Senate vs House control",
+        "token_a": {
+            "condition_id": "",
+            "search_query": "Republican Senate majority"
+        },
+        "token_b": {
+            "condition_id": "",
+            "search_query": "Republican House majority"
+        },
+        "category": "politics",
+        "reason": "Unified government correlation",
+        "expected_correlation": 0.70,
+        "priority": "medium"
+    },
+
+    # ========== CRYPTO REGULATION PAIRS ==========
+    {
+        "name": "Crypto_ETF_SEC_Policy",
+        "description": "ETF approval vs SEC crypto policy",
+        "token_a": {
+            "condition_id": "",
+            "search_query": "Bitcoin ETF approval"
+        },
+        "token_b": {
+            "condition_id": "",
+            "search_query": "SEC crypto regulation"
+        },
+        "category": "crypto",
+        "reason": "Regulatory environment correlation",
+        "expected_correlation": 0.65,
+        "priority": "low"
+    },
+
+    # ========== TECH MARKET PAIRS ==========
+    {
+        "name": "AI_Stocks_Tech_Index",
+        "description": "AI stock performance vs tech index",
+        "token_a": {
+            "condition_id": "",
+            "search_query": "Nvidia stock price"
+        },
+        "token_b": {
+            "condition_id": "",
+            "search_query": "QQQ tech index"
+        },
+        "category": "tech",
+        "reason": "AI sector drives tech index",
+        "expected_correlation": 0.70,
+        "priority": "low"
+    },
+
+    # ========== MACRO ECONOMIC PAIRS ==========
+    {
+        "name": "Fed_Rate_Inflation_Link",
+        "description": "Fed rate decisions vs inflation targets",
+        "token_a": {
+            "condition_id": "",
+            "search_query": "Fed rate cut 2025"
+        },
+        "token_b": {
+            "condition_id": "",
+            "search_query": "Inflation below 2%"
+        },
+        "category": "economics",
+        "reason": "Direct monetary policy relationship",
+        "expected_correlation": -0.60,  # Negative correlation
+        "priority": "medium"
+    },
+
+    # ========== SPORTS BETTING PAIRS ==========
+    {
+        "name": "NBA_Championship_Conference",
+        "description": "NBA Champion vs Conference winner",
+        "token_a": {
+            "condition_id": "",
+            "search_query": "Lakers NBA Champion"
+        },
+        "token_b": {
+            "condition_id": "",
+            "search_query": "Western Conference winner"
+        },
+        "category": "sports",
+        "reason": "Must win conference to win championship",
+        "expected_correlation": 0.90,
+        "priority": "low"
+    },
+
+    # ========== ADDITIONAL CRYPTO PAIRS ==========
+    {
+        "name": "XRP_SEC_Lawsuit_Outcome",
+        "description": "XRP price vs SEC lawsuit resolution",
+        "token_a": {
+            "condition_id": "",
+            "search_query": "XRP price 2025"
+        },
+        "token_b": {
+            "condition_id": "",
+            "search_query": "Ripple SEC lawsuit win"
+        },
+        "category": "crypto",
+        "reason": "Direct legal impact on XRP valuation",
+        "expected_correlation": 0.85,
+        "priority": "medium"
     }
 ]
 

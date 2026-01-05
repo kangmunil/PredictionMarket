@@ -47,27 +47,37 @@ class MarketMemory:
             logger.error(f"Embedding error: {e}")
             return []
 
-    def add_memory(self, category: str, entity: str, content: str, impact: Dict, source: str = ""):
-        """Store a new event memory"""
+    def add_experience(self, entity: str, content: str, reasoning: str, impact: Dict, pnl_usd: float):
+        """
+        Store a self-learned experience (Closed-loop learning).
+        Includes the original reasoning and the actual financial outcome.
+        """
         if not self.enabled: return
 
         try:
-            # Create embedding
-            vector = self.get_embedding(f"[{category}/{entity}] {content}")
+            # Create a rich text for embedding that includes the outcome
+            sentiment = "SUCCESSFUL" if pnl_usd > 0 else "FAILED"
+            experience_text = f"[{entity}] Event: {content}. My Reasoning: {reasoning}. Result: {sentiment} with ${pnl_usd:.2f} PnL."
+            
+            vector = self.get_embedding(experience_text)
             
             data = {
-                "category": category,
+                "category": "Experience",
                 "entity": entity,
                 "content": content,
                 "embedding": vector,
-                "market_impact": impact,
-                "source_url": source
+                "market_impact": {
+                    "original_reasoning": reasoning,
+                    "actual_pnl": pnl_usd,
+                    "initial_impact": impact
+                },
+                "source_url": "Self-Learning Loop"
             }
             
             self.supabase.table("market_memories").insert(data).execute()
-            logger.info(f"💾 Memory saved: {entity} - {content[:30]}...")
+            logger.info(f"🧠 Self-Learning: Experience saved for {entity} (${pnl_usd:+.2f} PnL)")
         except Exception as e:
-            logger.error(f"Failed to save memory: {e}")
+            logger.error(f"Failed to save experience: {e}")
 
     def find_similar_events(self, entity: str, query: str, limit: int = 3) -> List[Dict]:
         """Find similar past events using RAG (Vector Search)"""

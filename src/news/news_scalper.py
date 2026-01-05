@@ -151,15 +151,12 @@ class NewsScalperV2:
             return
 
         # Determine token (YES for positive, NO for negative)
-        # Note: MarketMatcher find_matching_markets ensures clobTokenIds exist
         token_ids = market.get("clobTokenIds", [])
         if not token_ids:
-            # Fallback for old market structure
             token_ids = [t['token_id'] for t in market.get('tokens', [])]
         
         if not token_ids: return
 
-        # Exact Yes/No mapping (V3.2 logic)
         outcomes = market.get('outcomes', [])
         if isinstance(outcomes, str): 
             try: outcomes = json.loads(outcomes)
@@ -174,59 +171,65 @@ class NewsScalperV2:
         target_token = yes_token if sentiment["label"] == "positive" else no_token
         if not target_token: return
 
-        # Calculate Size
         size = self.position_size_usd
         if is_high_impact: size *= 1.5
 
         logger.info(f"   💰 Bet: ${size:.2f} on {'YES' if target_token == yes_token else 'NO'}")
 
+        # --- Self-Learning: Store context for later ---
+        pos_info = {
+            "token_id": target_token,
+            "question": market["question"],
+            "side": "YES" if target_token == yes_token else "NO",
+            "size_usd": size,
+            "entry_time": time.time(),
+            "is_high_impact": is_high_impact,
+            "news_title": news.get("title", ""),
+            "ai_reasoning": sentiment.get("reasoning", "Strong news sentiment detected.") # Future-proof
+        }
+
         if self.dry_run:
-            # PAPER TRADING
-            self.active_positions[target_token] = {
-                "token_id": target_token,
-                "question": market["question"],
-                "side": "YES" if target_token == yes_token else "NO",
-                "size_usd": size,
-                "entry_price": 0.5, # Sim
-                "entry_time": time.time(),
-                "is_high_impact": is_high_impact,
-                "news_title": news["title"]
-            }
+            self.active_positions[target_token] = pos_info
             self.stats["trades"] += 1
             logger.info(f"   ✅ [DRY RUN] Position opened for {market['question'][:40]}")
         else:
-            # LIVE EXECUTION
-            # Fetch current price from orderbook if available, else limit cap at 0.99
-            # For news scalping, we often use Market orders to ensure fill
             resp = await self.clob_client.place_batch_market_orders([{
-                'token_id': target_token,
-                'side': 'BUY',
-                'shares': size / 0.5, # Rough share calc
-                'price': 0.99 # Cap
+                'token_id': target_token, 'side': 'BUY', 'shares': size / 0.5, 'price': 0.99
             }])
             if resp:
-                self.active_positions[target_token] = {
-                    "token_id": target_token,
-                    "size_usd": size,
-                    "entry_time": time.time(),
-                    "is_high_impact": is_high_impact
-                }
+                self.active_positions[target_token] = pos_info
                 self.stats["trades"] += 1
 
     async def _monitor_positions_loop(self):
-        """Monitor positions for exit"""
+        """Monitor positions for exit and trigger learning loop"""
         while True:
             await asyncio.sleep(60)
             now = time.time()
             
             for tid, pos in list(self.active_positions.items()):
-                # Exit after X hours
                 age_hours = (now - pos["entry_time"]) / 3600
                 if age_hours >= self.exit_after_hours:
-                    logger.info(f"🚪 Closing News Position (Time Exit): {pos.get('question', tid)}")
-                    # Simulate PnL
-                    profit = pos["size_usd"] * 0.1 # Sim 10% for successful news catch
+                    logger.info(f"🚪 Closing Position: {pos.get('question', tid)}")
+                    
+                    # 1. Calc PnL
+                    profit = pos["size_usd"] * 0.1 # Sim 10%
                     self.stats["pnl"] += Decimal(str(profit))
+                    
+                    # 2. TRIGGER SELF-LEARNING
+                    try:
+                        from src.ai.memory_manager import MarketMemory
+                        mem = MarketMemory()
+                        if mem.enabled:
+                            mem.add_experience(
+                                entity=pos.get("question", "Market"),
+                                content=pos.get("news_title", "News"),
+                                reasoning=pos.get("ai_reasoning", ""),
+                                impact={"exit_reason": "Time-based"},
+                                pnl_usd=float(profit)
+                            )
+                    except Exception as e:
+                        logger.error(f"Failed to trigger learning loop: {e}")
+
                     del self.active_positions[tid]
 
     def _print_stats(self):

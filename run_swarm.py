@@ -96,6 +96,19 @@ class SwarmSystem:
             budget_manager=self.budget_manager
         )
 
+        # Load pairs from config
+        from src.strategies.stat_arb_config import CANDIDATE_PAIRS
+        for pair in CANDIDATE_PAIRS:
+            # Only add pairs with valid condition_ids (skip empty ones for now)
+            if pair["token_a"]["condition_id"] and pair["token_b"]["condition_id"]:
+                self.stat_arb_agent.add_pair(
+                    condition_id_a=pair["token_a"]["condition_id"],
+                    condition_id_b=pair["token_b"]["condition_id"],
+                    pair_name=pair["name"],
+                    category=pair["category"]
+                )
+        logger.info(f"✅ Loaded StatArb pairs (filtered for valid condition_ids)")
+
         # 3. Elite Mimic
         self.mimic_agent = EliteMimicAgent(
             client=self.client,

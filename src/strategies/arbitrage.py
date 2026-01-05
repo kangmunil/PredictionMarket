@@ -41,28 +41,60 @@ class ArbitrageStrategy:
         while self.is_running:
             await asyncio.sleep(1) # 루프 유지
 
+    def _is_crypto_15min_market(self, market: dict) -> bool:
+        """Check if market is a crypto 15-minute market"""
+        question = market.get('question', '').lower()
+        description = market.get('description', '').lower()
+        combined = f"{question} {description}"
+
+        # Crypto asset filter
+        crypto_keywords = ['btc', 'bitcoin', 'eth', 'ethereum', 'sol', 'solana', 'xrp', 'ripple']
+        has_crypto = any(k in combined for k in crypto_keywords)
+
+        # 15-minute timeframe filter (positive context only)
+        timeframe_keywords = ['15 min', '15min', 'fifteen minute', '15-minute', 'next 15', 'in 15']
+
+        # Exclude if it mentions longer timeframes
+        exclude_keywords = ['daily', 'hourly', '1 hour', '24 hour', 'weekly', 'monthly', 'not 15']
+        has_exclude = any(k in combined for k in exclude_keywords)
+
+        is_15min = any(k in combined for k in timeframe_keywords) and not has_exclude
+
+        return has_crypto and is_15min
+
     async def _market_update_loop(self):
-        """15분마다 생성되는 새로운 마켓을 자동으로 탐색하여 구독"""
+        """15분마다 생성되는 새로운 크립토 마켓을 자동으로 탐색하여 구독"""
         while self.is_running:
             try:
                 if self.gamma_client:
-                    markets = await self.gamma_client.get_active_markets(limit=30, volume_min=2000)
+                    # Lower volume threshold to $100 for 15min markets (high frequency)
+                    markets = await self.gamma_client.get_active_markets(limit=50, volume_min=100)
                     new_assets = []
-                    
+                    filtered_count = 0
+
                     for m in markets:
+                        # Apply crypto 15min filter
+                        if not self._is_crypto_15min_market(m):
+                            filtered_count += 1
+                            continue
+
                         tokens = m.get('tokens', [])
                         if len(tokens) == 2:
                             y_id = next(t['token_id'] for t in tokens if t['outcome'].lower() == 'yes')
                             n_id = next(t['token_id'] for t in tokens if t['outcome'].lower() == 'no')
-                            
+
                             self.market_map[y_id] = n_id
                             self.market_map[n_id] = y_id
-                            
+
                             if y_id not in self.subscribed_ids:
                                 new_assets.extend([y_id, n_id])
                                 self.subscribed_ids.update([y_id, n_id])
                     
+                    if filtered_count > 0:
+                        logger.info(f"🔍 ArbHunter: Filtered out {filtered_count} non-crypto-15min markets")
+
                     if new_assets:
+                        logger.info(f"🎯 ArbHunter: Found {len(new_assets)//2} new crypto 15min markets")
                         logger.info(f"🆕 ArbHunter: Subscribing to {len(new_assets)//2} new market pairs")
                         self.client.subscribe('book', self.on_book_update)
                         await self.client.start_ws(list(self.subscribed_ids))

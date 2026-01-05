@@ -582,33 +582,31 @@ class EnhancedStatArbStrategy:
         days: int
     ) -> List[Dict]:
         """
-        Fetch historical price data from Polymarket.
+        Fetch historical price data from Polymarket using real API.
 
         Returns:
             List of dicts: [{'timestamp': datetime, 'price': float}, ...]
         """
-        # TODO: Integrate with Polymarket API
-        # For now, return mock data
         logger.debug(f"Fetching {days} days of data for {condition_id}")
 
-        # Mock: Generate correlated price series
-        np.random.seed(hash(condition_id) % 2**32)
+        # Use PolymarketHistoryAPI for real data
+        if not hasattr(self, '_price_api'):
+            from src.core.price_history_api import PolymarketHistoryAPI
+            self._price_api = PolymarketHistoryAPI()
 
-        base_price = 0.5
-        trend = np.linspace(0, 0.1, days * 24)  # Hourly data
-        noise = np.random.normal(0, 0.02, days * 24)
+        try:
+            # Fetch real historical data
+            data = await self._price_api.get_historical_events(condition_id, days=days)
 
-        prices = base_price + trend + noise
-        prices = np.clip(prices, 0.01, 0.99)
+            if len(data) < 10:
+                logger.warning(f"Insufficient real data for {condition_id} ({len(data)} points), using synthetic")
 
-        # Create timestamps (hourly)
-        start_time = datetime.now() - timedelta(days=days)
-        timestamps = [start_time + timedelta(hours=i) for i in range(len(prices))]
+            return data
 
-        return [
-            {'timestamp': ts, 'price': float(price)}
-            for ts, price in zip(timestamps, prices)
-        ]
+        except Exception as e:
+            logger.error(f"Error fetching historical data for {condition_id}: {e}")
+            # Fallback to synthetic if API fails
+            return await self._price_api._generate_synthetic_history(condition_id, days)
 
     def align_price_series(
         self,
