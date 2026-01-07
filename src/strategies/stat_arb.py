@@ -14,23 +14,65 @@ class StatArbStrategy:
     Target: Correlated markets (Pairs Trading).
     Logic: Trade Mean Reversion when spread Z-Score exceeds threshold (e.g., > 2.0).
     """
-    def __init__(self, client: PolyClient):
+    def __init__(self, client: PolyClient, gamma_client=None):
         self.client = client
+        self.gamma_client = gamma_client
         self.lookback_window = 24  # Look back 24 periods (e.g., hours)
         self.z_threshold = 2.0     # Trigger trade if divergence is > 2 sigma
         self.stop_loss_z = 4.0     # Close trade if divergence blows up
         
-        # Define Correlated Pairs to Monitor
-        # Structure: (Asset A Token ID, Asset B Token ID, Pair Name)
+        # Initial pairs (Real IDs found earlier as baseline)
         self.pairs = [
-            ("token_btc_yes", "token_eth_yes", "BTC/ETH Trend"),
-            ("token_gop_senate", "token_trump_pres", "GOP/Trump Correlation")
+            (
+                "0x19ee98e348c0ccb341d1b9566fa14521566e9b2ea7aed34dc407a0ec56be36a2", 
+                "0xe6508d867d153a268bdab732aa8abc8cc57e652d28a23aa042da40895bf031b2", 
+                "BTC/ETH Correlation (Static)"
+            )
         ]
         
         self.active_positions = {}
 
+    async def resolve_pairs(self):
+        """Dynamically find correlated market IDs using Gamma API"""
+        if not self.gamma_client:
+            return
+
+        logger.info("🔍 StatArb: Resolving dynamic market pairs...")
+        new_pairs = []
+        
+        try:
+            # 1. Search for Bitcoin market
+            btc_markets = await self.gamma_client.search_markets("Bitcoin price")
+            # 2. Search for Ethereum or SOL market
+            eth_markets = await self.gamma_client.search_markets("Ethereum price")
+            
+            if btc_markets and eth_markets:
+                # Extract first valid token ID (YES token is usually index 0)
+                btc_id = json.loads(btc_markets[0]['clobTokenIds'])[0] if isinstance(btc_markets[0]['clobTokenIds'], str) else btc_markets[0]['clobTokenIds'][0]
+                eth_id = json.loads(eth_markets[0]['clobTokenIds'])[0] if isinstance(eth_markets[0]['clobTokenIds'], str) else eth_markets[0]['clobTokenIds'][0]
+                
+                new_pairs.append((btc_id, eth_id, f"BTC/ETH ({btc_markets[0]['slug'][:10]})"))
+                logger.info(f"   ✅ Linked: {btc_markets[0]['question'][:30]}... <-> {eth_markets[0]['question'][:30]}...")
+
+            # 3. Search for Trump/Politics correlation
+            trump_markets = await self.gamma_client.search_markets("Trump Fed Chair")
+            if btc_markets and trump_markets:
+                trump_id = json.loads(trump_markets[0]['clobTokenIds'])[0] if isinstance(trump_markets[0]['clobTokenIds'], str) else trump_markets[0]['clobTokenIds'][0]
+                # Reuse btc_id from above
+                new_pairs.append((btc_id, trump_id, "BTC/Trump Correlation"))
+                logger.info(f"   ✅ Linked: Bitcoin <-> {trump_markets[0]['question'][:30]}...")
+
+            if new_pairs:
+                self.pairs = new_pairs
+                logger.info(f"🚀 StatArb: Successfully resolved {len(self.pairs)} dynamic pairs")
+        except Exception as e:
+            logger.error(f"❌ StatArb Pair Resolution Failed: {e}")
+
     async def run(self):
         logger.info("🛡️ Stat Arb Shield Activated. Monitoring market correlations...")
+        
+        # Resolve IDs at startup
+        await self.resolve_pairs()
         
         while True:
             try:

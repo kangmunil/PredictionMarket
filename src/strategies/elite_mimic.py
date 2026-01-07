@@ -43,8 +43,6 @@ class EliteMimicAgent:
             agent=self,
             config=self.config
         )
-        self.arb_engine = ArbitrageStrategy(client)
-        self.stat_arb_engine = StatArbStrategy(client)
         
         self.mimic_logs: List[Dict] = []
 
@@ -55,15 +53,9 @@ class EliteMimicAgent:
         # Keywords to monitor for News Scalper
         monitor_keywords = ["bitcoin", "ethereum", "trump", "crypto", "polymarket"]
         
-        # Run all components concurrently
-        # 1. News Scalper (Only in Standalone Mode)
-        # 2. Wallet Watcher (Copy Trading)
-        # 3. Arbitrage & Stat Arb (Hedged)
-        
+        # Run components concurrently
         tasks = [
-            asyncio.create_task(self.wallet_watcher.run()),
-            asyncio.create_task(self.stat_arb_engine.run()),
-            asyncio.create_task(self.arb_engine.run())
+            asyncio.create_task(self.wallet_watcher.run())
         ]
         
         # Only run local brain if not in swarm mode

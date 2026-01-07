@@ -19,6 +19,7 @@ class TelegramNotifier:
         self.base_url = f"https://api.telegram.org/bot{token}" if self.enabled else ""
         self.last_update_id = 0
         self.commands: Dict[str, Callable] = {}
+        self._poll_error_streak = 0
         
         if self.enabled:
             logger.info("📱 Telegram Notifier V2 Enabled")
@@ -45,17 +46,27 @@ class TelegramNotifier:
                         params={"offset": self.last_update_id + 1, "timeout": 30},
                         timeout=35
                     )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        for update in data.get("result", []):
-                            self.last_update_id = update["update_id"]
-                            # Handle both text messages and button callbacks
-                            if "message" in update:
-                                await self._handle_message(update["message"])
-                            elif "callback_query" in update:
-                                await self._handle_callback(update["callback_query"])
+                if resp.status_code != 200:
+                    self._poll_error_streak += 1
+                    preview = resp.text[:200] if hasattr(resp, "text") else ""
+                    logger.error(f"Telegram polling HTTP {resp.status_code}: {preview}")
+                    await asyncio.sleep(min(30, 1 + self._poll_error_streak * 2))
+                    continue
+
+                self._poll_error_streak = 0
+                data = resp.json()
+                for update in data.get("result", []):
+                    self.last_update_id = update["update_id"]
+                    # Handle both text messages and button callbacks
+                    if "message" in update:
+                        await self._handle_message(update["message"])
+                    elif "callback_query" in update:
+                        await self._handle_callback(update["callback_query"])
             except Exception as e:
-                logger.error(f"Telegram polling error: {e}")
+                self._poll_error_streak += 1
+                logger.error(f"Telegram polling error ({type(e).__name__}): {e!r}", exc_info=True)
+                await asyncio.sleep(min(30, 1 + self._poll_error_streak * 2))
+                continue
             await asyncio.sleep(1)
 
     async def _handle_message(self, message: Dict):

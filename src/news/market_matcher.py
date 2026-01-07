@@ -21,6 +21,13 @@ from difflib import SequenceMatcher
 import requests
 import asyncio
 import json
+import os
+
+from src.core.polymarket_mcp_client import (
+    get_default_mcp_client,
+    PolymarketMCPClient,
+)
+from src.core.market_registry import market_registry
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +73,17 @@ class MarketMatcher:
         ]
     }
 
-    def __init__(self, gamma_api_url: str = "https://gamma-api.polymarket.com"):
+    def __init__(
+        self,
+        gamma_api_url: str = "https://gamma-api.polymarket.com",
+        use_mcp: Optional[bool] = None,
+    ):
         self.gamma_api_url = gamma_api_url
         self.cache = {}  # Cache market searches
+        if use_mcp is None:
+            use_mcp = bool(os.getenv("POLYMARKET_MCP_URL"))
+        self._mcp_enabled = use_mcp
+        self._mcp_client: Optional[PolymarketMCPClient] = None
 
     def extract_entities(self, text: str) -> Dict[str, List[str]]:
         """
@@ -144,6 +159,8 @@ class MarketMatcher:
 
         # Search markets
         markets = await self._search_markets(keywords, min_volume)
+        for market in markets:
+            market_registry.register_market(market)
 
         # Score and rank
         scored_markets = []
@@ -190,47 +207,102 @@ class MarketMatcher:
             if kw_l in self.TOPIC_MAPPING:
                 search_queries.update(self.TOPIC_MAPPING[kw_l])
 
+        if await self._maybe_init_mcp():
+            markets = await self._search_markets_via_mcp(search_queries, min_volume)
+            if markets is not None:
+                return markets
+
+        return await self._search_markets_via_gamma(search_queries, min_volume)
+
+    async def _maybe_init_mcp(self) -> bool:
+        if not self._mcp_enabled:
+            return False
+        if self._mcp_client:
+            return True
+        try:
+            self._mcp_client = await get_default_mcp_client()
+        except Exception as exc:
+            logger.error("MarketMatcher MCP init failed: %s", exc)
+            self._mcp_enabled = False
+            return False
+        if not self._mcp_client:
+            self._mcp_enabled = False
+            return False
+        return True
+
+    async def _search_markets_via_gamma(self, search_queries: set, min_volume: float) -> List[Dict]:
         url = f"{self.gamma_api_url}/markets"
-        
+
         async def fetch_query(q):
-            params = {"active": "true", "closed": "false", "limit": 50, "query": q}
-            
-            # 🎯 Add Crypto Tag Filter (1002) for Crypto keywords to reduce noise
-            crypto_keywords = [kw.lower() for kw in self.ENTITY_PATTERNS['crypto']]
-            if any(ck in q.lower() for ck in crypto_keywords):
-                params["tag_id"] = 1002 # Crypto Tag
-                logger.debug(f"🎯 Applying Crypto Tag ID filter for query: {q}")
-                
+            params = {"active": "true", "closed": "false", "limit": 100, "query": q}
             try:
                 loop = asyncio.get_event_loop()
                 resp = await loop.run_in_executor(None, lambda: requests.get(url, params=params, timeout=10))
                 return resp.json() if resp.status_code == 200 else []
-            except: return []
+            except Exception:
+                return []
 
-        # Run parallel searches for the most important queries
         tasks = [fetch_query(q) for q in list(search_queries)[:5]]
         results = await asyncio.gather(*tasks)
 
         unique_markets = {}
         for market_list in results:
-            if isinstance(market_list, dict): market_list = market_list.get("data", [])
-            for market in market_list:
+            if isinstance(market_list, dict):
+                market_list = market_list.get("data", [])
+            for market in market_list or []:
                 m_id = market.get("condition_id") or market.get("id")
-                if not m_id or m_id in unique_markets: continue
-                
-                # SUPER RELAXED: Accept almost anything that looks like a binary market
+                if not m_id or m_id in unique_markets:
+                    continue
                 try:
-                    # check for tokens
                     clob_ids = market.get("clobTokenIds", [])
-                    if isinstance(clob_ids, str): clob_ids = json.loads(clob_ids)
-                    
+                    if isinstance(clob_ids, str):
+                        clob_ids = json.loads(clob_ids)
                     standard_tokens = market.get("tokens", [])
-                    
                     if (clob_ids and len(clob_ids) >= 2) or (len(standard_tokens) >= 2):
                         unique_markets[m_id] = market
-                except: continue
+                except Exception:
+                    continue
 
-        logger.debug(f"💎 Total unique market candidates: {len(unique_markets)}")
+        logger.debug("💎 Total unique market candidates: %d", len(unique_markets))
+        return list(unique_markets.values())
+
+    async def _search_markets_via_mcp(self, queries: set, min_volume: float) -> Optional[List[Dict]]:
+        assert self._mcp_client
+        tasks = []
+        for q in list(queries)[:5]:
+            tasks.append(self._mcp_client.search_markets(query=q, limit=50, closed=False))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        unique_markets: Dict[str, Dict] = {}
+        for result in results:
+            if isinstance(result, Exception):
+                logger.error("MCP search error: %s", result)
+                continue
+            markets = result
+            if isinstance(result, dict):
+                markets = result.get("markets", [])
+
+            for market in markets or []:
+                m_id = market.get("condition_id") or market.get("id")
+                if not m_id or m_id in unique_markets:
+                    continue
+                try:
+                    volume = float(market.get("volume", 0))
+                except (TypeError, ValueError):
+                    volume = 0
+                if volume < min_volume:
+                    continue
+                unique_markets[m_id] = market
+                market_registry.register_market(market)
+                market_registry.register_market(market)
+
+        if not unique_markets:
+            self._mcp_enabled = False
+            logger.warning("MCP returned no candidates, reverting to Gamma API")
+            return None
+
+        logger.debug("💎 MCP supplied %d unique market candidates", len(unique_markets))
         return list(unique_markets.values())
 
     def _calculate_relevance_score(

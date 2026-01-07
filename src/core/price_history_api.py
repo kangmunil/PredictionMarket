@@ -7,18 +7,35 @@ import aiohttp
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import logging
+import os
+
+from src.core.polymarket_mcp_client import (
+    get_default_mcp_client,
+    PolymarketMCPClient,
+)
+from src.core.market_registry import market_registry
 
 logger = logging.getLogger(__name__)
 
 
 class PolymarketHistoryAPI:
     """
-    Fetch historical market prices from Polymarket Gamma API
+    Fetch historical market prices from Polymarket Gamma API or MCP
     """
 
-    def __init__(self, gamma_url: str = "https://gamma-api.polymarket.com"):
+    def __init__(
+        self,
+        gamma_url: str = "https://gamma-api.polymarket.com",
+        use_mcp: Optional[bool] = None,
+    ):
         self.gamma_url = gamma_url
         self.session: Optional[aiohttp.ClientSession] = None
+        if use_mcp is None:
+            use_mcp = bool(os.getenv("POLYMARKET_MCP_URL"))
+        self._mcp_enabled = use_mcp
+        self._mcp_client: Optional[PolymarketMCPClient] = None
+        self._trade_cache: Dict[str, Dict] = {}
+        self._cache_ttl = timedelta(minutes=5)
 
     async def _ensure_session(self):
         """Ensure aiohttp session is created"""
@@ -29,6 +46,23 @@ class PolymarketHistoryAPI:
         """Close the session"""
         if self.session and not self.session.closed:
             await self.session.close()
+        self.session = None
+
+    async def _maybe_init_mcp(self) -> bool:
+        if not self._mcp_enabled:
+            return False
+        if self._mcp_client:
+            return True
+        try:
+            self._mcp_client = await get_default_mcp_client()
+        except Exception as exc:
+            logger.error("Failed to initialize Polymarket MCP client: %s", exc)
+            self._mcp_enabled = False
+            return False
+        if not self._mcp_client:
+            self._mcp_enabled = False
+            return False
+        return True
 
     async def get_market_prices(
         self,
@@ -51,39 +85,21 @@ class PolymarketHistoryAPI:
         """
         await self._ensure_session()
 
-        # Gamma API endpoint for market data
-        url = f"{self.gamma_url}/markets/{condition_id}"
-
-        try:
-            async with self.session.get(url, timeout=10) as response:
-                if response.status != 200:
-                    logger.error(f"Failed to fetch market {condition_id}: HTTP {response.status}")
-                    return []
-
-                data = await response.json()
-
-                # Extract current price as single data point
-                # Note: Gamma API doesn't provide full historical data
-                # We'll need to use events/trades endpoint for history
-                current_price = self._extract_current_price(data)
-
-                if current_price is None:
-                    logger.warning(f"No price found for market {condition_id}")
-                    return []
-
-                # For now, return single current price point
-                # TODO: Implement proper historical data from events endpoint
-                return [{
-                    'timestamp': datetime.now(),
-                    'price': current_price
-                }]
-
-        except asyncio.TimeoutError:
-            logger.error(f"Timeout fetching market {condition_id}")
+        data = await self._fetch_market_snapshot(condition_id)
+        if not data:
             return []
-        except Exception as e:
-            logger.error(f"Error fetching market {condition_id}: {e}")
+
+        current_price = self._extract_current_price(data)
+        market_registry.register_market(data)
+
+        if current_price is None:
+            logger.warning(f"No price found for market {condition_id}")
             return []
+
+        return [{
+            'timestamp': datetime.now(),
+            'price': current_price
+        }]
 
     async def get_historical_events(
         self,
@@ -106,7 +122,53 @@ class PolymarketHistoryAPI:
         end_time = datetime.now()
         start_time = end_time - timedelta(days=days)
 
-        # Gamma API events endpoint
+        # Prefer MCP trade history when available
+        mcp_points = await self._fetch_trades_via_mcp(condition_id, days, start_time)
+        if mcp_points:
+            return mcp_points
+
+        events = await self._fetch_events_from_gamma(condition_id, start_time, end_time)
+        if not events:
+            return self._generate_synthetic_history(condition_id, days)
+
+        # Parse events into price points
+        price_points = self._parse_events_to_prices(events)
+
+        if len(price_points) < 10:
+            logger.warning(f"Insufficient event data for {condition_id}, using synthetic")
+            return self._generate_synthetic_history(condition_id, days)
+
+        logger.info(f"Fetched {len(price_points)} price points for {condition_id}")
+        return price_points
+
+    async def _fetch_market_snapshot(self, condition_id: str) -> Optional[Dict]:
+        await self._ensure_session()
+        if not self.session:
+            return None
+
+        url = f"{self.gamma_url}/markets/{condition_id}"
+        try:
+            async with self.session.get(url, timeout=10) as response:
+                if response.status != 200:
+                    logger.error(f"Failed to fetch market {condition_id}: HTTP {response.status}")
+                    return None
+                return await response.json()
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout fetching market {condition_id}")
+        except Exception as exc:
+            logger.error(f"Error fetching market {condition_id}: {exc}")
+        return None
+
+    async def _fetch_events_from_gamma(
+        self,
+        condition_id: str,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> Optional[List[Dict]]:
+        await self._ensure_session()
+        if not self.session:
+            return None
+
         url = f"{self.gamma_url}/events"
         params = {
             'market': condition_id,
@@ -119,26 +181,84 @@ class PolymarketHistoryAPI:
             async with self.session.get(url, params=params, timeout=15) as response:
                 if response.status != 200:
                     logger.error(f"Failed to fetch events for {condition_id}: HTTP {response.status}")
-                    return self._generate_synthetic_history(condition_id, days)
-
-                events = await response.json()
-
-                # Parse events into price points
-                price_points = self._parse_events_to_prices(events)
-
-                if len(price_points) < 10:
-                    logger.warning(f"Insufficient event data for {condition_id}, using synthetic")
-                    return self._generate_synthetic_history(condition_id, days)
-
-                logger.info(f"Fetched {len(price_points)} price points for {condition_id}")
-                return price_points
-
+                    return None
+                return await response.json()
         except asyncio.TimeoutError:
             logger.error(f"Timeout fetching events for {condition_id}")
-            return self._generate_synthetic_history(condition_id, days)
-        except Exception as e:
-            logger.error(f"Error fetching events for {condition_id}: {e}")
-            return self._generate_synthetic_history(condition_id, days)
+        except Exception as exc:
+            logger.error(f"Error fetching events for {condition_id}: {exc}")
+        return None
+
+    async def _fetch_trades_via_mcp(
+        self,
+        condition_id: str,
+        days: int,
+        start_time: datetime,
+    ) -> List[Dict]:
+        if not await self._maybe_init_mcp():
+            return []
+
+        cache_key = f"{condition_id}:{days}"
+        cached = self._trade_cache.get(cache_key)
+        if cached and datetime.now() - cached["ts"] < self._cache_ttl:
+            return cached["data"]
+
+        assert self._mcp_client is not None
+        try:
+            result = await self._mcp_client.get_trades(market_id=condition_id, limit=1000)
+        except Exception as exc:
+            logger.error(f"MCP trade fetch failed for {condition_id}: {exc}")
+            self._mcp_enabled = False
+            return []
+
+        trades = result.get("trades") if isinstance(result, dict) else result
+        if not trades:
+            return []
+
+        earliest_time = start_time
+        price_points = []
+
+        for trade in trades:
+            price = trade.get("price")
+            if price is None:
+                continue
+
+            try:
+                price = float(price)
+            except (ValueError, TypeError):
+                continue
+
+            ts_raw = trade.get("timestamp") or trade.get("created_at") or trade.get("filledAt")
+            timestamp = self._parse_timestamp(ts_raw)
+            if not timestamp or timestamp < earliest_time:
+                continue
+
+            price_points.append({"timestamp": timestamp, "price": price})
+
+        price_points.sort(key=lambda x: x["timestamp"])
+
+        if price_points:
+            self._trade_cache[cache_key] = {
+                "ts": datetime.now(),
+                "data": price_points,
+            }
+
+        return price_points
+
+    def _parse_timestamp(self, raw_value) -> Optional[datetime]:
+        if raw_value is None:
+            return None
+        if isinstance(raw_value, (int, float)):
+            return datetime.fromtimestamp(float(raw_value))
+        if isinstance(raw_value, str):
+            try:
+                # strip Z if present
+                if raw_value.endswith("Z"):
+                    raw_value = raw_value[:-1]
+                return datetime.fromisoformat(raw_value)
+            except ValueError:
+                return None
+        return None
 
     def _extract_current_price(self, market_data: Dict) -> Optional[float]:
         """Extract current price from market data"""

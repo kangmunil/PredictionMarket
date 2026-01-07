@@ -288,7 +288,7 @@ class SwarmSystem:
 
             # 모든 에이전트를 동일한 루프에서 동시에 실행
             self.tasks = [
-                asyncio.create_task(self.news_agent.run(keywords=keywords, check_interval=900), name="NewsScalper"),
+                asyncio.create_task(self.news_agent.run(keywords=keywords, check_interval=20), name="NewsScalper"),
                 asyncio.create_task(self.stat_arb_agent.run(), name="StatArb"),
                 asyncio.create_task(self.mimic_agent.run(), name="EliteMimic"),
                 asyncio.create_task(self.arb_agent.run(), name="PureArb"),

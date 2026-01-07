@@ -19,6 +19,7 @@ import asyncio
 import logging
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
+from decimal import Decimal
 import time
 from collections import defaultdict
 import os
@@ -29,6 +30,8 @@ from .news_aggregator import NewsAggregator
 from .sentiment_analyzer import SentimentAnalyzer
 from .market_matcher import MarketMatcher
 from src.core.risk_manager import RiskManager
+from src.core.decision_logger import DecisionLogger
+from src.core.allocation_manager import AllocationManager
 
 # RAG System (Advanced AI Analysis)
 try:
@@ -76,6 +79,14 @@ class OptimizedNewsScalper:
         self.swarm_system = swarm_system # 🐝 Reference to Orchestrator
         if self.signal_bus:
             logger.info("🧠 Connected to SignalBus (Hive Mind)")
+
+        self.balance_allocator: Optional[AllocationManager] = None
+        if os.getenv("ENABLE_BALANCE_ALLOCATOR", "false").lower() in ("1", "true", "yes", "on"):
+            try:
+                self.balance_allocator = AllocationManager()
+                logger.info("💰 Balance-aware allocator enabled")
+            except Exception as exc:
+                logger.warning(f"⚠️ Could not enable balance allocator: {exc}")
         
         # Real-time Stream Client
         self.stream_client = TreeNewsStreamClient(api_key=tree_news_api_key)
@@ -87,6 +98,11 @@ class OptimizedNewsScalper:
         
         # Initialize Risk Manager
         self.risk_manager = RiskManager()
+        
+        # Initialize Decision Logger
+        notifier = self.swarm_system.notifier if self.swarm_system else None
+        self.decision_logger = DecisionLogger("NewsScalper", notifier=notifier)
+        
         logger.info("🛡️ Risk Manager Initialized (Dynamic Kelly Sizing)")
 
         if self.use_rag:
@@ -416,7 +432,6 @@ class OptimizedNewsScalper:
                 market_question = best_market.get("question", "")
 
                 # Get current price from market
-                from decimal import Decimal
                 try:
                     outcome_prices = json.loads(best_market.get("outcomePrices", "[]")) if isinstance(best_market.get("outcomePrices"), str) else best_market.get("outcomePrices", [])
                     if outcome_prices and len(outcome_prices) > 0:
@@ -596,22 +611,31 @@ class OptimizedNewsScalper:
         is_high_impact: bool
     ):
         """Execute trade with improved token ID extraction"""
-        try:
-            label = sentiment["label"]
-            market_question = market.get("question", "Unknown Market")
+        market_question = market.get('question', '')
+        logger.info(f"🚀 [SCALPER] Entering _execute_trade for '{market_question[:30]}...'")
+        
+        allocation_id: Optional[str] = None
+        allocation_amount: Optional[Decimal] = None
+        position_opened = False
 
-            if label == "positive":
+        try:
+            # 🚀 유연한 레이블 처리 (AI 출력값 대응)
+            raw_label = str(sentiment.get("label", "")).lower()
+            logger.info(f"   🔍 Analyzing Signal Label: '{raw_label}'")
+            
+            if raw_label in ["positive", "buy"]:
                 side = "BUY"
-            elif label == "negative":
+            elif raw_label in ["negative", "sell"]:
                 side = "SELL"
             else:
+                logger.info(f"   ⏭️  Skipping: Label '{raw_label}' is not actionable (HOLD)")
                 return
 
             # Robust Token ID extraction (matching market_matcher.py logic)
             token_id = None
             clob_ids_raw = market.get("clobTokenIds", [])
             
-            if isinstance(clob_ids_raw, str):
+            if isinstance(clob_ids_raw, str) and clob_ids_raw:
                 try:
                     import json
                     clob_ids = json.loads(clob_ids_raw)
@@ -620,14 +644,18 @@ class OptimizedNewsScalper:
             elif isinstance(clob_ids_raw, list) and clob_ids_raw:
                 token_id = clob_ids_raw[0]
 
-            # Fallback to tokens list
+            # Fallback: Condition ID를 Token ID로 변환 시도
             if not token_id:
-                tokens = market.get("tokens", [])
-                if tokens: token_id = tokens[0].get("token_id")
+                cid = market.get("condition_id") or market.get("id")
+                if cid:
+                    logger.debug(f"   🔍 Token ID missing, attempting to resolve from CID: {cid[:10]}")
+                    token_id = self.clob_client.get_yes_token_id(cid)
 
             if not token_id:
-                logger.warning(f"   ⚠️  Market '{market_question[:30]}...' has no valid token IDs")
+                logger.warning(f"   ⚠️  [EXECUTION ABORTED] Could not extract valid Token ID for: {market_question[:30]}...")
                 return
+
+            logger.info(f"   ✅ Target Token Resolved: {token_id[:15]}...")
 
             # 🛡️ DYNAMIC POSITION SIZING (Kelly Criterion)
             current_price = await self._get_current_price(token_id)
@@ -644,12 +672,22 @@ class OptimizedNewsScalper:
                 logger.info(f"   🛑 [RISK REJECTED] Size: ${position_size:.2f} | Reason: Low EV (Prob {sentiment['score']:.2f} vs Price {current_price:.2f}) or Volatility Penalty")
                 return
 
+            if self.balance_allocator:
+                adjusted_size = await self.balance_allocator.allocate_for_market(
+                    token_id,
+                    position_size
+                )
+                if adjusted_size <= 0:
+                    logger.info("   ⚠️ Allocation manager rejected trade for insufficient budget")
+                    return
+                position_size = adjusted_size
+
             # 💰 BUDGET ALLOCATION
             if self.budget_manager:
-                from decimal import Decimal
+                allocation_amount = Decimal(str(position_size))
                 allocation_id = await self.budget_manager.request_allocation(
                     strategy="arbhunter",
-                    amount=Decimal(str(position_size)),
+                    amount=allocation_amount,
                     priority="high" if is_high_impact else "normal"
                 )
                 if not allocation_id:
@@ -657,7 +695,20 @@ class OptimizedNewsScalper:
                     return
                 logger.debug(f"   💰 Allocation approved: {allocation_id}")
 
-            logger.info(f"   💰 Trade Signal: {side} ${position_size:.2f} on '{market_question[:40]}...'")
+            # 🧠 Log Decision using centralized logger
+            await self.decision_logger.log_decision(
+                action=side,
+                token=market_question[:40],
+                confidence=sentiment["score"],
+                reason=sentiment.get("reasoning", "High impact news detected"),
+                factors={
+                    "News": article.get("title", "")[:50],
+                    "Price": f"${current_price:.3f}",
+                    "Size": f"${position_size:.2f}",
+                    "Model": sentiment.get("model", "FinBERT"),
+                    "Token ID": token_id
+                }
+            )
 
             if self.dry_run:
                 # PAPER TRADING: Get real entry price
@@ -679,14 +730,25 @@ class OptimizedNewsScalper:
                     "sentiment": sentiment,
                     "article": article,
                     "is_high_impact": is_high_impact,
-                    "allocation_id": allocation_id if 'allocation_id' in locals() else None
+                    "allocation_id": allocation_id,
+                    "allocation_amount": allocation_amount
                 }
                 self.stats["trades_executed"] += 1
                 self.stats["positions_opened"] += 1
+                position_opened = True
 
                 # 🐝 HIVE MIND HISTORY: Report to orchestrator
                 if self.swarm_system:
                     self.swarm_system.add_trade_record(side, token_id, entry_price, position_size)
+                    # 🚀 PnL Tracker 기록 추가
+                    if hasattr(self.swarm_system, 'pnl_tracker'):
+                        self.positions[token_id]["pnl_tid"] = self.swarm_system.pnl_tracker.record_entry(
+                            strategy="news_scalper",
+                            token_id=token_id,
+                            side=side,
+                            price=entry_price,
+                            size=position_size
+                        )
             else:
                 # LIVE MODE: Use slippage-protected order
                 logger.info(f"   🛡️  Using slippage protection (max 2%)")
@@ -701,6 +763,7 @@ class OptimizedNewsScalper:
 
                 if order_result:
                     logger.info(f"   ✅ Order executed with slippage protection")
+                    entry_price = float(order_result.get('price', 0.5))
 
                     # Track position
                     self.positions[token_id] = {
@@ -708,20 +771,38 @@ class OptimizedNewsScalper:
                         "market": market,
                         "side": side,
                         "size": position_size,
-                        "entry_price": float(order_result.get('price', 0.5)),
+                        "entry_price": entry_price,
                         "entry_time": datetime.now(),
                         "sentiment": sentiment,
                         "article": article,
                         "is_high_impact": is_high_impact,
-                        "order_id": order_result.get('orderID')
+                        "order_id": order_result.get('orderID'),
+                        "allocation_id": allocation_id,
+                        "allocation_amount": allocation_amount
                     }
                     self.stats["trades_executed"] += 1
                     self.stats["positions_opened"] += 1
+                    position_opened = True
+                    
+                    # 🚀 PnL Tracker 기록 추가 (Live)
+                    if self.swarm_system and hasattr(self.swarm_system, 'pnl_tracker'):
+                        self.positions[token_id]["pnl_tid"] = self.swarm_system.pnl_tracker.record_entry(
+                            strategy="news_scalper",
+                            token_id=token_id,
+                            side=side,
+                            price=entry_price,
+                            size=position_size
+                        )
                 else:
                     logger.warning(f"   ⚠️  Order cancelled (slippage too high)")
 
         except Exception as e:
             logger.error(f"❌ Trade execution error: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+        finally:
+            if self.budget_manager and allocation_id and not position_opened:
+                await self.budget_manager.release_allocation("arbhunter", allocation_id, Decimal("0"))
 
     async def _monitor_positions(self):
         """Monitor positions (same as original)"""
@@ -768,7 +849,8 @@ class OptimizedNewsScalper:
 
         # 2. Time-based exit check
         hold_duration = (datetime.now() - entry_time).total_seconds() / 3600
-        max_hold = 1.0 if position.get("is_high_impact") else 6.0
+        # Force exit after 90 minutes regardless of signal class
+        max_hold = 1.5
 
         if hold_duration >= max_hold:
             await self._close_position(token_id, position, f"Max hold time ({max_hold}h)")
@@ -869,6 +951,22 @@ class OptimizedNewsScalper:
 
             del self.positions[token_id]
             self.stats["positions_closed"] += 1
+            
+            allocation_id = position.get("allocation_id")
+            if self.budget_manager and allocation_id:
+                await self.budget_manager.release_allocation(
+                    "arbhunter",
+                    allocation_id,
+                    Decimal("0")
+                )
+
+            # 🚀 PnL Tracker 청산 기록 추가
+            if self.swarm_system and hasattr(self.swarm_system, 'pnl_tracker') and "pnl_tid" in position:
+                self.swarm_system.pnl_tracker.record_exit(
+                    trade_id=position["pnl_tid"],
+                    exit_price=current_price,
+                    reason=reason
+                )
 
         except Exception as e:
             logger.error(f"❌ Error closing position: {e}")

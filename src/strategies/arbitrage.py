@@ -42,40 +42,30 @@ class ArbitrageStrategy:
             await asyncio.sleep(1) # 루프 유지
 
     def _is_crypto_15min_market(self, market: dict) -> bool:
-        """Check if market is a crypto 15-minute market"""
+        """Check if market is a short-cycle crypto price market (15min, Hourly, etc.)"""
         question = market.get('question', '').lower()
-        description = market.get('description', '').lower()
-        combined = f"{question} {description}"
+        
+        # Crypto asset filter (Expanded to SOL, XRP, DOGE)
+        crypto_keywords = ['btc', 'bitcoin', 'eth', 'ethereum', 'sol', 'solana', 'xrp', 'ripple', 'doge', 'dogecoin']
+        has_crypto = any(k in question for k in crypto_keywords)
 
-        # Crypto asset filter
-        crypto_keywords = ['btc', 'bitcoin', 'eth', 'ethereum', 'sol', 'solana', 'xrp', 'ripple']
-        has_crypto = any(k in combined for k in crypto_keywords)
+        # Short timeframe filter (15min, Hourly, Next 1h, Price at)
+        timeframe_keywords = ['15 min', '15min', 'hourly', '1 hour', '1h', 'next hour', 'price at', 'price of']
+        is_short_cycle = any(k in question for k in timeframe_keywords)
 
-        # 15-minute timeframe filter (positive context only)
-        timeframe_keywords = ['15 min', '15min', 'fifteen minute', '15-minute', 'next 15', 'in 15']
-
-        # Exclude if it mentions longer timeframes
-        exclude_keywords = ['daily', 'hourly', '1 hour', '24 hour', 'weekly', 'monthly', 'not 15']
-        has_exclude = any(k in combined for k in exclude_keywords)
-
-        is_15min = any(k in combined for k in timeframe_keywords) and not has_exclude
-
-        return has_crypto and is_15min
+        return has_crypto and is_short_cycle
 
     async def _market_update_loop(self):
-        """15분마다 생성되는 새로운 크립토 마켓을 자동으로 탐색하여 구독"""
+        """초단기 크립토 마켓을 1분마다 초고속 탐색하여 구독"""
         while self.is_running:
             try:
                 if self.gamma_client:
-                    # Lower volume threshold to $100 for 15min markets (high frequency)
-                    markets = await self.gamma_client.get_active_markets(limit=50, volume_min=100)
+                    # 초단기 마켓은 거래량이 낮아도 기회가 많으므로 문턱을 $10로 낮춤
+                    markets = await self.gamma_client.get_active_markets(limit=100, volume_min=10)
                     new_assets = []
-                    filtered_count = 0
-
+                    
                     for m in markets:
-                        # Apply crypto 15min filter
                         if not self._is_crypto_15min_market(m):
-                            filtered_count += 1
                             continue
 
                         tokens = m.get('tokens', [])
@@ -90,19 +80,15 @@ class ArbitrageStrategy:
                                 new_assets.extend([y_id, n_id])
                                 self.subscribed_ids.update([y_id, n_id])
                     
-                    if filtered_count > 0:
-                        logger.info(f"🔍 ArbHunter: Filtered out {filtered_count} non-crypto-15min markets")
-
                     if new_assets:
-                        logger.info(f"🎯 ArbHunter: Found {len(new_assets)//2} new crypto 15min markets")
-                        logger.info(f"🆕 ArbHunter: Subscribing to {len(new_assets)//2} new market pairs")
-                        self.client.subscribe('book', self.on_book_update)
-                        await self.client.start_ws(list(self.subscribed_ids))
+                        logger.info(f"🎯 ArbHunter: Found {len(new_assets)//2} new SHORT-CYCLE crypto markets")
+                        # WebSocket 구독 업데이트
+                        await self.client.subscribe_orderbook(new_assets, self.on_book_update)
                 
             except Exception as e:
-                logger.error(f"Market update error: {e}")
+                logger.error(f"Short-cycle market update error: {e}")
             
-            await asyncio.sleep(300) # 5분마다 갱신
+            await asyncio.sleep(60) # 1분마다 초고속 갱신 (기존 5분)
 
     async def _monitor_bus_updates(self):
         while self.is_running:
@@ -124,6 +110,9 @@ class ArbitrageStrategy:
                 await self.check_arbitrage(token_id)
 
     async def check_arbitrage(self, token_id):
+        if getattr(self.client, "ws_connected", True) is False:
+            logger.debug("Skipping arbitrage check; orderbook disconnected")
+            return
         other_id = self.market_map.get(token_id)
         if not other_id or other_id not in self.local_orderbook:
             return

@@ -30,6 +30,7 @@ from statsmodels.tsa.vector_ar.vecm import coint_johansen
 from scipy import stats
 
 from src.core.clob_client import PolyClient
+from src.core.decision_logger import DecisionLogger
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,7 @@ class EnhancedStatArbStrategy:
         self.budget_manager = budget_manager
         self.signal_bus = signal_bus # Hive Mind Connection
         self.pnl_tracker = pnl_tracker # Unified P&L Logger
+        self.decision_logger = DecisionLogger("StatArb") # Centralized Logger
         
         if self.signal_bus:
             logger.info("🧠 StatArb connected to SignalBus")
@@ -110,8 +112,8 @@ class EnhancedStatArbStrategy:
 
         # Trading thresholds
         self.entry_z_threshold = 2.0  # Enter when |Z| > 2.0
-        self.exit_z_threshold = 0.5   # Exit when |Z| < 0.5 (mean reversion)
-        self.stop_loss_z = 4.0        # Stop loss at |Z| > 4.0
+        self.exit_z_threshold = 1.0   # Exit when |Z| < 1.0 (sooner realization)
+        self.stop_loss_z = 3.0        # Stop loss at |Z| > 3.0
 
         # Cointegration requirements
         self.max_cointegration_pvalue = 0.05  # p < 0.05 required
@@ -129,6 +131,7 @@ class EnhancedStatArbStrategy:
         # Performance tracking
         self.pair_metrics_cache: Dict[str, PairMetrics] = {}
         self.last_analysis: Dict[str, datetime] = {}
+        self.disabled_pairs: Dict[str, datetime] = {}
 
     def add_pair(
         self,
@@ -138,20 +141,37 @@ class EnhancedStatArbStrategy:
         category: str = "general"
     ):
         """Add a pair to monitor for stat arb opportunities"""
+        cooldown_until = self.disabled_pairs.get(pair_name)
+        if cooldown_until and cooldown_until > datetime.now():
+            logger.info(f"⏳ Skipping re-add of disabled pair {pair_name} until {cooldown_until:%H:%M}")
+            return
         self.pairs.append((condition_id_a, condition_id_b, pair_name, category))
         logger.info(f"📊 Added pair: {pair_name} ({category})")
+
+    def _disable_pair(self, pair_name: str, reason: str, cooldown_hours: int = 6):
+        """Remove a problematic pair until data is refreshed"""
+        before = len(self.pairs)
+        self.pairs = [p for p in self.pairs if p[2] != pair_name]
+        self.pair_metrics_cache.pop(pair_name, None)
+        self.last_analysis.pop(pair_name, None)
+        self.disabled_pairs[pair_name] = datetime.now() + timedelta(hours=cooldown_hours)
+        logger.warning(f"🛑 Disabled pair {pair_name} ({before}->{len(self.pairs)}). Reason: {reason}")
+
+    async def _release_allocation(self, allocation_info: Optional[dict], actual_spent: Decimal):
+        """Helper to safely release capital back to the pool"""
+        if allocation_info and self.budget_manager:
+            await self.budget_manager.release_allocation(
+                "statarb",
+                allocation_info['allocation_id'],
+                actual_spent
+            )
 
     async def run(self):
         """Main strategy loop"""
         logger.info("🛡️ Enhanced Stat Arb Strategy Started")
-        logger.info(f"   Entry Z-Score: ±{self.entry_z_threshold}")
-        logger.info(f"   Stop Loss Z-Score: ±{self.stop_loss_z}")
-        logger.info(f"   Max Cointegration p-value: {self.max_cointegration_pvalue}")
-        logger.info(f"   Lookback Period: {self.lookback_days} days")
-
-        if not self.pairs:
-            logger.warning("⚠️ No pairs configured. Add pairs using add_pair()")
-            return
+        
+        # 🚀 실시간 핫 마켓 자동 탐색 시작
+        asyncio.create_task(self.auto_discover_pairs_loop())
 
         while True:
             try:
@@ -176,6 +196,9 @@ class EnhancedStatArbStrategy:
         Analyze all configured pairs for cointegration.
         Updates pair_metrics_cache with latest statistics.
         """
+        if getattr(self.client, "ws_connected", True) is False:
+            logger.warning("⏸️ StatArb paused: orderbook disconnected")
+            return
         logger.debug("🔍 Analyzing pairs for cointegration...")
 
         for condition_a, condition_b, pair_name, category in self.pairs:
@@ -431,15 +454,18 @@ class EnhancedStatArbStrategy:
 
     async def execute_entry(self, signal: TradingSignal):
         """Execute entry orders for stat arb position"""
-        logger.info(f"\n{'='*60}")
-        logger.info(f"🚨 STAT ARB ENTRY SIGNAL: {signal.pair_name}")
-        logger.info(f"{'='*60}")
-        logger.info(f"Action: {signal.action}")
-        logger.info(f"Z-Score: {signal.z_score:.2f} (Threshold: {self.entry_z_threshold})")
-        logger.info(f"Confidence: {signal.confidence:.0%}")
-        logger.info(f"Position Size: ${signal.position_size} per leg")
-        logger.info(f"Expected Half-Life: {signal.expected_half_life:.1f} days")
-        logger.info(f"Reason: {signal.entry_reason}")
+        
+        await self.decision_logger.log_decision(
+            action=signal.action,
+            token=signal.pair_name,
+            confidence=signal.confidence,
+            reason=signal.entry_reason,
+            factors={
+                "Z-Score": f"{signal.z_score:.2f}",
+                "Half-Life": f"{signal.expected_half_life:.1f}d",
+                "Size": f"${signal.position_size}"
+            }
+        )
 
         # Dry Run 체크
         dry_run = getattr(self.client.config, 'DRY_RUN', True)
@@ -465,15 +491,25 @@ class EnhancedStatArbStrategy:
             allocation_info = None
 
         try:
+            # 🚀 Fix: Resolve condition IDs to actual CLOB Token IDs
+            tid_a = self.client.get_yes_token_id(signal.token_a)
+            tid_b = self.client.get_yes_token_id(signal.token_b)
+            
+            if not tid_a or not tid_b:
+                logger.error(f"❌ Could not resolve token IDs for {signal.pair_name}. A: {tid_a}, B: {tid_b}")
+                await self._release_allocation(allocation_info, Decimal("0"))
+                self._disable_pair(signal.pair_name, "Token resolution failed")
+                return
+
             if not dry_run:
                 if signal.action == "SHORT_A_LONG_B":
-                    logger.info(f"   🚀 LIVE ORDER: SELL {signal.token_a} | BUY {signal.token_b}")
-                    await self.client.place_market_order(signal.token_a, "SELL", float(signal.position_size))
-                    await self.client.place_market_order(signal.token_b, "BUY", float(signal.position_size))
+                    logger.info(f"   🚀 LIVE ORDER: SELL {tid_a[:10]}... | BUY {tid_b[:10]}...")
+                    await self.client.place_market_order(tid_a, "SELL", float(signal.position_size))
+                    await self.client.place_market_order(tid_b, "BUY", float(signal.position_size))
                 else:
-                    logger.info(f"   🚀 LIVE ORDER: BUY {signal.token_a} | SELL {signal.token_b}")
-                    await self.client.place_market_order(signal.token_a, "BUY", float(signal.position_size))
-                    await self.client.place_market_order(signal.token_b, "SELL", float(signal.position_size))
+                    logger.info(f"   🚀 LIVE ORDER: BUY {tid_a[:10]}... | SELL {tid_b[:10]}...")
+                    await self.client.place_market_order(tid_a, "BUY", float(signal.position_size))
+                    await self.client.place_market_order(tid_b, "SELL", float(signal.position_size))
                 
                 # Report to UI history
                 swarm = getattr(self.client, 'swarm_system', None)
@@ -481,15 +517,11 @@ class EnhancedStatArbStrategy:
                     swarm.add_trade_record(signal.action[:5], signal.pair_name, 0.5, float(signal.position_size))
             else:
                 logger.info(f"   🧪 [DRY RUN] Entry for {signal.pair_name}")
-                logger.info(f"      Leg A: {signal.token_a[:15]}...")
-                logger.info(f"      Leg B: {signal.token_b[:15]}...")
+                logger.info(f"      Resolved Leg A Token: {tid_a[:15]}...")
+                logger.info(f"      Resolved Leg B Token: {tid_b[:15]}...")
                 
                 # Report to UI history even in dry run
                 swarm = getattr(self.client, 'swarm_system', None)
-                if not swarm:
-                    # Try to find via self.swarm_system if available
-                    swarm = getattr(self, 'swarm_system', None)
-                
                 if swarm:
                     swarm.add_trade_record(signal.action, signal.pair_name, 0.5, float(signal.position_size))
 
@@ -497,25 +529,26 @@ class EnhancedStatArbStrategy:
             trade_ids = []
             if self.pnl_tracker:
                 # Record Entry for Leg A
-                tid_a = self.pnl_tracker.record_entry(
+                entry_tid_a = self.pnl_tracker.record_entry(
                     strategy="statarb",
-                    token_id=signal.token_a,
+                    token_id=tid_a,
                     side="SELL" if "SHORT_A" in signal.action else "BUY",
                     price=0.5, # Placeholder for simulation
                     size=float(signal.position_size)
                 )
                 # Record Entry for Leg B
-                tid_b = self.pnl_tracker.record_entry(
+                entry_tid_b = self.pnl_tracker.record_entry(
                     strategy="statarb",
-                    token_id=signal.token_b,
+                    token_id=tid_b,
                     side="BUY" if "LONG_B" in signal.action else "SELL",
                     price=0.5,
                     size=float(signal.position_size)
                 )
-                trade_ids = [tid_a, tid_b]
+                trade_ids = [entry_tid_a, entry_tid_b]
 
             self.active_positions[signal.pair_name] = {
                 'signal': signal,
+                'resolved_tids': (tid_a, tid_b),
                 'entry_time': datetime.now(),
                 'entry_z_score': signal.z_score,
                 'allocation_info': allocation_info,
@@ -526,8 +559,7 @@ class EnhancedStatArbStrategy:
 
         except Exception as e:
             logger.error(f"❌ Failed to enter position: {e}")
-            if allocation_info and self.budget_manager:
-                await self.budget_manager.release_allocation("statarb", allocation_info['allocation_id'], Decimal("0"))
+            await self._release_allocation(allocation_info, Decimal("0"))
 
     async def manage_positions(self):
         """Monitor and exit active positions"""
@@ -597,17 +629,22 @@ class EnhancedStatArbStrategy:
 
         # Execute closing orders (reverse of entry)
         try:
+            tid_a, tid_b = position_data.get('resolved_tids', (None, None))
+            if not tid_a or not tid_b:
+                logger.error(f"❌ Cannot close position: Resolved Token IDs missing for {pair_name}")
+                return
+
             if not dry_run:
                 if signal.action == "SHORT_A_LONG_B":
                     # Close by: BUY A, SELL B
-                    logger.info(f"   🚀 LIVE CLOSE: BUY {signal.token_a} | SELL {signal.token_b}")
-                    await self.client.place_market_order(signal.token_a, "BUY", float(signal.position_size))
-                    await self.client.place_market_order(signal.token_b, "SELL", float(signal.position_size))
+                    logger.info(f"   🚀 LIVE CLOSE: BUY {tid_a[:10]}... | SELL {tid_b[:10]}...")
+                    await self.client.place_market_order(tid_a, "BUY", float(signal.position_size))
+                    await self.client.place_market_order(tid_b, "SELL", float(signal.position_size))
                 else:
                     # Close by: SELL A, BUY B
-                    logger.info(f"   🚀 LIVE CLOSE: SELL {signal.token_a} | BUY {signal.token_b}")
-                    await self.client.place_market_order(signal.token_a, "SELL", float(signal.position_size))
-                    await self.client.place_market_order(signal.token_b, "BUY", float(signal.position_size))
+                    logger.info(f"   🚀 LIVE CLOSE: SELL {tid_a[:10]}... | BUY {tid_b[:10]}...")
+                    await self.client.place_market_order(tid_a, "SELL", float(signal.position_size))
+                    await self.client.place_market_order(tid_b, "BUY", float(signal.position_size))
             else:
                 logger.info(f"   🧪 [DRY RUN] Closing position for {pair_name}")
 
@@ -623,11 +660,7 @@ class EnhancedStatArbStrategy:
 
             # Release budget allocation
             if position_data['allocation_info'] and self.budget_manager:
-                await self.budget_manager.release_allocation(
-                    "statarb",
-                    position_data['allocation_info']['allocation_id'],
-                    position_data['allocation_info']['allocated_amount']
-                )
+                await self._release_allocation(position_data['allocation_info'], Decimal("0"))
 
             # Remove from active positions
             del self.active_positions[pair_name]
@@ -646,7 +679,7 @@ class EnhancedStatArbStrategy:
         Fetch historical price data from Polymarket using real API.
 
         Returns:
-            List of dicts: [{'timestamp': datetime, 'price': float}, ...]
+            List of dicts: [{'timestamp': datetime, 'price': float}, ...] 
         """
         logger.debug(f"Fetching {days} days of data for {condition_id}")
 
@@ -669,11 +702,67 @@ class EnhancedStatArbStrategy:
             # Fallback to synthetic if API fails
             return await self._price_api._generate_synthetic_history(condition_id, days)
 
-    def align_price_series(
-        self,
-        data_a: List[Dict],
-        data_b: List[Dict]
-    ) -> pd.DataFrame:
+    async def auto_discover_pairs_loop(self):
+        """1시간마다 전략적으로 최적화된 마켓 페어를 탐색합니다."""
+        from src.core.gamma_client import GammaClient
+        gamma = GammaClient()
+        
+        while True:
+            try:
+                logger.info("🔍 StatArb: Running Advanced Market Discovery...")
+                # 더 많은 후보군 확보 (100개 -> 200개)
+                markets = await gamma.get_active_markets(limit=200, volume_min=2000)
+                
+                # 1. 자산-프록시(Proxy Peg) 탐색 로직 확장
+                proxies = {
+                    "bitcoin": ["mstr", "bitcoin", "btc", "etf"],
+                    "ethereum": ["eth", "ethereum", "staking"],
+                    "solana": ["sol", "solana", "phantom"],
+                    "xrp": ["xrp", "ripple", "sec"],
+                    "doge": ["doge", "dogecoin", "musk"],
+                    "trump": ["gop", "republican", "fed chair", "cabinet"],
+                    "elon": ["doge", "tesla", "x.com", "ai"]
+                }
+                
+                added_count = 0
+                for base, keywords in proxies.items():
+                    group = [m for m in markets if any(kw in m.get('question', '').lower() for kw in keywords)]
+                    if len(group) >= 2:
+                        # 🚀 안전하게 필드 존재 여부 확인 후 페어 추가
+                        m1, m2 = group[0], group[1]
+                        cid1 = m1.get('condition_id') or m1.get('id')
+                        cid2 = m2.get('condition_id') or m2.get('id')
+                        
+                        if cid1 and cid2:
+                            pair_name = f"PEG_{base.upper()}_{m1['id'][:4]}"
+                            if not any(p[2] == pair_name for p in self.pairs):
+                                self.add_pair(cid1, cid2, pair_name, "proxy_peg")
+                                added_count += 1
+
+                # 2. 초단기 만기 마켓(Near-Expiry) 탐색
+                # 만기가 24시간 이내인 시장은 변동성이 크므로 별도 관리 (우선순위 부여)
+                now = datetime.now()
+                for m in markets:
+                    ends_at_str = m.get('ends_at')
+                    if ends_at_str:
+                        try:
+                            # ends_at 형식에 따라 파싱 (예: "2026-01-07T12:00:00Z")
+                            ends_at = datetime.fromisoformat(ends_at_str.replace('Z', '+00:00'))
+                            if now < ends_at < now + timedelta(hours=24):
+                                # 이런 시장은 NewsScalper가 감시하도록 시그널 버스에 등록하거나 
+                                # StatArb에서 더 민감하게(Z-Score 1.5) 대응하도록 설계 가능
+                                pass 
+                        except: pass
+
+                if added_count > 0:
+                    logger.info(f"🚀 StatArb: Added {added_count} strategic Proxy-Peg pairs")
+                
+            except Exception as e:
+                logger.error(f"Error in strategic discovery: {e}")
+            
+            await asyncio.sleep(3600) # 1시간마다 정밀 탐색
+
+    def align_price_series(self, data_a: List[Dict], data_b: List[Dict]) -> pd.DataFrame:
         """
         Align two price series by timestamp.
 

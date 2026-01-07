@@ -49,12 +49,12 @@ class Config:
         if kw_env:
             return [k.strip() for k in kw_env.split(",")]
         
-        # 기본값 (최신 트렌드 반영)
+        # 최적화된 메이저 코인 + 정책 키워드 (범위 확장)
         return [
-            "sec-settlement", "stablecoin-regulation", "etf-approval", "gensler",
-            "trump-policy", "fed-rate", "powell", "election-odds",
-            "ai-agents", "depin", "rwa", "layer2-scaling", "meme-coins",
-            "breaking", "hack", "exploit", "listing", "liquidation"
+            "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "doge",
+            "trump", "elon musk", "fed rate", "powell", "inflation", 
+            "sec", "crypto regulation", "binance", "coinbase",
+            "hack", "listing", "liquidation"
         ]
 
     @property

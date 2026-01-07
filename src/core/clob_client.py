@@ -14,6 +14,8 @@ from py_clob_client.clob_types import MarketOrderArgs, OrderArgs
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from src.core.config import Config
+from src.core.market_registry import market_registry
+from src.core.polymarket_mcp_client import PolymarketMCPClient
 
 logger = logging.getLogger(__name__)
 
@@ -126,15 +128,15 @@ class PolyClient:
     """
     def __init__(self, strategy_name: str = "unknown", budget_manager=None):
         self.config = Config()
-        self.rest_client = None
+        self.rest_client: Optional[ClobClient] = None
+        self._mcp_client: Optional[PolymarketMCPClient] = None
         self.strategy_name = strategy_name
         self.budget_manager = budget_manager
         
         # Web3 & Contract
-        self.w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
-        self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        self.w3 = None
         self.executor_contract = None
-        self._init_contract()
+        self._init_web3()
         
         # WebSocket State
         self.ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -144,48 +146,73 @@ class PolyClient:
         self.orderbooks: Dict[str, LocalOrderBook] = {}
         self.callbacks: Dict[str, List[Callable]] = {}
         
-        self.init_rest_client()
+        self._init_rest_client()
+        if os.getenv("POLYMARKET_MCP_URL"):
+            try:
+                self._mcp_client = PolymarketMCPClient()
+            except Exception as exc:
+                logger.warning(f"⚠️ MCP client init failed: {exc}")
 
-    def _init_contract(self):
-        """Load the deployed ArbExecutor contract"""
+    def _init_web3(self):
+        """Initialize optional Web3 + contract state."""
+        if not self.config.RPC_URL:
+            logger.warning("⚠️ POLYGON_RPC_URL not configured; on-chain features disabled")
+            return
+
         try:
+            self.w3 = Web3(Web3.HTTPProvider(self.config.RPC_URL))
+            self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
             addr_path = "src/contracts/address.txt"
             abi_path = "src/contracts/ArbExecutor_ABI.json"
             if os.path.exists(addr_path) and os.path.exists(abi_path):
-                with open(addr_path, "r") as f: addr = f.read().strip()
-                with open(abi_path, "r") as f: abi = json.load(f)
+                with open(addr_path, "r") as f:
+                    addr = f.read().strip()
+                with open(abi_path, "r") as f:
+                    abi = json.load(f)
                 self.executor_contract = self.w3.eth.contract(address=addr, abi=abi)
                 logger.info(f"🛡️ ArbExecutor linked at {addr}")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not load contract: {e}")
+        except Exception as exc:
+            self.w3 = None
+            self.executor_contract = None
+            logger.warning(f"⚠️ Web3 unavailable ({exc}); continuing without on-chain access")
 
-    def init_rest_client(self):
-        if self.config.PRIVATE_KEY:
-            try:
-                self.rest_client = ClobClient(
-                    host=self.config.HOST,
-                    key=self.config.PRIVATE_KEY,
-                    chain_id=self.config.CHAIN_ID,
-                    signature_type=1, 
-                    funder=self.config.FUNDER_ADDRESS
-                )
-                creds = self.rest_client.create_or_derive_api_creds()
-                self.rest_client.set_api_creds(creds)
-                logger.info("✅ PolyClient Authenticated")
-            except Exception as e:
-                logger.error(f"❌ Failed to init REST client: {e}")
+    def _init_rest_client(self):
+        if not self.config.PRIVATE_KEY:
+            logger.warning("⚠️ PRIVATE_KEY missing; REST client disabled (dry-run only)")
+            return
+        try:
+            self.rest_client = ClobClient(
+                host=self.config.HOST,
+                key=self.config.PRIVATE_KEY,
+                chain_id=self.config.CHAIN_ID,
+                signature_type=1,
+                funder=self.config.FUNDER_ADDRESS,
+            )
+            creds = self.rest_client.create_or_derive_api_creds()
+            self.rest_client.set_api_creds(creds)
+            logger.info("✅ PolyClient Authenticated")
+        except Exception as exc:
+            self.rest_client = None
+            logger.error(f"❌ Failed to init REST client: {exc}")
 
     # --- WebSocket & Trading Methods (Already defined in previous step, ensuring consistency) ---
     async def start_ws(self):
-        self.ws_running = True
+        backoff = 1
+        self.ws_connected = False
         while self.ws_running:
             try:
                 async with websockets.connect(self.ws_url) as ws:
                     self.ws_connection = ws
-                    if self.subscribed_tokens: await self._send_subscribe(list(self.subscribed_tokens))
-                    async for msg in ws: await self._handle_ws_message(msg)
+                    self.ws_connected = True
+                    backoff = 1
+                    if self.subscribed_tokens:
+                        await self._send_subscribe(list(self.subscribed_tokens))
+                    async for msg in ws:
+                        await self._handle_ws_message(msg)
             except Exception as e:
-                await asyncio.sleep(5)
+                self.ws_connected = False
+                await asyncio.sleep(min(backoff, 60))
+                backoff *= 2
 
     async def subscribe_orderbook(self, token_ids: List[str], callback: Optional[Callable] = None):
         new_tokens = [tid for tid in token_ids if tid not in self.subscribed_tokens]
@@ -315,12 +342,50 @@ class PolyClient:
 
     def get_market(self, condition_id: str):
         """Fetch market details to get token_ids"""
-        if not self.rest_client: return None
+        condition_id = str(condition_id)
+        slug = market_registry.get_slug(condition_id)
+
+        if self._mcp_client and slug:
+            try:
+                market = self._mcp_client.get_market_sync(slug)
+                if isinstance(market, dict):
+                    market_registry.register_market(market)
+                return market
+            except Exception as exc:
+                logger.warning(f"⚠️ MCP market lookup failed for {slug}: {exc}")
+
+        if not self.rest_client:
+            return None
         try:
-            return self.rest_client.get_market(condition_id)
+            market = self.rest_client.get_market(condition_id)
+            if isinstance(market, dict):
+                market_registry.register_market(market)
+            return market
         except Exception as e:
             logger.error(f"Failed to get market {condition_id}: {e}")
             return None
+
+    def get_yes_token_id(self, condition_id: str) -> Optional[str]:
+        """
+        Helper: Resolve condition_id to the YES token_id for CLOB trading.
+        """
+        logger.debug(f"🔍 [CLOB] Resolving YES token for CID: {condition_id[:10]}...")
+        market = self.get_market(condition_id)
+        if not market: return None
+        
+        try:
+            # 1. Check clobTokenIds (Prefer list)
+            ids = market.get('clobTokenIds')
+            if isinstance(ids, str): ids = json.loads(ids)
+            if ids and len(ids) > 0: return ids[0]
+            
+            # 2. Check tokens list
+            tokens = market.get('tokens')
+            if tokens and len(tokens) > 0:
+                return tokens[0].get('token_id')
+        except Exception as exc:
+            logger.warning(f"⚠️ Failed to parse token IDs: {exc}")
+        return None
 
     def get_best_ask_price(self, token_id: str) -> float:
         if token_id in self.orderbooks:
