@@ -212,7 +212,7 @@ class NewsAPIClient:
         params = {
             "q": query,
             "apiKey": self.api_key,
-            "sortBy": "publishedAt",  # Most recent first
+            "sortBy": "popularity",  # 인기도(조회수/인용수 기반) 높은 순으로 변경
             "language": language,
             "pageSize": min(max_results, 100)  # API max is 100
         }

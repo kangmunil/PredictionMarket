@@ -28,6 +28,7 @@ from dataclasses import dataclass
 import json
 import hashlib
 import os
+import re
 
 # Vector store (Optional - gracefully handle if unavailable)
 CHROMADB_AVAILABLE = False
@@ -152,7 +153,12 @@ class OpenRouterRAGSystem:
         if CHROMADB_AVAILABLE:
             try:
                 # New ChromaDB 0.4+ client initialization
-                self.chroma_client = chromadb.PersistentClient(path=chroma_path)
+                # Disable telemetry to avoid background thread exceptions
+                from chromadb.config import Settings
+                self.chroma_client = chromadb.PersistentClient(
+                    path=chroma_path,
+                    settings=Settings(anonymized_telemetry=False)
+                )
                 
                 self.news_collection = self.chroma_client.get_or_create_collection(
                     name="news_events",
@@ -363,14 +369,16 @@ class OpenRouterRAGSystem:
                 self.news_collection.add(
                     embeddings=[embedding],
                     documents=[f"{event.title}\n\n{event.content}"],
-                    metadatas=[{
-                        'event_id': event.event_id,
-                        'title': event.title,
-                        'source': event.source,
-                        'category': event.category,
-                        'published_at': event.published_at.isoformat(),
-                        'entities': json.dumps(event.entities)
-                    }],
+                    metadatas=[
+                        {
+                            'event_id': event.event_id,
+                            'title': event.title,
+                            'source': event.source,
+                            'category': event.category,
+                            'published_at': event.published_at.isoformat(),
+                            'entities': json.dumps(event.entities)
+                        }
+                    ],
                     ids=[event.event_id]
                 )
 
@@ -430,122 +438,6 @@ class OpenRouterRAGSystem:
             logger.error(f"Failed to find similar events: {e}")
             return []
 
-    async def analyze_market_impact(
-        self,
-        event: NewsEvent,
-        market_id: str,
-        current_price: Decimal,
-        market_question: str
-    ) -> MarketImpact:
-        """
-        Analyze market impact using 2-stage pipeline for cost optimization:
-        1. Extract entities with cheap model (Gemini Flash ~$0.02/M)
-        2. Analyze with powerful model (GPT-5.2 ~$5/M)
-
-        Cost savings: ~70% compared to single-model approach
-        """
-        # Ensure event is stored in DB first to prevent FK violation
-        await self.store_news_event(event)
-
-        # Stage 1: Extract entities with cheap model (if not already extracted)
-        if not event.entities:
-            logger.debug(f"💰 Extracting entities with cheap model: {self.entity_model}")
-            event.entities = await self.extract_entities(event)
-            logger.debug(f"   Found {len(event.entities)} entities: {event.entities[:5]}")
-
-        # Stage 2: Find similar historical events (optional)
-        similar_events = await self.find_similar_events(event, top_k=3)
-
-        # Stage 3: Build analysis prompt with extracted entities
-        prompt = self._build_impact_analysis_prompt(
-            event, market_question, current_price, similar_events
-        )
-
-        try:
-            # Stage 4: Final analysis with expensive model
-            logger.debug(f"🎯 Running market analysis with premium model: {self.analysis_model}")
-
-            response = await self.openrouter_client.chat.completions.create(
-                model=self.analysis_model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are an expert prediction market analyst. "
-                            "Analyze news events and predict market impact. "
-                            "Be conservative and data-driven. Return JSON only."
-                        )
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                temperature=0.5,
-                max_tokens=1000
-            )
-
-            content = response.choices[0].message.content
-
-            # Parse JSON response
-            try:
-                result = json.loads(content)
-            except:
-                # Try to extract JSON from markdown code blocks
-                if "```json" in content:
-                    json_str = content.split("```json")[1].split("```")[0]
-                    result = json.loads(json_str)
-                else:
-                    raise ValueError("Invalid JSON response")
-
-            suggested_price = Decimal(str(result['suggested_price']))
-            confidence = result['confidence']
-            reasoning = result['reasoning']
-            trade_rec = result['trade_recommendation']
-
-            edge = abs(suggested_price - current_price)
-            expected_value = edge * Decimal(str(confidence))
-
-            impact = MarketImpact(
-                market_id=market_id,
-                current_price=current_price,
-                suggested_price=suggested_price,
-                confidence=confidence,
-                reasoning=reasoning,
-                similar_events=similar_events,
-                trade_recommendation=trade_rec,
-                expected_value=expected_value,
-                model_used=self.analysis_model
-            )
-
-            logger.info(f"\n{'='*60}")
-            logger.info(f"📊 MARKET IMPACT ANALYSIS ({self.analysis_model})")
-            logger.info(f"{'='*60}")
-            logger.info(f"Market: {market_question[:50]}...")
-            logger.info(f"Event: {event.title[:50]}...")
-            logger.info(f"Current: {current_price:.3f} → Suggested: {suggested_price:.3f}")
-            logger.info(f"Confidence: {confidence:.0%} | Trade: {trade_rec.upper()}")
-            logger.info(f"EV: {expected_value:.4f}")
-            logger.info(f"{'='*60}\n")
-
-            await self._store_market_analysis(event, impact, market_question)
-
-            return impact
-
-        except Exception as e:
-            logger.error(f"Failed to analyze market impact: {e}")
-            return MarketImpact(
-                market_id=market_id,
-                current_price=current_price,
-                suggested_price=current_price,
-                confidence=0.0,
-                reasoning=f"Analysis failed: {str(e)}",
-                similar_events=[],
-                trade_recommendation="hold",
-                expected_value=Decimal("0"),
-                model_used="error"
-            )
-
     def _build_impact_analysis_prompt(
         self,
         event: NewsEvent,
@@ -553,7 +445,7 @@ class OpenRouterRAGSystem:
         current_price: Decimal,
         similar_events: List[Dict]
     ) -> str:
-        """Build analysis prompt (same as original)"""
+        """Build analysis prompt (Optimized for decisiveness)"""
         similar_context = ""
         if similar_events:
             similar_context = "\n\nHistorically similar events:\n"
@@ -573,7 +465,7 @@ Source: {event.source}
 Published: {event.published_at.isoformat()}
 {similar_context}
 
-Return JSON:
+Return JSON ONLY:
 {{
     "suggested_price": 0.XX (new probability 0.0-1.0),
     "confidence": 0.XX (confidence 0.0-1.0),
@@ -582,11 +474,114 @@ Return JSON:
 }}
 
 Rules:
-- Conservative (max price move ±0.10 unless highly significant)
-- Higher confidence for direct evidence
-- Consider base rates
-- If unrelated, return current price with confidence 0.0
+- Be calibrated. If news directly affects the outcome, reflect the probability shift accurately.
+- Do not default to HOLD if there is actionable information.
+- If the news is irrelevant to the market, set confidence to 0.0.
+- If the news confirms the current trend, suggest a price movement in that direction.
 """
+
+    async def analyze_market_impact(
+        self,
+        event: NewsEvent,
+        market_id: str,
+        current_price: Decimal,
+        market_question: str
+    ) -> MarketImpact:
+        """
+        Analyze market impact using 2-stage pipeline for cost optimization.
+        """
+        # Ensure event is stored in DB first
+        await self.store_news_event(event)
+
+        if not event.entities:
+            logger.debug(f"💰 Extracting entities with cheap model: {self.entity_model}")
+            event.entities = await self.extract_entities(event)
+
+        similar_events = await self.find_similar_events(event, top_k=3)
+        prompt = self._build_impact_analysis_prompt(
+            event, market_question, current_price, similar_events
+        )
+
+        try:
+            logger.info(f"🎯 Running market analysis with premium model: {self.analysis_model}")
+
+            response = await self.openrouter_client.chat.completions.create(
+                model=self.analysis_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are an expert prediction market analyst. Return JSON only."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0.3, # Lower temperature for more consistent JSON
+                max_tokens=1000
+            )
+
+            content = response.choices[0].message.content.strip()
+
+            # Robust JSON Parsing
+            try:
+                # 1. Try direct parse
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                # 2. Try regex extraction
+                json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                if json_match:
+                    result = json.loads(json_match.group(0))
+                else:
+                    raise ValueError(f"Could not parse JSON from: {content[:100]}...")
+
+            suggested_price = Decimal(str(result.get('suggested_price', current_price)))
+            confidence = float(result.get('confidence', 0.0))
+            reasoning = result.get('reasoning', "No reasoning provided")
+            trade_rec = result.get('trade_recommendation', 'hold').lower()
+
+            edge = abs(suggested_price - current_price)
+            expected_value = edge * Decimal(str(confidence))
+
+            impact = MarketImpact(
+                market_id=market_id,
+                current_price=current_price,
+                suggested_price=suggested_price,
+                confidence=confidence,
+                reasoning=reasoning,
+                similar_events=similar_events,
+                trade_recommendation=trade_rec,
+                expected_value=expected_value,
+                model_used=self.analysis_model
+            )
+
+            logger.info(f"\n{'='*60}")
+            logger.info(f"📊 MARKET IMPACT ANALYSIS ({self.analysis_model})")
+            logger.info(f"{ '='*60}")
+            logger.info(f"Market: {market_question[:50]}...")
+            logger.info(f"Event: {event.title[:50]}...")
+            logger.info(f"Current: {current_price:.3f} → Suggested: {suggested_price:.3f}")
+            logger.info(f"Confidence: {confidence:.0%} | Trade: {trade_rec.upper()}")
+            logger.info(f"EV: {expected_value:.4f}")
+            logger.info(f"{ '='*60}\n")
+
+            await self._store_market_analysis(event, impact, market_question)
+
+            return impact
+
+        except Exception as e:
+            logger.error(f"Failed to analyze market impact: {e}")
+            return MarketImpact(
+                market_id=market_id,
+                current_price=current_price,
+                suggested_price=current_price,
+                confidence=0.0,
+                reasoning=f"Analysis failed: {str(e)}",
+                similar_events=[],
+                trade_recommendation="hold",
+                expected_value=Decimal("0"),
+                model_used="error"
+            )
 
     async def _store_market_analysis(
         self,

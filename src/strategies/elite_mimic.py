@@ -2,7 +2,7 @@ import asyncio
 import logging
 from typing import List, Dict
 from src.core.clob_client import PolyClient
-from src.core.wallet_watcher import WalletWatcher
+from src.core.wallet_watcher_v2 import EnhancedWalletWatcher as WalletWatcher
 from src.strategies.arbitrage import ArbitrageStrategy
 from src.strategies.stat_arb import StatArbStrategy
 # from src.strategies.ai_model import AIModelStrategy # Deprecated
@@ -40,9 +40,8 @@ class EliteMimicAgent:
         # Pass signal_bus to WalletWatcher for advanced validation
         self.wallet_watcher = WalletWatcher(
             client, 
-            agent=self, 
-            ai_brain=self.news_brain,
-            signal_bus=self.signal_bus
+            agent=self,
+            config=self.config
         )
         self.arb_engine = ArbitrageStrategy(client)
         self.stat_arb_engine = StatArbStrategy(client)

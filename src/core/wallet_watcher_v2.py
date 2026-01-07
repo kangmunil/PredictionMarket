@@ -20,6 +20,7 @@ import logging
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 from web3.contract import Contract
 
 from src.core.config import Config
@@ -48,7 +49,8 @@ class EnhancedWalletWatcher:
         self.config = config or Config()
 
         # Web3 setup
-        self.w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+        self.w3 = Web3(Web3.HTTPProvider(self.config.RPC_URL))
+        self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         self.targets = self._load_target_wallets()
 
         # Intelligence modules

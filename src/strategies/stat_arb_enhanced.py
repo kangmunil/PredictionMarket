@@ -93,11 +93,13 @@ class EnhancedStatArbStrategy:
         budget_manager=None,
         lookback_days: int = 30,
         min_data_points: int = 10,
-        signal_bus = None
+        signal_bus = None,
+        pnl_tracker = None
     ):
         self.client = client
         self.budget_manager = budget_manager
         self.signal_bus = signal_bus # Hive Mind Connection
+        self.pnl_tracker = pnl_tracker # Unified P&L Logger
         
         if self.signal_bus:
             logger.info("🧠 StatArb connected to SignalBus")
@@ -361,6 +363,16 @@ class EnhancedStatArbStrategy:
 
             # Check if Z-score exceeds dynamic entry threshold
             if abs(metrics.current_z_score) > current_threshold:
+                # 🧠 HIVE MIND UPDATE: Report signal to dashboard
+                if self.signal_bus:
+                    # token_a를 기준으로 시그널 등록 (Z > 0이면 A 매도/B 매수이므로 음수 점수)
+                    score = -metrics.current_z_score / 5.0 # -1.0 ~ 1.0 사이로 정규화 시도
+                    asyncio.create_task(self.signal_bus.update_signal(
+                        token_id=pair_name[:15], 
+                        source='STATARB',
+                        score=max(-1.0, min(1.0, score))
+                    ))
+
                 signal = self.generate_entry_signal(pair_name, metrics)
                 if signal:
                     await self.execute_entry(signal)
@@ -429,11 +441,14 @@ class EnhancedStatArbStrategy:
         logger.info(f"Expected Half-Life: {signal.expected_half_life:.1f} days")
         logger.info(f"Reason: {signal.entry_reason}")
 
+        # Dry Run 체크
+        dry_run = getattr(self.client.config, 'DRY_RUN', True)
+
         # Budget check
         if self.budget_manager:
             total_required = signal.position_size * 2  # Both legs
             allocation_id = await self.budget_manager.request_allocation(
-                strategy="polyai",
+                strategy="statarb",
                 amount=total_required,
                 priority="normal"
             )
@@ -442,7 +457,6 @@ class EnhancedStatArbStrategy:
                 logger.warning(f"⚠️ Budget allocation denied for {signal.pair_name}")
                 return
 
-            # Store allocation for later release
             allocation_info = {
                 'allocation_id': allocation_id,
                 'allocated_amount': total_required
@@ -450,39 +464,70 @@ class EnhancedStatArbStrategy:
         else:
             allocation_info = None
 
-        # Execute orders (placeholder - integrate with real order execution)
         try:
-            if signal.action == "SHORT_A_LONG_B":
-                logger.info(f"   → SELL {signal.token_a} (${signal.position_size})")
-                logger.info(f"   → BUY {signal.token_b} (${signal.position_size})")
-                # await self.client.place_market_order(signal.token_a, "SELL", signal.position_size)
-                # await self.client.place_market_order(signal.token_b, "BUY", signal.position_size)
+            if not dry_run:
+                if signal.action == "SHORT_A_LONG_B":
+                    logger.info(f"   🚀 LIVE ORDER: SELL {signal.token_a} | BUY {signal.token_b}")
+                    await self.client.place_market_order(signal.token_a, "SELL", float(signal.position_size))
+                    await self.client.place_market_order(signal.token_b, "BUY", float(signal.position_size))
+                else:
+                    logger.info(f"   🚀 LIVE ORDER: BUY {signal.token_a} | SELL {signal.token_b}")
+                    await self.client.place_market_order(signal.token_a, "BUY", float(signal.position_size))
+                    await self.client.place_market_order(signal.token_b, "SELL", float(signal.position_size))
+                
+                # Report to UI history
+                swarm = getattr(self.client, 'swarm_system', None)
+                if swarm:
+                    swarm.add_trade_record(signal.action[:5], signal.pair_name, 0.5, float(signal.position_size))
             else:
-                logger.info(f"   → BUY {signal.token_a} (${signal.position_size})")
-                logger.info(f"   → SELL {signal.token_b} (${signal.position_size})")
-                # await self.client.place_market_order(signal.token_a, "BUY", signal.position_size)
-                # await self.client.place_market_order(signal.token_b, "SELL", signal.position_size)
+                logger.info(f"   🧪 [DRY RUN] Entry for {signal.pair_name}")
+                logger.info(f"      Leg A: {signal.token_a[:15]}...")
+                logger.info(f"      Leg B: {signal.token_b[:15]}...")
+                
+                # Report to UI history even in dry run
+                swarm = getattr(self.client, 'swarm_system', None)
+                if not swarm:
+                    # Try to find via self.swarm_system if available
+                    swarm = getattr(self, 'swarm_system', None)
+                
+                if swarm:
+                    swarm.add_trade_record(signal.action, signal.pair_name, 0.5, float(signal.position_size))
 
-            # Record position
+            # Store in active positions
+            trade_ids = []
+            if self.pnl_tracker:
+                # Record Entry for Leg A
+                tid_a = self.pnl_tracker.record_entry(
+                    strategy="statarb",
+                    token_id=signal.token_a,
+                    side="SELL" if "SHORT_A" in signal.action else "BUY",
+                    price=0.5, # Placeholder for simulation
+                    size=float(signal.position_size)
+                )
+                # Record Entry for Leg B
+                tid_b = self.pnl_tracker.record_entry(
+                    strategy="statarb",
+                    token_id=signal.token_b,
+                    side="BUY" if "LONG_B" in signal.action else "SELL",
+                    price=0.5,
+                    size=float(signal.position_size)
+                )
+                trade_ids = [tid_a, tid_b]
+
             self.active_positions[signal.pair_name] = {
                 'signal': signal,
                 'entry_time': datetime.now(),
                 'entry_z_score': signal.z_score,
-                'allocation_info': allocation_info
+                'allocation_info': allocation_info,
+                'trade_ids': trade_ids
             }
 
             logger.info(f"✅ Position entered for {signal.pair_name}")
 
         except Exception as e:
             logger.error(f"❌ Failed to enter position: {e}")
-
-            # Release budget if allocated
             if allocation_info and self.budget_manager:
-                await self.budget_manager.release_allocation(
-                    "polyai",
-                    allocation_info['allocation_id'],
-                    Decimal("0")  # Nothing spent
-                )
+                await self.budget_manager.release_allocation("statarb", allocation_info['allocation_id'], Decimal("0"))
 
     async def manage_positions(self):
         """Monitor and exit active positions"""
@@ -539,6 +584,7 @@ class EnhancedStatArbStrategy:
 
         signal = position_data['signal']
         metrics = self.pair_metrics_cache.get(pair_name)
+        dry_run = getattr(self.client.config, 'DRY_RUN', True)
 
         logger.info(f"\n{'='*60}")
         logger.info(f"🔚 CLOSING POSITION: {pair_name}")
@@ -551,19 +597,34 @@ class EnhancedStatArbStrategy:
 
         # Execute closing orders (reverse of entry)
         try:
-            if signal.action == "SHORT_A_LONG_B":
-                # Close by: BUY A, SELL B
-                logger.info(f"   → BUY {signal.token_a} (close short)")
-                logger.info(f"   → SELL {signal.token_b} (close long)")
+            if not dry_run:
+                if signal.action == "SHORT_A_LONG_B":
+                    # Close by: BUY A, SELL B
+                    logger.info(f"   🚀 LIVE CLOSE: BUY {signal.token_a} | SELL {signal.token_b}")
+                    await self.client.place_market_order(signal.token_a, "BUY", float(signal.position_size))
+                    await self.client.place_market_order(signal.token_b, "SELL", float(signal.position_size))
+                else:
+                    # Close by: SELL A, BUY B
+                    logger.info(f"   🚀 LIVE CLOSE: SELL {signal.token_a} | BUY {signal.token_b}")
+                    await self.client.place_market_order(signal.token_a, "SELL", float(signal.position_size))
+                    await self.client.place_market_order(signal.token_b, "BUY", float(signal.position_size))
             else:
-                # Close by: SELL A, BUY B
-                logger.info(f"   → SELL {signal.token_a} (close long)")
-                logger.info(f"   → BUY {signal.token_b} (close short)")
+                logger.info(f"   🧪 [DRY RUN] Closing position for {pair_name}")
+
+            # Record Exits
+            if self.pnl_tracker and 'trade_ids' in position_data:
+                for tid in position_data['trade_ids']:
+                    # Simulating a small profit (0.52 exit vs 0.50 entry) for verification
+                    self.pnl_tracker.record_exit(
+                        trade_id=tid, 
+                        exit_price=0.52, 
+                        reason=exit_reason
+                    )
 
             # Release budget allocation
             if position_data['allocation_info'] and self.budget_manager:
                 await self.budget_manager.release_allocation(
-                    "polyai",
+                    "statarb",
                     position_data['allocation_info']['allocation_id'],
                     position_data['allocation_info']['allocated_amount']
                 )

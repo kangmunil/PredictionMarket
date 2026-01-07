@@ -8,6 +8,7 @@ from decimal import Decimal
 import aiohttp
 import websockets
 from web3 import Web3
+from web3.middleware import ExtraDataToPOAMiddleware
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import MarketOrderArgs, OrderArgs
 from py_clob_client.order_builder.constants import BUY, SELL
@@ -131,6 +132,7 @@ class PolyClient:
         
         # Web3 & Contract
         self.w3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
+        self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         self.executor_contract = None
         self._init_contract()
         
@@ -214,7 +216,10 @@ class PolyClient:
                             for cb in self.callbacks[asset_id]:
                                 if asyncio.iscoroutinefunction(cb): await cb(asset_id, book)
                                 else: cb(asset_id, book)
-        except: pass
+        except json.JSONDecodeError as e:
+            logger.warning(f"⚠️ WebSocket JSON Decode Error: {e} | Msg: {message[:100]}...")
+        except Exception as e:
+            logger.error(f"❌ WebSocket Handler Error: {e}")
 
     # --- NEW: Atomic Batch Execution ---
 
@@ -254,6 +259,13 @@ class PolyClient:
         Execute multiple market orders in a single API batch request.
         orders_data: List of {'token_id': str, 'side': str, 'shares': float, 'price': float}
         """
+        logger.info(f"🚀 [EXECUTION] Entering place_batch_market_orders for {len(orders_data)} orders")
+        
+        if self.config.DRY_RUN:
+            total_usd = sum(Decimal(str(o['shares'])) * Decimal(str(o['price'])) for o in orders_data)
+            logger.info(f"🧪 [DRY RUN] Simulating BATCH of {len(orders_data)} orders (Total: ${total_usd:.2f})")
+            return {"status": "OK", "orders": [{"orderID": f"mock_batch_{i}", "price": o['price']} for i, o in enumerate(orders_data)]}
+
         if not self.rest_client:
             logger.error("❌ REST client not initialized")
             return None
@@ -317,8 +329,18 @@ class PolyClient:
         return 0.0 # Or fallback to REST if needed
 
     async def place_market_order(self, token_id: str, side: str, amount: float):
-        # Implementation from V2.0
-        pass
+        """
+        Execute a market order by placing an aggressive limit order 
+        with slippage protection to ensure immediate fill.
+        """
+        logger.info(f"🚀 [EXECUTION] Entering place_market_order for {token_id}")
+        return await self.place_limit_order_with_slippage_protection(
+            token_id=token_id,
+            side=side,
+            amount=amount,
+            max_slippage_pct=2.0,
+            priority="normal"
+        )
 
     # --- NEW: Maker-Taker & Limit Order Support ---
 
@@ -327,6 +349,10 @@ class PolyClient:
         Place a Limit Order (Maker).
         Returns order_id if successful, None otherwise.
         """
+        if self.config.DRY_RUN:
+            logger.info(f"🧪 [DRY RUN] Simulating {side} {size} @ ${price} on {token_id[:10]}...")
+            return f"mock_order_{os.urandom(4).hex()}"
+
         if not self.rest_client:
             logger.error("❌ REST client not initialized")
             return None
@@ -372,6 +398,74 @@ class PolyClient:
         except Exception as e:
             logger.error(f"❌ Limit order exception: {e}")
             return None
+
+    async def place_limit_order_with_slippage_protection(self, token_id: str, side: str, amount: float, max_slippage_pct: float = 1.0, priority: str = "normal") -> Optional[Dict]:
+        """
+        Place a limit order with aggressive pricing to ensure fill within slippage limits.
+        
+        Args:
+            token_id: The market token ID
+            side: 'BUY' or 'SELL'
+            amount: Number of shares
+            max_slippage_pct: Max allowed price deviation (e.g., 2.0 for 2%)
+            priority: Budget priority
+            
+        Returns:
+            Dict with orderID and price, or None if failed.
+        """
+        side = side.upper()
+        
+        # 1. Get current market price (Orderbook top)
+        if token_id in self.orderbooks:
+            book = self.orderbooks[token_id]
+            best_price, _ = book.get_best_ask() if side == 'BUY' else book.get_best_bid()
+        else:
+            # Fallback to REST if not subscribed to WS
+            try:
+                book = self.rest_client.get_order_book(token_id)
+                if side == 'BUY' and book.asks:
+                    best_price = float(book.asks[0].price)
+                elif side == 'SELL' and book.bids:
+                    best_price = float(book.bids[0].price)
+                else:
+                    best_price = 0.0
+            except Exception:
+                best_price = 0.0
+                
+        if best_price <= 0:
+            logger.warning(f"⚠️ Cannot place protected order: No liquidity for {token_id}")
+            return None
+            
+        # 2. Calculate Limit Price with Slippage
+        # BUY: We are willing to pay MORE (up to slippage)
+        # SELL: We are willing to receive LESS (down to slippage)
+        slippage_factor = max_slippage_pct / 100.0
+        
+        if side == 'BUY':
+            limit_price = best_price * (1 + slippage_factor)
+            # Cap at 1.00 (Polymarket max)
+            limit_price = min(limit_price, 0.999) 
+        else:
+            limit_price = best_price * (1 - slippage_factor)
+            # Floor at 0.00
+            limit_price = max(limit_price, 0.001)
+            
+        # Round to valid tick size (usually 2-4 decimals, mostly raw float works but being safe)
+        limit_price = round(limit_price, 4)
+        
+        logger.info(f"🛡️ Slippage Protection: Market ${best_price:.3f} -> Limit ${limit_price:.3f} ({max_slippage_pct}%)")
+        
+        # 3. Place Order
+        # We reuse place_limit_order but catch the string return and wrap it
+        order_id = await self.place_limit_order(token_id, side, limit_price, amount)
+        
+        if order_id:
+            return {
+                "orderID": order_id,
+                "price": limit_price,
+                "filled": amount # Assumption for now, real fill needs ws confirmation
+            }
+        return None
 
     async def cancel_order(self, order_id: str):
         """Cancel a specific order"""

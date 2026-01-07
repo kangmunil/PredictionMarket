@@ -35,8 +35,7 @@ class TelegramNotifier:
         if not self.enabled: return
         
         logger.info("👂 Telegram Listener Active...")
-        # Send a startup message with a menu
-        await self.send_menu("🚀 Hive Mind System is Online!")
+        # startup message moved to orchestrator to avoid duplication
         
         while True:
             try:

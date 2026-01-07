@@ -194,6 +194,13 @@ class MarketMatcher:
         
         async def fetch_query(q):
             params = {"active": "true", "closed": "false", "limit": 50, "query": q}
+            
+            # 🎯 Add Crypto Tag Filter (1002) for Crypto keywords to reduce noise
+            crypto_keywords = [kw.lower() for kw in self.ENTITY_PATTERNS['crypto']]
+            if any(ck in q.lower() for ck in crypto_keywords):
+                params["tag_id"] = 1002 # Crypto Tag
+                logger.debug(f"🎯 Applying Crypto Tag ID filter for query: {q}")
+                
             try:
                 loop = asyncio.get_event_loop()
                 resp = await loop.run_in_executor(None, lambda: requests.get(url, params=params, timeout=10))

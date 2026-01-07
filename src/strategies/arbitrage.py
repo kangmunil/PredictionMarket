@@ -155,7 +155,22 @@ class ArbitrageStrategy:
                     await self.notifier.notify_trade("BUY (ARB)", f"Pair {id_y[:8]}", float(price_y+price_n), self.default_trade_size, "Mathematical Arbitrage")
             else:
                 # Live Batch Order Logic
-                pass 
+                orders = [
+                    {
+                        "token_id": id_y,
+                        "side": "BUY",
+                        "shares": float(self.default_trade_size / Decimal(str(price_y))),
+                        "price": float(price_y)
+                    },
+                    {
+                        "token_id": id_n,
+                        "side": "BUY",
+                        "shares": float(self.default_trade_size / Decimal(str(price_n))),
+                        "price": float(price_n)
+                    }
+                ]
+                await self.client.place_batch_market_orders(orders, priority="high")
+                logger.info(f"✅ Live Batch Order Sent for {id_y} / {id_n}") 
 
         except Exception as e:
             logger.error(f"Arb execution failed: {e}")

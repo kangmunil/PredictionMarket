@@ -1,0 +1,39 @@
+[
+  {
+    "anonymous": false,
+    "inputs": [
+      { "indexed": true, "internalType": "address", "name": "maker", "type": "address" },
+      { "indexed": false, "internalType": "bytes32", "name": "orderHash", "type": "bytes32" },
+      { "indexed": false, "internalType": "uint256", "name": "amountFilled", "type": "uint256" }
+    ],
+    "name": "OrderFilled",
+    "type": "event"
+  },
+  {
+    "inputs": [
+      {
+        "components": [
+          { "internalType": "uint256", "name": "makerOrderNonce", "type": "uint256" },
+          { "internalType": "address", "name": "maker", "type": "address" },
+          { "internalType": "address", "name": "taker", "type": "address" },
+          { "internalType": "uint256", "name": "tokenId", "type": "uint256" },
+          { "internalType": "uint256", "name": "makerAmount", "type": "uint256" },
+          { "internalType": "uint256", "name": "takerAmount", "type": "uint256" },
+          { "internalType": "enum OrderSide", "name": "side", "type": "uint8" },
+          { "internalType": "uint256", "name": "feeRateBps", "type": "uint256" },
+          { "internalType": "uint256", "name": "nonce", "type": "uint256" },
+          { "internalType": "uint256", "name": "signerExpiration", "type": "uint256" },
+          { "internalType": "bytes", "name": "signature", "type": "bytes" }
+        ],
+        "internalType": "struct Order",
+        "name": "order",
+        "type": "tuple"
+      },
+      { "internalType": "uint256", "name": "takerAmount", "type": "uint256" }
+    ],
+    "name": "fillOrder",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  }
+]

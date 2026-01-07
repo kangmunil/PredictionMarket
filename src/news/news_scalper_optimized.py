@@ -23,10 +23,12 @@ import time
 from collections import defaultdict
 import os
 import json
+from dateutil import parser as date_parser
 
 from .news_aggregator import NewsAggregator
 from .sentiment_analyzer import SentimentAnalyzer
 from .market_matcher import MarketMatcher
+from src.core.risk_manager import RiskManager
 
 # RAG System (Advanced AI Analysis)
 try:
@@ -82,6 +84,10 @@ class OptimizedNewsScalper:
         # Analysis Engine
         self.use_rag = use_rag and RAG_AVAILABLE
         # ... rest of init ...
+        
+        # Initialize Risk Manager
+        self.risk_manager = RiskManager()
+        logger.info("🛡️ Risk Manager Initialized (Dynamic Kelly Sizing)")
 
         if self.use_rag:
             logger.info("🤖 Initializing RAG System (Advanced AI Analysis)...")
@@ -371,12 +377,18 @@ class OptimizedNewsScalper:
                 source_data = article.get("source", "Unknown")
                 source_name = source_data.get("name", "Unknown") if isinstance(source_data, dict) else str(source_data)
 
+                # Use dateutil.parser for flexible date parsing
+                try:
+                    pub_date = date_parser.parse(article.get("publishedAt", ""))
+                except:
+                    pub_date = datetime.now()
+
                 event = NewsEvent(
                     event_id=f"news_{hash(url)}",
                     title=title,
                     content=content,
                     source=source_name,
-                    published_at=datetime.fromisoformat(article.get("publishedAt", datetime.now().isoformat()).replace('Z', '+00:00')),
+                    published_at=pub_date,
                     entities=[],  # Will be extracted by RAG
                     category="crypto",  # Default
                     url=url
@@ -617,10 +629,33 @@ class OptimizedNewsScalper:
                 logger.warning(f"   ⚠️  Market '{market_question[:30]}...' has no valid token IDs")
                 return
 
-            # Position size
-            position_size = self.position_size
-            if is_high_impact:
-                position_size *= 1.5
+            # 🛡️ DYNAMIC POSITION SIZING (Kelly Criterion)
+            current_price = await self._get_current_price(token_id)
+            if current_price <= 0: current_price = 0.5 # Safety fallback
+            
+            position_size = self.risk_manager.calculate_position_size(
+                prob_win=sentiment["score"],
+                current_price=current_price,
+                category="crypto", # Can be dynamic based on news
+                volatility_score=0.1 # Placeholder: would calculate from spread
+            )
+            
+            if position_size <= 0:
+                logger.info(f"   🛑 [RISK REJECTED] Size: ${position_size:.2f} | Reason: Low EV (Prob {sentiment['score']:.2f} vs Price {current_price:.2f}) or Volatility Penalty")
+                return
+
+            # 💰 BUDGET ALLOCATION
+            if self.budget_manager:
+                from decimal import Decimal
+                allocation_id = await self.budget_manager.request_allocation(
+                    strategy="arbhunter",
+                    amount=Decimal(str(position_size)),
+                    priority="high" if is_high_impact else "normal"
+                )
+                if not allocation_id:
+                    logger.warning(f"   ⚠️  Budget allocation denied. Skipping trade.")
+                    return
+                logger.debug(f"   💰 Allocation approved: {allocation_id}")
 
             logger.info(f"   💰 Trade Signal: {side} ${position_size:.2f} on '{market_question[:40]}...'")
 
@@ -643,7 +678,8 @@ class OptimizedNewsScalper:
                     "entry_time": datetime.now(),
                     "sentiment": sentiment,
                     "article": article,
-                    "is_high_impact": is_high_impact
+                    "is_high_impact": is_high_impact,
+                    "allocation_id": allocation_id if 'allocation_id' in locals() else None
                 }
                 self.stats["trades_executed"] += 1
                 self.stats["positions_opened"] += 1

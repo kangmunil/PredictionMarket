@@ -4,6 +4,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
+    def __init__(self):
+        self._dry_run_override = None
+
     @property
     def HOST(self):
         return os.getenv("POLY_HOST", "https://clob.polymarket.com")
@@ -57,3 +60,27 @@ class Config:
     @property
     def WS_URL(self):
         return "wss://ws-subscriptions-clob.polymarket.com"
+
+    @property
+    def RPC_URL(self):
+        return os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com")
+
+    @property
+    def DRY_RUN(self) -> bool:
+        """
+        Master switch for trading execution.
+        If True, no real transactions are sent.
+        """
+        if self._dry_run_override is not None:
+            return self._dry_run_override
+            
+        val = os.getenv("DRY_RUN", "True").lower()
+        return val in ("true", "1", "yes", "on")
+
+    @DRY_RUN.setter
+    def DRY_RUN(self, value: bool):
+        self._dry_run_override = bool(value)
+
+    @property
+    def BUDGET_MODE(self) -> str:
+        return os.getenv("BUDGET_MODE", "simulation")

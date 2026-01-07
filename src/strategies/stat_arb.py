@@ -95,22 +95,24 @@ class StatArbStrategy:
         If Z > 0 (Spread too high): Sell A, Buy B (expect A to drop, B to rise)
         If Z < 0 (Spread too low): Buy A, Sell B
         """
-        action = ""
-        if z_score > 0:
-            # Spread A-B is too high. A is expensive, B is cheap.
-            action = f"SHORT A ({token_a}) / LONG B ({token_b})"
-            # self.client.place_order(token_a, SELL)
-            # self.client.place_order(token_b, BUY)
-        else:
-            # Spread A-B is too low. A is cheap, B is expensive.
-            action = f"LONG A ({token_a}) / SHORT B ({token_b})"
-            # self.client.place_order(token_a, BUY)
-            # self.client.place_order(token_b, SELL)
-            
+        amount = 10.0
+        
         logger.info(f"🚨 STAT ARB SIGNAL [{pair_name}]")
         logger.info(f"   Z-Score: {z_score:.2f} (Threshold: {self.z_threshold})")
-        logger.info(f"   Action: {action}")
         logger.info(f"   Reason: Divergence detected. Expecting reversion to mean spread {spread:.3f}")
+        
+        logger.info("   ✅ Executing Stat Arb Pair Trade...")
+        
+        if z_score > 0:
+            # Spread A-B is too high. A is expensive, B is cheap.
+            logger.info(f"   Action: SHORT A ({token_a}) / LONG B ({token_b})")
+            await self.client.place_market_order(token_a, "SELL", amount)
+            await self.client.place_market_order(token_b, "BUY", amount)
+        else:
+            # Spread A-B is too low. A is cheap, B is expensive.
+            logger.info(f"   Action: LONG A ({token_a}) / SHORT B ({token_b})")
+            await self.client.place_market_order(token_a, "BUY", amount)
+            await self.client.place_market_order(token_b, "SELL", amount)
 
     def fetch_history(self, token_id):
         """
