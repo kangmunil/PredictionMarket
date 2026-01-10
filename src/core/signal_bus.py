@@ -2,7 +2,9 @@ import asyncio
 import logging
 from typing import Dict, Any, Optional
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+
+from src.core.config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,13 @@ class MarketSignal:
     # Volatility / Arb
     is_volatile: bool = False
     arb_opportunity_detected: bool = False
+    delta_exposure: float = 0.0
+    long_avg_price: float = 0.0
+    short_avg_price: float = 0.0
+    spread: float = 0.0
+    spread_bps: float = 0.0
+    spread_regime: str = "UNKNOWN"
+    expires_at: Optional[datetime] = None
     
     last_updated: datetime = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -49,6 +58,12 @@ class SignalBus:
         self._global_mode: str = "NORMAL" # NORMAL, BULL_FRENZY, PANIC_SELL
         self._lock = asyncio.Lock()
         self._initialized = True
+        cfg = Config()
+        thresholds = cfg.SPREAD_REGIME_THRESHOLDS
+        self._spread_thresholds = {
+            "efficient": float(thresholds.get("efficient", 0.01)),
+            "neutral": float(thresholds.get("neutral", 0.03)),
+        }
         logger.info("🧠 SignalBus (Hive Mind) Initialized")
 
     async def update_signal(self, token_id: str, source: str, **kwargs):
@@ -79,6 +94,71 @@ class SignalBus:
 
             logger.debug(f"🧠 Bus Updated [{source}] for {token_id[:10]}... | Sent:{signal.sentiment_score:.2f} Whale:{signal.whale_activity_score:.2f}")
 
+    async def update_market_metrics(
+        self,
+        token_id: str,
+        *,
+        delta_exposure: Optional[float] = None,
+        long_avg_price: Optional[float] = None,
+        short_avg_price: Optional[float] = None,
+        spread: Optional[float] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        best_bid: Optional[float] = None,
+        best_ask: Optional[float] = None,
+        mid_price: Optional[float] = None,
+    ):
+        async with self._lock:
+            if token_id not in self._signals:
+                self._signals[token_id] = MarketSignal(token_id=token_id)
+            signal = self._signals[token_id]
+            signal.last_updated = datetime.now()
+
+            if delta_exposure is not None:
+                signal.delta_exposure = delta_exposure
+            if long_avg_price is not None:
+                signal.long_avg_price = long_avg_price
+            if short_avg_price is not None:
+                signal.short_avg_price = short_avg_price
+            spread_value = None
+            mid_reference = mid_price
+            if best_bid and best_ask and best_bid > 0 and best_ask > 0:
+                spread_value = max(best_ask - best_bid, 0.0)
+                mid_reference = (best_ask + best_bid) / 2.0
+                signal.metadata["best_bid"] = best_bid
+                signal.metadata["best_ask"] = best_ask
+            elif spread is not None:
+                spread_value = max(spread, 0.0)
+
+            if spread_value is not None:
+                if mid_reference is None and signal.long_avg_price and signal.short_avg_price:
+                    avg_prices = [signal.long_avg_price, signal.short_avg_price]
+                    positives = [p for p in avg_prices if p and p > 0]
+                    if len(positives) == 2:
+                        mid_reference = sum(positives) / 2.0
+
+                signal.spread = spread_value
+                spread_ratio = (
+                    (spread_value / mid_reference) if mid_reference and mid_reference > 0 else None
+                )
+                if spread_ratio is not None:
+                    signal.spread_bps = spread_ratio * 10000.0
+                else:
+                    signal.spread_bps = 0.0
+                signal.spread_regime = self._classify_spread(spread_ratio)
+
+            if metadata:
+                signal.metadata.update(metadata)
+
+            expires_at_val = None
+            if metadata and metadata.get("expires_at"):
+                expires_at_val = metadata["expires_at"]
+            elif signal.metadata.get("expires_at"):
+                expires_at_val = signal.metadata.get("expires_at")
+
+            if expires_at_val:
+                expiry_ctx = self._calculate_expiry_phase(expires_at_val)
+                signal.metadata["expiry"] = expiry_ctx
+
     async def get_signal(self, token_id: str) -> MarketSignal:
         """특정 토큰의 종합 상태 조회"""
         if token_id not in self._signals:
@@ -90,4 +170,68 @@ class SignalBus:
         return {
             k: v for k, v in self._signals.items() 
             if abs(v.sentiment_score) >= min_sentiment or v.whale_activity_score >= min_whale
+        }
+
+    async def get_spread_snapshot(
+        self,
+        max_entries: int = 6,
+        max_age_seconds: int = 300,
+    ) -> list[Dict[str, Any]]:
+        """
+        Return a prioritized snapshot of spread regimes for observability.
+        """
+        severity = {"INEFFICIENT": 2, "EFFICIENT": 1, "NEUTRAL": 0, "UNKNOWN": -1}
+        now = datetime.now()
+        entries = []
+        async with self._lock:
+            for token_id, signal in self._signals.items():
+                age = (now - signal.last_updated).total_seconds()
+                if age > max_age_seconds:
+                    continue
+                regime = (signal.spread_regime or "UNKNOWN").upper()
+                if regime == "NORMAL":
+                    regime = "NEUTRAL"
+                entry = {
+                    "token_id": token_id,
+                    "regime": regime,
+                    "spread_bps": round(signal.spread_bps or 0.0, 2),
+                    "updated_at": signal.last_updated.isoformat(),
+                }
+                entries.append((severity.get(regime, -1), entry))
+
+        entries.sort(key=lambda item: (item[0], item[1]["spread_bps"]), reverse=True)
+        return [entry for _, entry in entries[:max_entries]]
+
+    def _classify_spread(self, spread_ratio: Optional[float]) -> str:
+        if spread_ratio is None or spread_ratio <= 0:
+            return "UNKNOWN"
+        if spread_ratio < self._spread_thresholds["efficient"]:
+            return "EFFICIENT"
+        if spread_ratio < self._spread_thresholds["neutral"]:
+            return "NEUTRAL"
+        return "INEFFICIENT"
+
+    def _calculate_expiry_phase(self, expires_at_value: str) -> Dict[str, Any]:
+        try:
+            expiry_dt = datetime.fromisoformat(str(expires_at_value).replace("Z", "+00:00"))
+        except Exception:
+            return {"minutes_remaining": 9999, "phase": "EARLY"}
+
+        now = datetime.now(timezone.utc)
+        delta = expiry_dt - now
+        minutes = max(0, delta.total_seconds() / 60)
+
+        if minutes < 15:
+            phase = "ENDGAME"
+        elif minutes < 60:
+            phase = "LATE"
+        elif minutes < 240:
+            phase = "MID"
+        else:
+            phase = "EARLY"
+
+        return {
+            "minutes_remaining": minutes,
+            "phase": phase,
+            "expires_at": expiry_dt.isoformat(),
         }

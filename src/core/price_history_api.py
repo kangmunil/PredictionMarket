@@ -5,7 +5,7 @@ Fetches real historical price data for statistical arbitrage analysis
 import asyncio
 import aiohttp
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import logging
 import os
 
@@ -36,6 +36,7 @@ class PolymarketHistoryAPI:
         self._mcp_client: Optional[PolymarketMCPClient] = None
         self._trade_cache: Dict[str, Dict] = {}
         self._cache_ttl = timedelta(minutes=5)
+        self._history_source_cache: Dict[str, Dict] = {}
 
     async def _ensure_session(self):
         """Ensure aiohttp session is created"""
@@ -101,45 +102,82 @@ class PolymarketHistoryAPI:
             'price': current_price
         }]
 
+    async def get_history_with_source(
+        self,
+        condition_id: str,
+        days: int = 30,
+        min_points: int = 10,
+    ) -> Tuple[List[Dict], str]:
+        """
+        Return historical points along with the data source that produced them.
+        This is the primary entrypoint for strategies that need to reason
+        about data quality.
+        """
+        await self._ensure_session()
+
+        end_time = datetime.now()
+        start_time = end_time - timedelta(days=days)
+
+        points, source = await self._collect_history_points(
+            condition_id=condition_id,
+            days=days,
+            start_time=start_time,
+            end_time=end_time,
+            min_points=min_points,
+        )
+
+        self._history_source_cache[condition_id] = {
+            "source": source,
+            "points": len(points),
+            "timestamp": datetime.now().isoformat(),
+        }
+        return points, source
+
     async def get_historical_events(
         self,
         condition_id: str,
         days: int = 30
     ) -> List[Dict]:
         """
-        Fetch historical price snapshots from events/trades
-
-        Args:
-            condition_id: Market condition ID
-            days: Number of days of history
-
-        Returns:
-            List of {'timestamp': datetime, 'price': float} dicts
+        Backwards-compatible wrapper that returns only price points.
+        Call get_history_with_source when the caller needs metadata.
         """
-        await self._ensure_session()
+        points, _ = await self.get_history_with_source(condition_id, days=days)
+        return points
 
-        # Calculate time range
-        end_time = datetime.now()
-        start_time = end_time - timedelta(days=days)
-
-        # Prefer MCP trade history when available
+    async def _collect_history_points(
+        self,
+        condition_id: str,
+        days: int,
+        start_time: datetime,
+        end_time: datetime,
+        min_points: int = 10,
+    ) -> Tuple[List[Dict], str]:
         mcp_points = await self._fetch_trades_via_mcp(condition_id, days, start_time)
         if mcp_points:
-            return mcp_points
+            logger.info(f"Using MCP trade history for {condition_id} ({len(mcp_points)} pts)")
+            return mcp_points, "MCP_TRADES"
 
         events = await self._fetch_events_from_gamma(condition_id, start_time, end_time)
-        if not events:
-            return self._generate_synthetic_history(condition_id, days)
+        if events:
+            price_points = self._parse_events_to_prices(events)
+            if len(price_points) >= min_points:
+                logger.info(f"Using Gamma events history for {condition_id} ({len(price_points)} pts)")
+                return price_points, "GAMMA_EVENTS"
+            logger.warning(f"Gamma events insufficient for {condition_id} ({len(price_points)} pts)")
 
-        # Parse events into price points
-        price_points = self._parse_events_to_prices(events)
+        logger.warning(f"Using synthetic history for {condition_id}")
+        synthetic = self._generate_synthetic_history(condition_id, days)
+        return synthetic, "SYNTHETIC"
 
-        if len(price_points) < 10:
-            logger.warning(f"Insufficient event data for {condition_id}, using synthetic")
-            return self._generate_synthetic_history(condition_id, days)
+    def get_history_source(self, condition_id: str) -> Optional[str]:
+        info = self._history_source_cache.get(condition_id)
+        if not info:
+            return None
+        return info.get("source")
 
-        logger.info(f"Fetched {len(price_points)} price points for {condition_id}")
-        return price_points
+    def get_history_source_snapshot(self) -> Dict[str, Dict]:
+        return {cid: meta.copy() for cid, meta in self._history_source_cache.items()}
 
     async def _fetch_market_snapshot(self, condition_id: str) -> Optional[Dict]:
         await self._ensure_session()
@@ -333,6 +371,34 @@ class PolymarketHistoryAPI:
             {'timestamp': ts, 'price': float(price)}
             for ts, price in zip(timestamps, prices)
         ]
+
+    async def get_recent_trade_price(
+        self,
+        condition_id: str,
+        minutes: int = 60
+    ) -> Optional[float]:
+        """
+        Return the most recent MCP trade price within the lookback window.
+        """
+        if minutes <= 0:
+            minutes = 5
+
+        start_time = datetime.now() - timedelta(minutes=minutes)
+        trades = await self._fetch_trades_via_mcp(
+            condition_id=condition_id,
+            days=1,
+            start_time=start_time,
+        )
+        if not trades:
+            return None
+
+        last_price = trades[-1].get("price")
+        if last_price is None:
+            return None
+        try:
+            return float(last_price)
+        except (ValueError, TypeError):
+            return None
 
 
 async def test_api():

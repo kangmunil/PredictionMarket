@@ -28,11 +28,17 @@ class RiskManager:
     Calculates optimal bet sizes and enforces safety limits.
     """
 
-    def __init__(self, total_capital: float = 1000.0, risk_multiplier: float = 0.25):
+    def __init__(
+        self,
+        total_capital: float = 1000.0,
+        risk_multiplier: float = 0.25,
+        max_bet_usd: Optional[float] = None,
+    ):
         self.total_capital = float(total_capital)
         self.risk_multiplier = risk_multiplier # Quarter Kelly (0.25)
         self.max_bet_cap_pct = 0.10  # Max 10% of portfolio per trade
         self.max_daily_loss_pct = 0.03 # 3% daily loss limit
+        self.max_bet_usd = float(max_bet_usd) if max_bet_usd is not None else None
         
         # State tracking
         self.daily_start_capital = self.total_capital
@@ -124,6 +130,10 @@ class RiskManager:
         # 8. Calculate Dollar Amount
         bet_amount = self.total_capital * final_fraction
         
+        if self.max_bet_usd is not None and bet_amount > self.max_bet_usd:
+            logger.info(f"🔒 Absolute Bet Cap Applied: ${bet_amount:.2f} → ${self.max_bet_usd:.2f}")
+            bet_amount = self.max_bet_usd
+
         logger.info(f"⚖️ Risk Sizing: P({prob_win:.2f}) vs Price({current_price:.2f}) -> Kelly({kelly_fraction:.2%}) -> Safe({final_fraction:.2%}) -> ${bet_amount:.2f}")
         
         return max(bet_amount, 0.0)

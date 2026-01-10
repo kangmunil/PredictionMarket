@@ -1,9 +1,13 @@
 import asyncio
+import json
 import logging
 import os
+import re
 import signal
 import sys
-from datetime import datetime
+from contextlib import suppress
+from datetime import datetime, timedelta
+from uuid import uuid4
 from dotenv import load_dotenv
 
 # Load Environment Variables
@@ -17,41 +21,35 @@ from src.core.budget_manager import BudgetManager
 from src.core.notifier import TelegramNotifier
 from src.core.gamma_client import GammaClient
 from src.core.pnl_tracker import PnLTracker
+from src.core.delta_tracker import DeltaTracker
+from src.core.structured_logger import setup_logging, StructuredLogger
+from src.core.health_monitor import get_health_monitor, record_heartbeat
 
-# Strategies
+# Strategies & Agents
 from src.news.news_scalper_optimized import OptimizedNewsScalper
 from src.strategies.stat_arb_enhanced import EnhancedStatArbStrategy
-from src.strategies.arbitrage import ArbitrageStrategy
 from src.strategies.elite_mimic import EliteMimicAgent
+from src.strategies.arbitrage import ArbitrageStrategy
 
 # Setup Logging
-log_dir = "logs"
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
-
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-log_filename = f"{log_dir}/swarm_{timestamp}.log"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(log_filename, mode='a') 
-    ]
-)
+# Initial logging before args are parsed
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SwarmOrchestrator")
-logger.info(f"📝 Logging to {log_filename}")
 
 class SwarmSystem:
-    def __init__(self):
+    def __init__(self, json_logs: bool = False):
+        self.json_logs = json_logs
         self.config = Config()
-        self.client = PolyClient()
-        self.client.swarm_system = self # Link back for reporting (Fix for dashboard trade counts)
         self.bus = SignalBus()
+        self.client = PolyClient()
+        self.client.signal_bus = self.bus
+        self.client.swarm_system = self # Link back for reporting (Fix for dashboard trade counts)
         self.pnl_tracker = PnLTracker()
+        self.delta_tracker = DeltaTracker(self.bus, delta_limits=self.config.DELTA_LIMITS)
         self.budget_manager = None
         self.notifier = None
+        self.health_monitor = None
+        self.s_logger = None
 
         # Trading Control
         self.trading_enabled = True
@@ -69,9 +67,21 @@ class SwarmSystem:
 
         self.running = True
         self.tasks = []
+        self.notifier_task = None
+        self.status_heartbeat_minutes = int(os.getenv("STATUS_HEARTBEAT_MINUTES", "30"))
+        self.status_watch_interval = int(os.getenv("STATUS_WATCH_INTERVAL_SECONDS", "300"))
+        self.pnl_alert_threshold = float(os.getenv("STATUS_PNL_ALERT_THRESHOLD", "5.0"))
+        self._last_total_pnl = None
 
     async def setup(self, dry_run: bool = False):
-        logger.info(f"🐝 Initializing Swarm Intelligence System... (Mode: {'DRY RUN' if dry_run else 'LIVE'})")
+        # Configure advanced logging
+        setup_logging(
+            level=logging.INFO,
+            json_output=self.json_logs,
+            log_file=f"logs/swarm_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        )
+        self.s_logger = StructuredLogger("SwarmOrchestrator")
+        self.s_logger.info(f"🐝 Initializing Swarm Intelligence System... (Mode: {'DRY RUN' if dry_run else 'LIVE'})")
 
         # 0. Init Notifier & Commands
         self.notifier = TelegramNotifier(
@@ -82,7 +92,7 @@ class SwarmSystem:
 
         # Start notifier polling in background (non-blocking)
         if self.notifier.enabled:
-            asyncio.create_task(self.notifier.start_polling())
+            self.notifier_task = asyncio.create_task(self.notifier.start_polling())
             await self.notifier.send_message("🚀 *Hive Mind Swarm Intelligence* Online!\nUse /status to check system.")
             logger.info("✅ Telegram Notifier initialized and polling started")
         else:
@@ -95,7 +105,18 @@ class SwarmSystem:
         self.client.config.DRY_RUN = dry_run
         
         # Budget
-        self.budget_manager = BudgetManager(total_capital=1000.0)
+        initial_capital = 1000.0
+        if not dry_run:
+            try:
+                # Attempt to fetch real balance
+                balance_str = await self.client.get_usdc_balance()
+                initial_capital = float(balance_str)
+                logger.info(f"💳 Wallet Balance Detected: ${initial_capital:.2f}")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not fetch balance, defaulting to $44.0: {e}")
+                initial_capital = 44.0
+
+        self.budget_manager = BudgetManager(total_capital=initial_capital)
         
         # 1. News Scalper
         self.news_agent = OptimizedNewsScalper(
@@ -109,14 +130,16 @@ class SwarmSystem:
             openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
             supabase_url=os.getenv("SUPABASE_URL"),
             supabase_key=os.getenv("SUPABASE_KEY"),
-            swarm_system=self
+            swarm_system=self,
+            delta_tracker=self.delta_tracker
         )
 
         # 2. Stat Arb
         self.stat_arb_agent = EnhancedStatArbStrategy(
             client=self.client,
             budget_manager=self.budget_manager,
-            pnl_tracker=self.pnl_tracker
+            pnl_tracker=self.pnl_tracker,
+            delta_tracker=self.delta_tracker
         )
 
         # Load pairs from config
@@ -147,6 +170,15 @@ class SwarmSystem:
             budget_manager=self.budget_manager
         )
         self.arb_agent.notifier = self.notifier
+
+        # 5. Health Monitor
+        import redis.asyncio as aioredis
+        redis = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost"))
+        self.health_monitor = await get_health_monitor(
+            redis=redis,
+            budget_manager=self.budget_manager,
+            metrics_port=int(os.getenv("METRICS_PORT", "8000"))
+        )
 
         logger.info("✅ All Agents Initialized & Connected to Hive Mind")
 
@@ -180,60 +212,234 @@ class SwarmSystem:
                 await self.notifier.send_message("⏳ System is still initializing. Please wait...")
                 return
 
-            # 1. Fetch prices for unrealized PnL
-            active_tokens = {entry.token_id for entry in self.pnl_tracker.active_trades.values()}
-            current_prices = {}
-            
-            # Fetch prices (could be optimized with batch fetch in future)
-            for tid in active_tokens:
-                price = self.client.get_best_ask_price(tid)
-                # If price is 0 (no liquidity/offline), try to use last known or skip
-                if price > 0:
-                    current_prices[tid] = price
-                elif self.client.config.DRY_RUN:
-                    # In Dry Run, simulate slight price movement for demo
-                    import random
-                    # entry price might not be easily accessible here without query, so just skip
-                    # or assume 0.5 for stability if unknown
-                    current_prices[tid] = 0.505 # Slight profit simulation
+            payload = await self._build_status_payload()
+            self._log_status_snapshot(payload)
+            message = self._format_status_message(payload)
+            await self.notifier.send_message(message)
+        except Exception as e:
+            logger.exception("❌ Failed to generate status report")
+            await self.notifier.send_message(f"⚠️ Failed to fetch status: {e}")
 
-            # 2. Calculate PnL
-            status = await self.budget_manager.get_status()
-            pnl_summary = self.pnl_tracker.get_summary()
-            
-            realized_pnl = pnl_summary['total_pnl']
-            unrealized_pnl = self.pnl_tracker.calculate_unrealized_pnl(current_prices)
-            total_equity_pnl = realized_pnl + unrealized_pnl
-            
-            active_sigs = await self.bus.get_hot_tokens(min_sentiment=0.1) if self.bus else {}
-            trading_status = "🟢 ENABLED" if self.trading_enabled else "🔴 STOPPED"
-            
-            # 3. Format Message
-            lines = [
-                "📊 *Hive Mind Status Report*",
-                "",
-                f"Trading: {trading_status}",
-                "",
-                "💎 *Performance:*",
-                f"  Realized: *${realized_pnl:+.2f}*",
-                f"  Unrealized: *${unrealized_pnl:+.2f}* (Floating)",
-                f"  Total PnL: *${total_equity_pnl:+.2f}*",
+    async def _build_status_payload(self) -> dict:
+        """Collect a single source-of-truth payload for /status reporting."""
+        active_tokens = {entry.token_id for entry in self.pnl_tracker.active_trades.values()}
+        current_prices = {}
+
+        for tid in active_tokens:
+            price = self.client.get_best_ask_price(tid)
+            if price > 0:
+                current_prices[tid] = price
+            elif self.client.config.DRY_RUN:
+                current_prices[tid] = 0.505
+
+        status = await self.budget_manager.get_status()
+        pnl_summary = self.pnl_tracker.get_summary()
+        realized_pnl = float(pnl_summary['total_pnl'])
+        unrealized_pnl = float(self.pnl_tracker.calculate_unrealized_pnl(current_prices))
+        total_equity_pnl = realized_pnl + unrealized_pnl
+
+        active_sigs = await self.bus.get_hot_tokens(min_sentiment=0.1) if self.bus else {}
+        serialized_signals = [
+            {
+                "token_id": token_id,
+                "sentiment": float(signal.sentiment_score),
+                "whale": float(signal.whale_activity_score),
+                "last_updated": signal.last_updated.isoformat(),
+            }
+            for token_id, signal in active_sigs.items()
+        ]
+
+        balances = status.get('balances', {})
+        risk_exposure = []
+        if self.delta_tracker:
+            delta_snapshot = self.delta_tracker.get_snapshot()
+            limit_table = self.config.DELTA_LIMITS
+            for market_key, entry in delta_snapshot.items():
+                long_size = float(entry.get("long_size", 0.0))
+                short_size = float(entry.get("short_size", 0.0))
+                net = long_size - short_size
+                if abs(net) < 1.0:
+                    continue
+                group = entry.get("market_group", "DEFAULT")
+                group_limits = limit_table.get(group, limit_table.get("DEFAULT", {}))
+                hard = group_limits.get("hard")
+                soft = group_limits.get("soft")
+                status_flag = "OK"
+                if hard and abs(net) >= hard:
+                    status_flag = "HARD"
+                elif soft and abs(net) >= soft:
+                    status_flag = "SOFT"
+                usage_pct = (abs(net) / hard * 100) if hard else None
+                risk_exposure.append(
+                    {
+                        "market": market_key,
+                        "group": group,
+                        "net": net,
+                        "hard_limit": hard,
+                        "soft_limit": soft,
+                        "usage_pct": usage_pct,
+                        "status": status_flag,
+                    }
+                )
+        risk_exposure.sort(key=lambda x: abs(x["net"]), reverse=True)
+
+        history_sources = []
+        price_api = getattr(getattr(self, "stat_arb_agent", None), "_price_api", None)
+        if price_api and hasattr(price_api, "get_history_source_snapshot"):
+            snapshot = price_api.get_history_source_snapshot()
+            for cid, meta in snapshot.items():
+                history_sources.append(
+                    {
+                        "condition": cid,
+                        "source": meta.get("source", "UNKNOWN"),
+                        "points": meta.get("points"),
+                        "timestamp": meta.get("timestamp"),
+                    }
+                )
+        history_sources.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
+
+        real_wallet_balance = None
+        if not self.client.config.DRY_RUN:
+            try:
+                real_wallet_balance = await self.client.get_usdc_balance()
+            except Exception as exc:
+                logger.error(f"Live balance fetch failed: {exc}")
+
+        payload = {
+            "type": "STATUS_SNAPSHOT",
+            "snapshot_id": str(uuid4()),
+            "timestamp": datetime.now().isoformat(),
+            "mode": "DRY_RUN" if self.client.config.DRY_RUN else "LIVE",
+            "trading": {
+                "enabled": self.trading_enabled,
+            },
+            "performance": {
+                "realized": realized_pnl,
+                "unrealized": unrealized_pnl,
+                "total": total_equity_pnl,
+            },
+            "balances": {
+                "arbhunter": float(balances.get('arbhunter', 0)),
+                "statarb": float(balances.get('statarb', 0)),
+                "elitemimic": float(balances.get('elitemimic', 0)),
+                "reserve": float(status.get('reserve', 0)),
+                "wallet_usdc": real_wallet_balance,
+            },
+            "positions": {
+                "open": int(pnl_summary['open_positions']),
+                "closed": int(pnl_summary['closed_trades']),
+            },
+            "signals": {
+                "active_count": len(serialized_signals),
+                "entries": serialized_signals,
+            },
+            "risk": {
+                "exposure": risk_exposure,
+            },
+            "history_sources": history_sources,
+            "spread_stats": await self.bus.get_spread_snapshot() if self.bus else [],
+        }
+        return payload
+
+    def _log_status_snapshot(self, payload: dict) -> None:
+        """Write the JSON payload to logs for later auditing."""
+        logger.info("STATUS_SNAPSHOT %s", json.dumps(payload, ensure_ascii=False))
+
+    @staticmethod
+    def _tg_escape(value: str) -> str:
+        """Escape Telegram Markdown control characters in dynamic values."""
+        if value is None:
+            return ""
+        return re.sub(r'([_\[\]\(\)~`>#+=|{}!])', r'\\\1', str(value))
+
+    def _format_status_message(self, payload: dict) -> str:
+        """Convert the payload into a Telegram-friendly status message."""
+        trading_state = "🟢 ENABLED" if payload["trading"]["enabled"] else "🔴 STOPPED"
+        perf = payload["performance"]
+        balances = payload["balances"]
+        positions = payload["positions"]
+        signals = payload["signals"]
+        risk = payload.get("risk", {})
+        exposures = risk.get("exposure", [])
+        history_sources = payload.get("history_sources", [])
+        spread_stats = payload.get("spread_stats", [])
+
+        sid = self._tg_escape(payload['snapshot_id'][:8])
+        mode = self._tg_escape(payload['mode'])
+        realized = self._tg_escape(f"{perf['realized']:+.2f}")
+        unrealized = self._tg_escape(f"{perf['unrealized']:+.2f}")
+        total = self._tg_escape(f"{perf['total']:+.2f}")
+
+        lines = [
+            "📊 *Hive Mind Status Report*",
+            f"ID: `{sid}` | Mode: {mode}",
+            "",
+            f"Trading: {trading_state}",
+            "",
+            "💎 *Performance:*",
+            f"  Realized: *${realized}*",
+            f"  Unrealized: *${unrealized}* (Floating)",
+            f"  Total PnL: *${total}*",
+        ]
+
+        wallet_balance = balances.get("wallet_usdc")
+        lines.append("")
+        if wallet_balance is not None:
+            lines.append(f"💳 *Wallet Balance:* ${wallet_balance:.2f}")
+        else:
+            lines.append("💳 *Wallet Balance:* $0.00 _(fetch failed)_")
+
+        lines.extend(
+            [
                 "",
                 "💰 *Allocated Balances:*",
-                f"- ARBHUNTER: ${status['balances'].get('arbhunter', 0):.2f}",
-                f"- STATARB: ${status['balances'].get('statarb', 0):.2f}",
-                f"- ELITEMIMIC: ${status['balances'].get('elitemimic', 0):.2f}",
-                f"- Reserve: ${status.get('reserve', 0):.2f}",
+                f"- ARBHUNTER: ${balances['arbhunter']:.2f}",
+                f"- STATARB: ${balances['statarb']:.2f}",
+                f"- ELITEMIMIC: ${balances['elitemimic']:.2f}",
+                f"- Reserve: ${balances['reserve']:.2f}",
                 "",
-                f"📈 *Open Positions:* {pnl_summary['open_positions']}",
-                f"✅ *Completed Trades:* {pnl_summary['closed_trades']}",
-                f"🧠 *Active Signals:* {len(active_sigs)}"
+                f"📈 *Open Positions:* {positions['open']}",
+                f"✅ *Completed Trades:* {positions['closed']}",
+                f"🧠 *Active Signals:* {signals['active_count']}",
             ]
-            
-            await self.notifier.send_message("\n".join(lines))
-        except Exception as e:
-            logger.error(f"Status report error: {e}")
-            await self.notifier.send_message("❌ Error building status report.")
+        )
+        if exposures:
+            lines.append("")
+            lines.append("⚖️ *Risk Exposure:*")
+            for entry in exposures[:3]:
+                usage = entry.get("usage_pct")
+                usage_str = f"{usage:.0f}%" if usage is not None else "n/a"
+                market_id = entry["market"]
+                market_label = market_id[:12] + ("…" if len(market_id) > 12 else "")
+                group = self._tg_escape(entry.get("group", "UNKNOWN"))
+                status = self._tg_escape(entry.get("status", "OK"))
+                lines.append(
+                    f"- {market_label} ({group}): {entry['net']:+.1f} [{status}] {usage_str}"
+                )
+        if history_sources:
+            lines.append("")
+            lines.append("🗂 *History Sources:*")
+            for entry in history_sources[:3]:
+                condition_id = entry["condition"]
+                market_label = condition_id[:12] + ("…" if len(condition_id) > 12 else "")
+                source = self._tg_escape(entry.get("source", "UNKNOWN"))
+                points = entry.get("points")
+                pts_str = f"{points}" if points is not None else "?"
+                lines.append(f"- {market_label}: {source} ({pts_str} pts)")
+
+        if spread_stats:
+            lines.append("")
+            lines.append("📡 *Spread Regimes:*")
+            for entry in spread_stats:
+                token_label = entry["token_id"][:12] + ("…" if len(entry["token_id"]) > 12 else "")
+                regime = self._tg_escape(entry.get("regime", "UNKNOWN"))
+                spread_bps = entry.get("spread_bps", 0.0)
+                lines.append(f"- {token_label}: {regime} ({spread_bps:.0f} bps)")
+        else:
+            lines.append("")
+            lines.append("📡 *Spread Regimes:* All Normal")
+
+        return "\n".join(lines)
 
     async def handle_stop(self, text):
         self.trading_enabled = False
@@ -284,7 +490,15 @@ class SwarmSystem:
             keywords = self.config.MONITOR_KEYWORDS
 
             logger.info(f"🚀 Swarm 요원 가동 시작... (감시 키워드: {len(keywords)}개)")
-            logger.info("📋 Starting 6 bots: NewsScalper, StatArb, EliteMimic, PureArb, HealthMonitor, DailyReport")
+
+            # WebSocket control via environment variable
+            enable_websocket = os.getenv("ENABLE_WEBSOCKET", "true").lower() in ("true", "1", "yes", "on")
+
+            if enable_websocket:
+                logger.info("📋 Starting 9 bots: PolyWS, NewsScalper, StatArb, EliteMimic, PureArb, HealthMonitor, DailyReport, StatusWatchdog, Heartbeat")
+            else:
+                logger.warning("⚠️ WebSocket DISABLED - Using REST API only (Set ENABLE_WEBSOCKET=true to enable)")
+                logger.info("📋 Starting 8 bots: NewsScalper, StatArb, EliteMimic, PureArb, HealthMonitor, DailyReport, StatusWatchdog, Heartbeat")
 
             # 모든 에이전트를 동일한 루프에서 동시에 실행
             self.tasks = [
@@ -292,9 +506,15 @@ class SwarmSystem:
                 asyncio.create_task(self.stat_arb_agent.run(), name="StatArb"),
                 asyncio.create_task(self.mimic_agent.run(), name="EliteMimic"),
                 asyncio.create_task(self.arb_agent.run(), name="PureArb"),
-                asyncio.create_task(self._monitor_swarm_health(), name="HealthMonitor"),
-                asyncio.create_task(self._daily_report_task(), name="DailyReport")
+                asyncio.create_task(self.health_monitor.run(), name="HealthMonitor"),
+                asyncio.create_task(self._daily_report_task(), name="DailyReport"),
+                asyncio.create_task(self._status_watchdog_task(), name="StatusWatchdog"),
+                asyncio.create_task(self._swarm_heartbeat_task(), name="Heartbeat"),
             ]
+
+            # Add WebSocket task only if enabled
+            if enable_websocket:
+                self.tasks.insert(0, asyncio.create_task(self.client.start_ws(), name="PolyWS"))
 
             logger.info(f"✅ All {len(self.tasks)} bot tasks created successfully")
 
@@ -317,6 +537,17 @@ class SwarmSystem:
             if self.notifier and self.notifier.enabled:
                 await self.notifier.send_message(msg)
 
+    async def _swarm_heartbeat_task(self):
+        """Send heartbeats for all active agents to Redis"""
+        redis = self.health_monitor.redis
+        while self.running:
+            await record_heartbeat(redis, "SwarmOrchestrator")
+            if self.news_agent: await record_heartbeat(redis, "NewsScalper")
+            if self.stat_arb_agent: await record_heartbeat(redis, "StatArb")
+            if self.mimic_agent: await record_heartbeat(redis, "EliteMimic")
+            if self.arb_agent: await record_heartbeat(redis, "PureArb")
+            await asyncio.sleep(30)
+
     async def _monitor_swarm_health(self):
         while self.running:
             await asyncio.sleep(60)
@@ -325,27 +556,135 @@ class SwarmSystem:
             if hot_tokens:
                 logger.info(f"🔥 Swarm Alert: {len(hot_tokens)} active signals detected!")
 
+    async def _status_watchdog_task(self):
+        if not self.notifier or not self.notifier.enabled:
+            return
+        check_interval = max(60, self.status_watch_interval)
+        next_heartbeat = datetime.now() + timedelta(minutes=self.status_heartbeat_minutes)
+        while self.running:
+            await asyncio.sleep(check_interval)
+            try:
+                payload = await self._build_status_payload()
+            except Exception as exc:
+                logger.error(f"Status watchdog failed to build payload: {exc}")
+                continue
+
+            perf = payload["performance"]
+            total_pnl = float(perf["total"])
+            delta = 0.0 if self._last_total_pnl is None else total_pnl - self._last_total_pnl
+            exposures = payload.get("risk", {}).get("exposure", [])
+            risky = next(
+                (
+                    entry
+                    for entry in exposures
+                    if entry.get("status") not in ("OK", None)
+                    or ((entry.get("usage_pct") or 0.0) >= 95.0)
+                ),
+                None,
+            )
+
+            now = datetime.now()
+            reason = None
+            if self._last_total_pnl is not None and abs(delta) >= self.pnl_alert_threshold:
+                reason = f"🔔 *PnL Alert* Δ${delta:+.2f}"
+            elif risky:
+                usage = risky.get("usage_pct")
+                usage_str = f"{usage:.0f}%" if usage is not None else "limit"
+                reason = f"⚠️ *Delta Alert* {risky['market']} at {usage_str}"
+            elif now >= next_heartbeat:
+                reason = "🕰️ *Status Heartbeat*"
+                next_heartbeat = now + timedelta(minutes=self.status_heartbeat_minutes)
+
+            self._last_total_pnl = total_pnl
+
+            if not reason:
+                continue
+
+            self._log_status_snapshot(payload)
+            message = f"{reason}\n\n{self._format_status_message(payload)}"
+            try:
+                await self.notifier.send_message(message)
+            except Exception as exc:
+                logger.error(f"Failed to send status heartbeat: {exc}")
+
     async def shutdown(self):
+        if not self.running:
+            return
         self.running = False
-        for task in self.tasks: task.cancel()
+        for task in self.tasks:
+            task.cancel()
+        if self.notifier_task:
+            self.notifier_task.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        self.tasks.clear()
+        if self.notifier_task:
+            with suppress(asyncio.CancelledError):
+                await self.notifier_task
+            self.notifier_task = None
+
+        await self._shutdown_agents()
         logger.info("👋 Swarm Disconnected")
+
+    async def _shutdown_agents(self):
+        async def _close_agent(agent):
+            if agent and hasattr(agent, "shutdown"):
+                try:
+                    await agent.shutdown()
+                except Exception as exc:
+                    logger.error(f"Agent shutdown error ({agent.__class__.__name__}): {exc}")
+
+        await _close_agent(self.news_agent)
+        await _close_agent(self.stat_arb_agent)
+        await _close_agent(self.mimic_agent)
+        await _close_agent(self.arb_agent)
+        await _close_agent(self.health_monitor)
+
+        if self.client:
+            try:
+                await self.client.close()
+            except Exception as exc:
+                logger.error(f"PolyClient close error: {exc}")
+
+        if self.gamma_client and hasattr(self.gamma_client, "close"):
+            try:
+                await self.gamma_client.close()
+            except Exception as exc:
+                logger.error(f"GammaClient close error: {exc}")
+
 
 import argparse
 from src.ui.dashboard import SwarmDashboard
+
+async def _main(args):
+    system = SwarmSystem(json_logs=args.json_logs)
+    loop = asyncio.get_running_loop()
+
+    def _handle_signal():
+        if system.running:
+            logger.info("⚠️ Signal received. Initiating graceful shutdown...")
+            asyncio.create_task(system.shutdown())
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _handle_signal)
+        except NotImplementedError:
+            pass
+
+    if args.ui:
+        dashboard = SwarmDashboard(system)
+        await dashboard.run(dry_run=args.dry_run)
+    else:
+        await system.run(dry_run=args.dry_run)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Hive Mind Swarm System")
     parser.add_argument("--dry-run", action="store_true", help="Run in paper trading mode")
     parser.add_argument("--ui", action="store_true", help="Launch TUI Dashboard")
+    parser.add_argument("--json-logs", action="store_true", help="Enable JSON logging output")
     args = parser.parse_args()
 
-    system = SwarmSystem()
     try:
-        if args.ui:
-            dashboard = SwarmDashboard(system)
-            # Ensure setup happens before dashboard run or within it
-            asyncio.run(dashboard.run(dry_run=args.dry_run))
-        else:
-            asyncio.run(system.run(dry_run=args.dry_run))
+        asyncio.run(_main(args))
     except KeyboardInterrupt:
         pass

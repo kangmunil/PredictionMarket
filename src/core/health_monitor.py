@@ -34,9 +34,20 @@ from dataclasses import dataclass, asdict
 import json
 
 import aiohttp
+from prometheus_client import start_http_server, Counter, Gauge, Histogram
 
 logger = logging.getLogger(__name__)
 
+# Prometheus Metrics
+PROM_UPTIME = Counter('bot_uptime_seconds_total', 'Total bot uptime in seconds')
+PROM_BOT_STATUS = Gauge('bot_status', 'Bot status (1=active, 0=crashed)', ['bot_name'])
+PROM_BUDGET_UTILIZATION = Gauge('budget_utilization_pct', 'Budget utilization percentage')
+PROM_TOTAL_CAPITAL = Gauge('total_capital_dollars', 'Total available capital in USD')
+PROM_API_REQUESTS = Counter('api_requests_total', 'Total API requests', ['service'])
+PROM_API_ERRORS = Counter('api_errors_total', 'Total API errors', ['service', 'error_type'])
+PROM_TRADES = Counter('trades_total', 'Total trades executed', ['strategy', 'outcome'])
+PROM_PNL_DAILY = Gauge('pnl_daily_dollars', 'Daily PnL in USD')
+PROM_LATENCY = Histogram('api_request_latency_seconds', 'API request latency', ['service'])
 
 @dataclass
 class HealthMetrics:
@@ -124,11 +135,16 @@ class HealthMonitor:
         self,
         redis,
         budget_manager=None,
-        rate_limiter=None
+        rate_limiter=None,
+        metrics_port: int = 8000,
+        metrics_addr: str = "0.0.0.0"
     ):
         self.redis = redis
         self.budget_manager = budget_manager
         self.rate_limiter = rate_limiter
+        self.metrics_port = metrics_port
+        self.metrics_addr = metrics_addr
+        self._session: Optional[aiohttp.ClientSession] = None
 
         # Alert channels
         self.slack_webhook_url: Optional[str] = None
@@ -149,15 +165,26 @@ class HealthMonitor:
         self.alert_cooldowns: Dict[str, datetime] = {}
         self.cooldown_minutes = 15
 
-    def configure_slack(self, webhook_url: str):
-        """Configure Slack alerting"""
-        self.slack_webhook_url = webhook_url
-        logger.info("✅ Slack alerts configured")
+    def start_metrics_server(self):
+        """Start Prometheus metrics server"""
+        try:
+            start_http_server(self.metrics_port, addr=self.metrics_addr)
+            logger.info(f"📊 Prometheus metrics server started on {self.metrics_addr}:{self.metrics_port}")
+        except Exception as e:
+            logger.error(f"Failed to start Prometheus server: {e}")
 
-    def configure_discord(self, webhook_url: str):
-        """Configure Discord alerting"""
-        self.discord_webhook_url = webhook_url
-        logger.info("✅ Discord alerts configured")
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            )
+        return self._session
+
+    async def shutdown(self):
+        """Graceful shutdown"""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            logger.info("🏥 Health Monitor session closed")
 
     async def run(self, check_interval_seconds: int = 30):
         """Main monitoring loop"""
@@ -166,10 +193,26 @@ class HealthMonitor:
         logger.info(f"   Slack Alerts: {'Enabled' if self.slack_webhook_url else 'Disabled'}")
         logger.info(f"   Discord Alerts: {'Enabled' if self.discord_webhook_url else 'Disabled'}")
 
+        self.start_metrics_server()
+
         while True:
             try:
+                # Update uptime metric
+                PROM_UPTIME.inc(check_interval_seconds)
+
                 # Collect metrics
                 metrics = await self.collect_metrics()
+                
+                # Update Prometheus Gauges
+                PROM_BUDGET_UTILIZATION.set(metrics.utilization_pct)
+                PROM_TOTAL_CAPITAL.set(float(metrics.total_capital))
+                PROM_PNL_DAILY.set(float(metrics.pnl_today))
+
+                # Update Bot status metrics
+                for bot in metrics.active_bots:
+                    PROM_BOT_STATUS.labels(bot_name=bot).set(1)
+                for bot in metrics.crashed_bots:
+                    PROM_BOT_STATUS.labels(bot_name=bot).set(0)
 
                 # Store latest metrics
                 self.last_metrics = metrics
@@ -428,14 +471,10 @@ class HealthMonitor:
                 }]
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    self.slack_webhook_url,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    if resp.status != 200:
-                        logger.error(f"Slack webhook failed: {resp.status}")
+            session = await self._ensure_session()
+            async with session.post(self.slack_webhook_url, json=payload) as resp:
+                if resp.status != 200:
+                    logger.error(f"Slack webhook failed: {resp.status}")
 
         except Exception as e:
             logger.error(f"Failed to send Slack alert: {e}")
@@ -462,14 +501,10 @@ class HealthMonitor:
                 }]
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    self.discord_webhook_url,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as resp:
-                    if resp.status not in [200, 204]:
-                        logger.error(f"Discord webhook failed: {resp.status}")
+            session = await self._ensure_session()
+            async with session.post(self.discord_webhook_url, json=payload) as resp:
+                if resp.status not in [200, 204]:
+                    logger.error(f"Discord webhook failed: {resp.status}")
 
         except Exception as e:
             logger.error(f"Failed to send Discord alert: {e}")
@@ -483,8 +518,7 @@ class HealthMonitor:
         ts_key = "health:timeseries"
         await self.redis.zadd(
             ts_key,
-            time.time(),
-            json.dumps(metrics.to_dict())
+            {json.dumps(metrics.to_dict()): time.time()}
         )
 
         # Trim old data (keep last 24 hours)
@@ -603,7 +637,9 @@ _health_monitor_instance = None
 async def get_health_monitor(
     redis,
     budget_manager=None,
-    rate_limiter=None
+    rate_limiter=None,
+    metrics_port: int = 8000,
+    metrics_addr: str = "0.0.0.0"
 ) -> HealthMonitor:
     """Get or create global HealthMonitor instance"""
     global _health_monitor_instance
@@ -612,7 +648,9 @@ async def get_health_monitor(
         _health_monitor_instance = HealthMonitor(
             redis,
             budget_manager,
-            rate_limiter
+            rate_limiter,
+            metrics_port,
+            metrics_addr
         )
         logger.info("✅ Health Monitor initialized")
 
@@ -627,24 +665,25 @@ async def record_heartbeat(redis, bot_name: str):
 
 async def record_error(redis, category: str, message: str):
     """Record error for monitoring"""
+    # Update Prometheus
+    PROM_API_ERRORS.labels(service=category, error_type=message[:20]).inc()
+
     # Add to general error timeseries
     await redis.zadd(
         "errors:timeseries",
-        time.time(),
-        f"{category}:{message}"
+        {f"{category}:{message}": time.time()}
     )
 
     # Add to category-specific timeseries
     if category:
         await redis.zadd(
             f"errors:{category}:timeseries",
-            time.time(),
-            message
+            {message: time.time()}
         )
 
 
-async def record_trade(redis, success: bool, pnl: Decimal):
-    """Record trade outcome for monitoring"""
+async def record_trade(redis, success: bool, pnl: Decimal, strategy: str = "unknown"):
+    """Record trade outcome for monitoring (Redis only, Prometheus handled by PnLTracker)"""
     # Increment trade counter
     await redis.incr("metrics:trades_today")
 

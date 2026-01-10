@@ -129,7 +129,17 @@ class TelegramNotifier:
 
         try:
             async with httpx.AsyncClient() as client:
-                await client.post(f"{self.base_url}/sendMessage", json=payload, timeout=10)
+                resp = await client.post(f"{self.base_url}/sendMessage", json=payload, timeout=10)
+            if resp.status_code != 200:
+                preview = resp.text[:200] if hasattr(resp, "text") else ""
+                logger.error(f"Telegram sendMessage HTTP {resp.status_code}: {preview}")
+                if parse_mode and resp.status_code == 400 and "parse" in preview.lower():
+                    safe_payload = dict(payload)
+                    safe_payload.pop("parse_mode", None)
+                    async with httpx.AsyncClient() as client:
+                        retry = await client.post(f"{self.base_url}/sendMessage", json=safe_payload, timeout=10)
+                    if retry.status_code != 200:
+                        logger.error(f"Telegram fallback send failed HTTP {retry.status_code}: {retry.text[:200]}")
         except Exception as e:
             logger.error(f"Failed to send message: {e}")
 

@@ -22,6 +22,7 @@ import requests
 import asyncio
 import json
 import os
+from datetime import datetime, timedelta
 
 from src.core.polymarket_mcp_client import (
     get_default_mcp_client,
@@ -189,6 +190,10 @@ class MarketMatcher:
         "fed": ["fed", "rate", "cut", "hike"],
         "sec": ["sec", "crypto", "regulation"]
     }
+    SHORT_TERM_KEYWORDS = [
+        "15 min", "15min", "30 min", "30min", "1 hour", "1h", "hourly",
+        "today", "tonight", "this week", "next hour", "intraday", "daily close"
+    ]
 
     async def _search_markets(
         self,
@@ -264,7 +269,12 @@ class MarketMatcher:
                     continue
 
         logger.debug("💎 Total unique market candidates: %d", len(unique_markets))
-        return list(unique_markets.values())
+        markets = list(unique_markets.values())
+        filtered = [m for m in markets if self._is_short_term_market(m)]
+        if filtered:
+            logger.debug("⏱️ Filtered to %d short-term markets", len(filtered))
+            return filtered
+        return markets
 
     async def _search_markets_via_mcp(self, queries: set, min_volume: float) -> Optional[List[Dict]]:
         assert self._mcp_client
@@ -303,7 +313,12 @@ class MarketMatcher:
             return None
 
         logger.debug("💎 MCP supplied %d unique market candidates", len(unique_markets))
-        return list(unique_markets.values())
+        markets = list(unique_markets.values())
+        filtered = [m for m in markets if self._is_short_term_market(m)]
+        if filtered:
+            logger.debug("⏱️ Filtered MCP results to %d short-term markets", len(filtered))
+            return filtered
+        return markets
 
     def _calculate_relevance_score(
         self,
@@ -369,6 +384,21 @@ class MarketMatcher:
             return best
 
         return None
+
+    def _is_short_term_market(self, market: Dict) -> bool:
+        question = (market.get("question") or "").lower()
+        if any(keyword in question for keyword in (kw.lower() for kw in self.SHORT_TERM_KEYWORDS)):
+            return True
+        ends_at = market.get("ends_at")
+        if ends_at:
+            try:
+                ts = ends_at.replace("Z", "+00:00") if ends_at.endswith("Z") else ends_at
+                end_dt = datetime.fromisoformat(ts)
+                now = datetime.now(end_dt.tzinfo) if end_dt.tzinfo else datetime.utcnow()
+                return now < end_dt <= now + timedelta(hours=24)
+            except Exception:
+                return False
+        return False
 
 
 # Standalone test

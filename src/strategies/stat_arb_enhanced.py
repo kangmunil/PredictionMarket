@@ -31,6 +31,7 @@ from scipy import stats
 
 from src.core.clob_client import PolyClient
 from src.core.decision_logger import DecisionLogger
+from src.core.aggression import seconds_to_expiry, aggression_profile
 
 logger = logging.getLogger(__name__)
 
@@ -95,12 +96,14 @@ class EnhancedStatArbStrategy:
         lookback_days: int = 30,
         min_data_points: int = 10,
         signal_bus = None,
-        pnl_tracker = None
+        pnl_tracker = None,
+        delta_tracker=None,
     ):
         self.client = client
         self.budget_manager = budget_manager
         self.signal_bus = signal_bus # Hive Mind Connection
         self.pnl_tracker = pnl_tracker # Unified P&L Logger
+        self.delta_tracker = delta_tracker
         self.decision_logger = DecisionLogger("StatArb") # Centralized Logger
         
         if self.signal_bus:
@@ -127,6 +130,7 @@ class EnhancedStatArbStrategy:
         # Market pairs to monitor
         # Format: (condition_id_a, condition_id_b, pair_name, category)
         self.pairs = []
+        self.pair_groups: Dict[str, str] = {}
 
         # Performance tracking
         self.pair_metrics_cache: Dict[str, PairMetrics] = {}
@@ -146,7 +150,78 @@ class EnhancedStatArbStrategy:
             logger.info(f"⏳ Skipping re-add of disabled pair {pair_name} until {cooldown_until:%H:%M}")
             return
         self.pairs.append((condition_id_a, condition_id_b, pair_name, category))
+        self.pair_groups[pair_name] = (category or "DEFAULT").upper()
         logger.info(f"📊 Added pair: {pair_name} ({category})")
+
+    def _resolve_pair_group(self, pair_name: str) -> str:
+        return self.pair_groups.get(pair_name, "DEFAULT")
+
+    @staticmethod
+    def _entry_sides(action: str) -> Tuple[str, str]:
+        if action == "LONG_A_SHORT_B":
+            return ("BUY", "SELL")
+        return ("SELL", "BUY")
+
+    @staticmethod
+    def _exit_sides(action: str) -> Tuple[str, str]:
+        entry_a, entry_b = EnhancedStatArbStrategy._entry_sides(action)
+        invert = {"BUY": "SELL", "SELL": "BUY"}
+        return (invert[entry_a], invert[entry_b])
+
+    async def _get_spread_regime(self, token_id: str) -> str:
+        if not self.signal_bus:
+            return "UNKNOWN"
+        try:
+            signal = await self.signal_bus.get_signal(token_id)
+            return (getattr(signal, "spread_regime", "UNKNOWN") or "UNKNOWN").upper()
+        except Exception as exc:
+            logger.debug(f"⚠️ Spread regime lookup failed for {token_id[:10]}: {exc}")
+            return "UNKNOWN"
+
+    def _spread_multiplier(self, regime: str) -> float:
+        regime_key = (regime or "UNKNOWN").upper()
+        mapping = {
+            "INEFFICIENT": 1.0,
+            "NEUTRAL": 0.6,
+            "EFFICIENT": 0.0,
+            "UNKNOWN": 0.8,
+        }
+        return mapping.get(regime_key, 0.8)
+
+    async def _determine_spread_policy(self, token_a: str, token_b: str) -> Tuple[float, str, str]:
+        regime_a = await self._get_spread_regime(token_a)
+        regime_b = await self._get_spread_regime(token_b)
+        if regime_a == "EFFICIENT" and regime_b == "EFFICIENT":
+            return 0.0, regime_a, regime_b
+        multiplier = max(self._spread_multiplier(regime_a), self._spread_multiplier(regime_b))
+        return multiplier, regime_a, regime_b
+
+    def _parse_expiry(self, market: Optional[dict]) -> Optional[datetime]:
+        if not market:
+            return None
+        end_raw = (
+            market.get("end_date")
+            or market.get("endDate")
+            or market.get("ends_at")
+            or market.get("endDateISO")
+        )
+        if not end_raw:
+            return None
+        text = end_raw.strip()
+        if not text:
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(text)
+        except Exception:
+            return None
+
+    def _resolve_condition_expiry(self, condition_id: str) -> Optional[datetime]:
+        market = self.client.get_market(condition_id)
+        if not market:
+            return None
+        return self._parse_expiry(market)
 
     def _disable_pair(self, pair_name: str, reason: str, cooldown_hours: int = 6):
         """Remove a problematic pair until data is refreshed"""
@@ -196,9 +271,11 @@ class EnhancedStatArbStrategy:
         Analyze all configured pairs for cointegration.
         Updates pair_metrics_cache with latest statistics.
         """
-        if getattr(self.client, "ws_connected", True) is False:
-            logger.warning("⏸️ StatArb paused: orderbook disconnected")
-            return
+        # Allow StatArb to run even without WebSocket (can use REST API for prices)
+        ws_status = getattr(self.client, "ws_connected", None)
+        if ws_status is False:
+            logger.debug("⚠️ StatArb running without WS (using REST API fallback)")
+        # Removed hard block: StatArb can fetch prices via REST if needed
         logger.debug("🔍 Analyzing pairs for cointegration...")
 
         for condition_a, condition_b, pair_name, category in self.pairs:
@@ -234,6 +311,12 @@ class EnhancedStatArbStrategy:
                 # Log if cointegrated
                 if metrics.is_cointegrated:
                     logger.info(f"✅ {pair_name}: COINTEGRATED - {metrics}")
+                    
+                    # Subscribe to real-time orderbook
+                    tid_a = self.client.get_yes_token_id(condition_a)
+                    tid_b = self.client.get_yes_token_id(condition_b)
+                    if tid_a and tid_b:
+                        asyncio.create_task(self.client.subscribe_orderbook([tid_a, tid_b]))
                 else:
                     logger.debug(f"❌ {pair_name}: Not cointegrated (p={metrics.cointegration_pvalue:.4f})")
 
@@ -349,8 +432,14 @@ class EnhancedStatArbStrategy:
     async def scan_for_entries(self):
         """Scan cointegrated pairs for entry signals"""
         for pair_name, metrics in self.pair_metrics_cache.items():
-            if not metrics.is_cointegrated:
+            if not metrics or not metrics.is_cointegrated:
                 continue
+
+            pair_info = next((p for p in self.pairs if p[2] == pair_name), None)
+            if not pair_info:
+                continue
+
+            token_a, token_b, _, _ = pair_info
 
             # Skip if already in position
             if pair_name in self.active_positions:
@@ -358,31 +447,45 @@ class EnhancedStatArbStrategy:
 
             # 🧠 Dynamic Threshold Adjustment based on SignalBus
             current_threshold = self.entry_z_threshold
+
+            # Apply data-quality penalty when synthetic history is in play
+            history_sources = []
+            for cid in (token_a, token_b):
+                source = self._get_history_source(cid)
+                if source:
+                    history_sources.append(source)
+
+            if history_sources and any(src == "SYNTHETIC" for src in history_sources):
+                current_threshold *= 1.5
+                logger.info(
+                    "⚠️ %s: Synthetic history detected (%s) → threshold raised to %.2f",
+                    pair_name,
+                    ", ".join(history_sources),
+                    current_threshold,
+                )
             
             if self.signal_bus:
                 # Get tokens from pair info
-                pair_info = next((p for p in self.pairs if p[2] == pair_name), None)
-                if pair_info:
-                    token_a, token_b, _, _ = pair_info
-                    
-                    # Get signals from Hive Mind
-                    # Note: Signal retrieval needs to be sync here or cached, 
-                    # but get_signal is async. For prototype, we assume we can run it.
-                    # Since this func is async, we can await.
-                    sig_a = await self.signal_bus.get_signal(token_a)
-                    sig_b = await self.signal_bus.get_signal(token_b)
-                    
-                    # Logic: If we want to LONG A (Z < 0) and A has Good News -> Lower threshold
-                    if metrics.current_z_score < 0: # Signal to LONG A, SHORT B
-                        if sig_a.sentiment_score > 0.5:
-                            current_threshold = 1.5 # More aggressive
-                            logger.info(f"🔥 Hive Mind Boost: Lowering entry threshold for {pair_name} due to {token_a} news")
-                            
-                    # Logic: If we want to LONG B (Z > 0) and B has Good News -> Lower threshold
-                    elif metrics.current_z_score > 0: # Signal to SHORT A, LONG B
-                        if sig_b.sentiment_score > 0.5:
-                            current_threshold = 1.5
-                            logger.info(f"🔥 Hive Mind Boost: Lowering entry threshold for {pair_name} due to {token_b} news")
+                # Get signals from Hive Mind
+                # Note: Signal retrieval needs to be sync here or cached, 
+                # but get_signal is async. For prototype, we assume we can run it.
+                # Since this func is async, we can await.
+                sig_a = await self.signal_bus.get_signal(token_a)
+                sig_b = await self.signal_bus.get_signal(token_b)
+                sig_a_score = getattr(sig_a, "sentiment_score", 0.0) if sig_a else 0.0
+                sig_b_score = getattr(sig_b, "sentiment_score", 0.0) if sig_b else 0.0
+                
+                # Logic: If we want to LONG A (Z < 0) and A has Good News -> Lower threshold
+                if metrics.current_z_score < 0: # Signal to LONG A, SHORT B
+                    if sig_a_score > 0.5:
+                        current_threshold = 1.5 # More aggressive
+                        logger.info(f"🔥 Hive Mind Boost: Lowering entry threshold for {pair_name} due to {token_a} news")
+                        
+                # Logic: If we want to LONG B (Z > 0) and B has Good News -> Lower threshold
+                elif metrics.current_z_score > 0: # Signal to SHORT A, LONG B
+                    if sig_b_score > 0.5:
+                        current_threshold = 1.5
+                        logger.info(f"🔥 Hive Mind Boost: Lowering entry threshold for {pair_name} due to {token_b} news")
 
             # Check if Z-score exceeds dynamic entry threshold
             if abs(metrics.current_z_score) > current_threshold:
@@ -469,52 +572,128 @@ class EnhancedStatArbStrategy:
 
         # Dry Run 체크
         dry_run = getattr(self.client.config, 'DRY_RUN', True)
-
-        # Budget check
-        if self.budget_manager:
-            total_required = signal.position_size * 2  # Both legs
-            allocation_id = await self.budget_manager.request_allocation(
-                strategy="statarb",
-                amount=total_required,
-                priority="normal"
-            )
-
-            if not allocation_id:
-                logger.warning(f"⚠️ Budget allocation denied for {signal.pair_name}")
-                return
-
-            allocation_info = {
-                'allocation_id': allocation_id,
-                'allocated_amount': total_required
-            }
-        else:
-            allocation_info = None
+        allocation_info = None
 
         try:
-            # 🚀 Fix: Resolve condition IDs to actual CLOB Token IDs
+            # 🚀 Resolve condition IDs to actual CLOB Token IDs
             tid_a = self.client.get_yes_token_id(signal.token_a)
             tid_b = self.client.get_yes_token_id(signal.token_b)
-            
             if not tid_a or not tid_b:
                 logger.error(f"❌ Could not resolve token IDs for {signal.pair_name}. A: {tid_a}, B: {tid_b}")
-                await self._release_allocation(allocation_info, Decimal("0"))
                 self._disable_pair(signal.pair_name, "Token resolution failed")
                 return
+
+            market_group = self._resolve_pair_group(signal.pair_name)
+            side_a, side_b = self._entry_sides(signal.action)
+            base_size = float(signal.position_size)
+
+            spread_multiplier, regime_a, regime_b = await self._determine_spread_policy(tid_a, tid_b)
+            if spread_multiplier <= 0 or base_size <= 0:
+                logger.info(
+                    "   🧊 Spread regimes %s/%s show no exploitable edge; skipping entry.",
+                    regime_a,
+                    regime_b,
+                )
+                return
+
+            trade_size = base_size * spread_multiplier
+            if trade_size <= 0:
+                logger.info("   💤 Spread regime scaling reduced size to $0. Skipping %s.", signal.pair_name)
+                return
+            if abs(trade_size - base_size) > 1e-6:
+                logger.info(
+                    "   ⚖️ Spread regimes %s/%s scaled size from $%.2f → $%.2f",
+                    regime_a,
+                    regime_b,
+                    base_size,
+                    trade_size,
+                )
+            position_size_dec = Decimal(str(trade_size))
+
+            expiry_a = self._resolve_condition_expiry(signal.token_a)
+            expiry_b = self._resolve_condition_expiry(signal.token_b)
+            nearest_expiry = None
+            if expiry_a and expiry_b:
+                nearest_expiry = min(expiry_a, expiry_b)
+            else:
+                nearest_expiry = expiry_a or expiry_b
+            expiry_seconds = seconds_to_expiry(nearest_expiry)
+            agg_multiplier, agg_stage = aggression_profile(expiry_seconds)
+            if agg_multiplier <= 0:
+                logger.info("   🕒 Aggression stage %s suppressed stat-arb trade.", agg_stage)
+                return
+            if abs(agg_multiplier - 1.0) > 1e-6:
+                scaled = trade_size * agg_multiplier
+                logger.info(
+                    "   ⚡ Aggression stage %s (t=%.0fs) scaled size from $%.2f → $%.2f",
+                    agg_stage,
+                    expiry_seconds if expiry_seconds is not None else float("nan"),
+                    trade_size,
+                    scaled,
+                )
+                trade_size = scaled
+                position_size_dec = Decimal(str(trade_size))
+
+            if self.delta_tracker:
+                allowance_a = await self.delta_tracker.check_allowance(
+                    token_id=tid_a,
+                    side=side_a,
+                    size=trade_size,
+                    market_group=market_group,
+                    condition_id=signal.token_a,
+                )
+                allowance_b = await self.delta_tracker.check_allowance(
+                    token_id=tid_b,
+                    side=side_b,
+                    size=trade_size,
+                    market_group=market_group,
+                    condition_id=signal.token_b,
+                )
+                violated = allowance_a if not allowance_a.allowed else None
+                if not allowance_b.allowed:
+                    violated = allowance_b
+                if violated and not violated.allowed:
+                    logger.info(
+                        "   🛑 Delta guard blocked stat-arb entry (%s) [group=%s current=%.2f -> projected=%.2f]",
+                        violated.reason or "limit exceeded",
+                        violated.group,
+                        violated.current_delta,
+                        violated.projected_delta,
+                    )
+                    return
+
+            # Budget check after risk filters
+            if self.budget_manager:
+                total_required = position_size_dec * 2  # Both legs
+                allocation_id = await self.budget_manager.request_allocation(
+                    strategy="statarb",
+                    amount=total_required,
+                    priority="normal"
+                )
+
+                if not allocation_id:
+                    logger.warning(f"⚠️ Budget allocation denied for {signal.pair_name}")
+                    return
+
+                allocation_info = {
+                    'allocation_id': allocation_id,
+                    'allocated_amount': total_required
+                }
 
             if not dry_run:
                 if signal.action == "SHORT_A_LONG_B":
                     logger.info(f"   🚀 LIVE ORDER: SELL {tid_a[:10]}... | BUY {tid_b[:10]}...")
-                    await self.client.place_market_order(tid_a, "SELL", float(signal.position_size))
-                    await self.client.place_market_order(tid_b, "BUY", float(signal.position_size))
+                    await self.client.place_market_order(tid_a, "SELL", trade_size)
+                    await self.client.place_market_order(tid_b, "BUY", trade_size)
                 else:
                     logger.info(f"   🚀 LIVE ORDER: BUY {tid_a[:10]}... | SELL {tid_b[:10]}...")
-                    await self.client.place_market_order(tid_a, "BUY", float(signal.position_size))
-                    await self.client.place_market_order(tid_b, "SELL", float(signal.position_size))
+                    await self.client.place_market_order(tid_a, "BUY", trade_size)
+                    await self.client.place_market_order(tid_b, "SELL", trade_size)
                 
                 # Report to UI history
                 swarm = getattr(self.client, 'swarm_system', None)
                 if swarm:
-                    swarm.add_trade_record(signal.action[:5], signal.pair_name, 0.5, float(signal.position_size))
+                    swarm.add_trade_record(signal.action[:5], signal.pair_name, 0.5, trade_size)
             else:
                 logger.info(f"   🧪 [DRY RUN] Entry for {signal.pair_name}")
                 logger.info(f"      Resolved Leg A Token: {tid_a[:15]}...")
@@ -523,26 +702,24 @@ class EnhancedStatArbStrategy:
                 # Report to UI history even in dry run
                 swarm = getattr(self.client, 'swarm_system', None)
                 if swarm:
-                    swarm.add_trade_record(signal.action, signal.pair_name, 0.5, float(signal.position_size))
+                    swarm.add_trade_record(signal.action, signal.pair_name, 0.5, trade_size)
 
             # Store in active positions
             trade_ids = []
             if self.pnl_tracker:
-                # Record Entry for Leg A
                 entry_tid_a = self.pnl_tracker.record_entry(
                     strategy="statarb",
                     token_id=tid_a,
                     side="SELL" if "SHORT_A" in signal.action else "BUY",
-                    price=0.5, # Placeholder for simulation
-                    size=float(signal.position_size)
+                    price=0.5,
+                    size=trade_size
                 )
-                # Record Entry for Leg B
                 entry_tid_b = self.pnl_tracker.record_entry(
                     strategy="statarb",
                     token_id=tid_b,
                     side="BUY" if "LONG_B" in signal.action else "SELL",
                     price=0.5,
-                    size=float(signal.position_size)
+                    size=trade_size
                 )
                 trade_ids = [entry_tid_a, entry_tid_b]
 
@@ -552,8 +729,33 @@ class EnhancedStatArbStrategy:
                 'entry_time': datetime.now(),
                 'entry_z_score': signal.z_score,
                 'allocation_info': allocation_info,
-                'trade_ids': trade_ids
+                'trade_ids': trade_ids,
+                'market_group': market_group,
+                'executed_size': position_size_dec,
+                'expires_a': expiry_a,
+                'expires_b': expiry_b,
             }
+
+            if self.delta_tracker:
+                entry_price = 0.5
+                await self.delta_tracker.record_trade(
+                    token_id=tid_a,
+                    side=side_a,
+                    size=trade_size,
+                    price=entry_price,
+                    market_group=market_group,
+                    expires_at=expiry_a,
+                    condition_id=signal.token_a,
+                )
+                await self.delta_tracker.record_trade(
+                    token_id=tid_b,
+                    side=side_b,
+                    size=trade_size,
+                    price=entry_price,
+                    market_group=market_group,
+                    expires_at=expiry_b,
+                    condition_id=signal.token_b,
+                )
 
             logger.info(f"✅ Position entered for {signal.pair_name}")
 
@@ -617,6 +819,8 @@ class EnhancedStatArbStrategy:
         signal = position_data['signal']
         metrics = self.pair_metrics_cache.get(pair_name)
         dry_run = getattr(self.client.config, 'DRY_RUN', True)
+        executed_size_dec = position_data.get('executed_size')
+        executed_size = float(executed_size_dec) if executed_size_dec is not None else float(signal.position_size)
 
         logger.info(f"\n{'='*60}")
         logger.info(f"🔚 CLOSING POSITION: {pair_name}")
@@ -633,18 +837,21 @@ class EnhancedStatArbStrategy:
             if not tid_a or not tid_b:
                 logger.error(f"❌ Cannot close position: Resolved Token IDs missing for {pair_name}")
                 return
+            market_group = position_data.get('market_group', self._resolve_pair_group(pair_name))
+            exit_side_a, exit_side_b = self._exit_sides(signal.action)
+            trade_size = executed_size
 
             if not dry_run:
                 if signal.action == "SHORT_A_LONG_B":
                     # Close by: BUY A, SELL B
                     logger.info(f"   🚀 LIVE CLOSE: BUY {tid_a[:10]}... | SELL {tid_b[:10]}...")
-                    await self.client.place_market_order(tid_a, "BUY", float(signal.position_size))
-                    await self.client.place_market_order(tid_b, "SELL", float(signal.position_size))
+                    await self.client.place_market_order(tid_a, "BUY", trade_size)
+                    await self.client.place_market_order(tid_b, "SELL", trade_size)
                 else:
                     # Close by: SELL A, BUY B
                     logger.info(f"   🚀 LIVE CLOSE: SELL {tid_a[:10]}... | BUY {tid_b[:10]}...")
-                    await self.client.place_market_order(tid_a, "SELL", float(signal.position_size))
-                    await self.client.place_market_order(tid_b, "BUY", float(signal.position_size))
+                    await self.client.place_market_order(tid_a, "SELL", trade_size)
+                    await self.client.place_market_order(tid_b, "BUY", trade_size)
             else:
                 logger.info(f"   🧪 [DRY RUN] Closing position for {pair_name}")
 
@@ -661,6 +868,25 @@ class EnhancedStatArbStrategy:
             # Release budget allocation
             if position_data['allocation_info'] and self.budget_manager:
                 await self._release_allocation(position_data['allocation_info'], Decimal("0"))
+
+            if self.delta_tracker:
+                exit_price = 0.52 if self.pnl_tracker else 0.5
+                await self.delta_tracker.record_trade(
+                    token_id=tid_a,
+                    side=exit_side_a,
+                    size=trade_size,
+                    price=exit_price,
+                    market_group=market_group,
+                    condition_id=signal.token_a,
+                )
+                await self.delta_tracker.record_trade(
+                    token_id=tid_b,
+                    side=exit_side_b,
+                    size=trade_size,
+                    price=exit_price,
+                    market_group=market_group,
+                    condition_id=signal.token_b,
+                )
 
             # Remove from active positions
             del self.active_positions[pair_name]
@@ -689,11 +915,22 @@ class EnhancedStatArbStrategy:
             self._price_api = PolymarketHistoryAPI()
 
         try:
-            # Fetch real historical data
-            data = await self._price_api.get_historical_events(condition_id, days=days)
+            # Fetch real historical data along with source metadata
+            data, source = await self._price_api.get_history_with_source(condition_id, days=days)
+            logger.info(
+                "📚 History source for %s...: %s (%d pts)",
+                condition_id[:8],
+                source,
+                len(data),
+            )
 
             if len(data) < 10:
-                logger.warning(f"Insufficient real data for {condition_id} ({len(data)} points), using synthetic")
+                logger.warning(
+                    "Insufficient data for %s (%d points from %s); synthetic fallback likely noisy",
+                    condition_id,
+                    len(data),
+                    source,
+                )
 
             return data
 
@@ -701,6 +938,30 @@ class EnhancedStatArbStrategy:
             logger.error(f"Error fetching historical data for {condition_id}: {e}")
             # Fallback to synthetic if API fails
             return await self._price_api._generate_synthetic_history(condition_id, days)
+
+    def _get_history_source(self, condition_id: str) -> Optional[str]:
+        """
+        Helper to read the last known history source for a condition.
+        Returns None if the cache is unavailable.
+        """
+        api = getattr(self, "_price_api", None)
+        if not api or not hasattr(api, "get_history_source"):
+            return None
+        try:
+            return api.get_history_source(condition_id)
+        except Exception as exc:
+            logger.debug(f"History source lookup failed for {condition_id[:8]}: {exc}")
+            return None
+
+    async def shutdown(self):
+        """Release data clients."""
+        api = getattr(self, "_price_api", None)
+        if api:
+            try:
+                await api.close()
+            except Exception as exc:
+                logger.debug(f"StatArb price API close error: {exc}")
+            self._price_api = None
 
     async def auto_discover_pairs_loop(self):
         """1시간마다 전략적으로 최적화된 마켓 페어를 탐색합니다."""
@@ -711,7 +972,7 @@ class EnhancedStatArbStrategy:
             try:
                 logger.info("🔍 StatArb: Running Advanced Market Discovery...")
                 # 더 많은 후보군 확보 (100개 -> 200개)
-                markets = await gamma.get_active_markets(limit=200, volume_min=2000)
+                markets = await gamma.get_active_markets(limit=200, volume_min=2000, max_hours_to_close=24)
                 
                 # 1. 자산-프록시(Proxy Peg) 탐색 로직 확장
                 proxies = {

@@ -37,3 +37,4 @@ sortedcontainers>=2.4.0
 transformers>=4.30.0
 torch>=2.0.0
 sentencepiece>=0.1.99
+prometheus-client>=0.17.0

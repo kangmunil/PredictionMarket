@@ -11,13 +11,15 @@ Created: 2026-01-07
 
 import logging
 from typing import Dict, Any, Optional
+from src.core.structured_logger import StructuredLogger
 
 logger = logging.getLogger("DecisionLog")
 
 class DecisionLogger:
-    def __init__(self, agent_name: str, notifier=None):
+    def __init__(self, agent_name: str, notifier=None, correlation_id: Optional[str] = None):
         self.agent_name = agent_name
         self.notifier = notifier
+        self.s_logger = StructuredLogger("DecisionLog", agent_name, correlation_id)
 
     async def log_decision(
         self,
@@ -32,6 +34,19 @@ class DecisionLogger:
         """
         emoji = "🟢" if action in ["BUY", "LONG"] else "🔴" if action in ["SELL", "SHORT"] else "⚪"
 
+        # Structured logging for machine consumption
+        self.s_logger.info(
+            f"DECISION: {action} {token}",
+            extra_fields={
+                "action": action,
+                "token": token,
+                "confidence": confidence,
+                "reason": reason,
+                "factors": factors
+            }
+        )
+
+        # High-level human-readable log
         log_msg = (
             f"\n{'='*60}\n"
             f"🧠 [{self.agent_name}] DECISION: {emoji} {action}\n"

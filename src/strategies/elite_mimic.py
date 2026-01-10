@@ -1,5 +1,7 @@
 import asyncio
 import logging
+from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import List, Dict
 from src.core.clob_client import PolyClient
 from src.core.wallet_watcher_v2 import EnhancedWalletWatcher as WalletWatcher
@@ -21,6 +23,13 @@ class EliteMimicAgent:
         self.client = client
         self.signal_bus = signal_bus
         self.budget_manager = budget_manager
+        self._signal_history: Dict[str, datetime] = {}
+        self._signal_cooldown = timedelta(
+            minutes=float(getattr(self.config, "MIMIC_SIGNAL_COOLDOWN_MINUTES", 10) or 10)
+        )
+        self._min_signal_score = float(getattr(self.config, "MIMIC_MIN_SIGNAL_SCORE", 0.50) or 0.50)
+        self._max_position_usd = float(getattr(self.config, "MIMIC_MAX_POSITION_USD", 2.0) or 2.0)
+        self._signal_poll_interval = int(getattr(self.config, "MIMIC_SIGNAL_POLL_SECONDS", 30) or 30)
         
         # 1. Initialize the Super Brain
         # If signal_bus is provided (Swarm Mode), we don't need a separate NewsScalper instance
@@ -61,6 +70,9 @@ class EliteMimicAgent:
         # Only run local brain if not in swarm mode
         if self.news_brain:
              tasks.append(asyncio.create_task(self.news_brain.run(keywords=monitor_keywords)))
+        elif self.signal_bus:
+            logger.info("🔁 EliteMimic: enabling SignalBus mirror mode")
+            tasks.append(asyncio.create_task(self._run_signal_bridge(), name="EliteMimicSignalBridge"))
         
         logger.info("✅ All systems GO. Monitoring Shadows (Whales) and Light (News).")
         
@@ -99,3 +111,59 @@ class EliteMimicAgent:
         }
         self.mimic_logs.append(entry)
         logger.info(f"📝 New Mimic Log: {entry}")
+
+    async def _run_signal_bridge(self):
+        """
+        Dry-run activation path: mirror high-confidence SignalBus alerts
+        when no whale fills arrive.
+        """
+        logger.info("🤝 EliteMimic: SignalBus bridge online (mirroring hot tokens)")
+        while True:
+            try:
+                hot = await self.signal_bus.get_hot_tokens(min_sentiment=self._min_signal_score)
+                logger.debug(f"EliteMimic bridge scanning {len(hot)} hot tokens (threshold {self._min_signal_score:.2f})")
+                now = datetime.now()
+                for token_id, sig in hot.items():
+                    last = self._signal_history.get(token_id)
+                    if last and (now - last) < self._signal_cooldown:
+                        continue
+                    await self._mirror_signal(token_id, sig)
+                    self._signal_history[token_id] = now
+                await asyncio.sleep(self._signal_poll_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error(f"EliteMimic bridge error: {exc}", exc_info=True)
+                await asyncio.sleep(5)
+
+    async def _mirror_signal(self, token_id, signal):
+        """
+        Convert aggregated signal into a lightweight mimic trade/log.
+        """
+        side = "BUY" if signal.sentiment_score >= 0 else "SELL"
+        intensity = abs(signal.sentiment_score)
+        size = round(self._max_position_usd * min(1.0, intensity), 2)
+
+        # Budget guard (best effort)
+        allocation_id = None
+        if self.budget_manager:
+            allocation_id = await self.budget_manager.request_allocation(
+                "elitemimic",
+                Decimal(str(size)),
+                priority="normal"
+            )
+            if not allocation_id:
+                logger.info("EliteMimic: budget denied, skipping signal mirror")
+                return
+
+        details = f"SignalBus mirror {side} {token_id[:12]} size ${size:.2f}"
+        self.add_log(
+            trader_id=signal.token_id if hasattr(signal, "token_id") else token_id,
+            tx_details=details,
+            ai_result=f"Sentiment {signal.sentiment_score:+.2f}",
+            recommendation="COPY" if intensity >= self._min_signal_score else "WATCH"
+        )
+        self.wallet_watcher.trades_executed += 1
+
+        if allocation_id:
+            await self.budget_manager.release_allocation("elitemimic", allocation_id, Decimal("0"))

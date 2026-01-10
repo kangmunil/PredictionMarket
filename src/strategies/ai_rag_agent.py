@@ -50,22 +50,47 @@ class PolyAIAgent:
             for e in similar_events
         ])
 
-        # 2. Construct Prompt
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """
+        # 2. Load System Prompt from File
+        try:
+            # Assuming the script is run from project root, or we find the file relative to this script
+            project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            prompt_path = os.path.join(project_root, ".claude", "agents", "polymarket-trading-agent.md")
+            
+            with open(prompt_path, "r") as f:
+                content = f.read()
+                
+            # Remove Frontmatter (between first two ---)
+            if content.startswith("---"):
+                _, _, body = content.split("---", 2)
+                system_instruction = body.strip()
+            else:
+                system_instruction = content.strip()
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Could not load agent prompt from file, using fallback: {e}")
+            system_instruction = """
             You are PolyAI, an elite quantitative trader.
             Your goal is to identify +EV (Positive Expected Value) betting opportunities on Polymarket.
             
             Analyze the input news based on historical patterns.
             Compare the current situation with retrieved similar past events.
+            """
+
+        # 3. Construct Prompt with JSON Enforcement
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", f"""
+            {{system_instruction}}
+            
+            IMPORTANT: You must strictly output your response in valid JSON format.
+            Do not include any markdown formatting (like ```json), just the raw JSON object.
             
             Output strictly in JSON format:
-            {{
+            {{{{
                 "signal": "BUY_YES" | "BUY_NO" | "HOLD",
                 "confidence": 0.0 to 1.0,
-                "reasoning": "Concise explanation citing history",
+                "reasoning": "Concise explanation citing history and analysis",
                 "risk_level": "LOW" | "MEDIUM" | "HIGH"
-            }}
+            }}}}
             """),
             ("user", """
             [Current News]
@@ -81,11 +106,12 @@ class PolyAIAgent:
             """)
         ])
 
-        # 3. Reasoning
+        # 4. Reasoning
         chain = prompt | self.llm | self.parser
         
         try:
             result = await chain.ainvoke({
+                "system_instruction": system_instruction,
                 "news": news_text,
                 "context": market_context,
                 "history": history_str

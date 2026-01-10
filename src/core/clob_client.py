@@ -3,6 +3,7 @@ import json
 import logging
 import threading
 import os
+import time
 from typing import Dict, List, Callable, Optional, Set, Tuple
 from decimal import Decimal
 import aiohttp
@@ -10,12 +11,14 @@ import websockets
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, OrderArgs
+from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, BalanceAllowanceParams, AssetType
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from src.core.config import Config
 from src.core.market_registry import market_registry
 from src.core.polymarket_mcp_client import PolymarketMCPClient
+from src.core.price_history_api import PolymarketHistoryAPI
+from src.core.health_monitor import PROM_API_REQUESTS, PROM_API_ERRORS, PROM_LATENCY
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +135,7 @@ class PolyClient:
         self._mcp_client: Optional[PolymarketMCPClient] = None
         self.strategy_name = strategy_name
         self.budget_manager = budget_manager
+        self.price_history_api: Optional[PolymarketHistoryAPI] = None
         
         # Web3 & Contract
         self.w3 = None
@@ -145,7 +149,9 @@ class PolyClient:
         self.subscribed_tokens: Set[str] = set()
         self.orderbooks: Dict[str, LocalOrderBook] = {}
         self.callbacks: Dict[str, List[Callable]] = {}
-        
+        self.signal_bus = None  # optional: set by SwarmSystem
+        self._last_known_balance: Optional[float] = None
+
         self._init_rest_client()
         if os.getenv("POLYMARKET_MCP_URL"):
             try:
@@ -199,20 +205,58 @@ class PolyClient:
     async def start_ws(self):
         backoff = 1
         self.ws_connected = False
+        self.ws_running = True
+        logger.info("🔌 Connecting to Polymarket WebSocket...")
         while self.ws_running:
             try:
-                async with websockets.connect(self.ws_url) as ws:
+                # Add keep-alive settings to prevent idle disconnections
+                async with websockets.connect(
+                    self.ws_url,
+                    ping_interval=20,  # Send ping every 20 seconds
+                    ping_timeout=10,   # Wait 10s for pong response
+                    close_timeout=10,  # Wait 10s for close frame
+                    max_size=2**23,    # 8MB message size limit
+                ) as ws:
                     self.ws_connection = ws
                     self.ws_connected = True
+                    logger.info("✅ WebSocket connected successfully (ws_connected=True)")
                     backoff = 1
+
+                    # Wait for server to be ready before subscribing
+                    await asyncio.sleep(1.0)
+
+                    # Re-subscribe to tokens in small batches (max 5 per batch)
                     if self.subscribed_tokens:
-                        await self._send_subscribe(list(self.subscribed_tokens))
+                        token_list = list(self.subscribed_tokens)
+
+                        # Limit subscription to avoid server rejection
+                        max_subscriptions = int(os.getenv("MAX_WS_SUBSCRIPTIONS", "5"))
+                        if len(token_list) > max_subscriptions:
+                            logger.warning(f"⚠️ Limiting WebSocket subscriptions: {len(token_list)} → {max_subscriptions} tokens")
+                            token_list = token_list[:max_subscriptions]
+
+                        batch_size = 5
+                        for i in range(0, len(token_list), batch_size):
+                            batch = token_list[i:i+batch_size]
+                            await self._send_subscribe(batch)
+                            logger.info(f"📡 Subscribed to batch {i//batch_size + 1}: {len(batch)} tokens")
+                            await asyncio.sleep(0.5)  # Small delay between batches
+                        logger.info(f"✅ Total subscribed: {len(token_list)} tokens")
+
                     async for msg in ws:
                         await self._handle_ws_message(msg)
+            except websockets.exceptions.ConnectionClosedError as e:
+                self.ws_connected = False
+                logger.warning(f"❌ WebSocket closed unexpectedly: {e.code} {e.reason}")
+                logger.info(f"🔄 Retrying in {min(backoff, 60)}s...")
+                await asyncio.sleep(min(backoff, 60))
+                backoff = min(backoff * 2, 60)  # Cap at 60s
             except Exception as e:
                 self.ws_connected = False
+                logger.warning(f"❌ WebSocket disconnected (ws_connected=False): {e}")
+                logger.info(f"🔄 Retrying in {min(backoff, 60)}s...")
                 await asyncio.sleep(min(backoff, 60))
-                backoff *= 2
+                backoff = min(backoff * 2, 60)
 
     async def subscribe_orderbook(self, token_ids: List[str], callback: Optional[Callable] = None):
         new_tokens = [tid for tid in token_ids if tid not in self.subscribed_tokens]
@@ -225,26 +269,82 @@ class PolyClient:
         if new_tokens and self.ws_connection: await self._send_subscribe(new_tokens)
 
     async def _send_subscribe(self, token_ids: List[str]):
-        payload = [{"assets_ids": token_ids, "type": "market"}]
-        await self.ws_connection.send(json.dumps(payload))
+        try:
+            # Official Polymarket CLOB format (from docs.polymarket.com)
+            # https://docs.polymarket.com/developers/CLOB/websocket/wss-overview
+            payload = {"assets_ids": token_ids, "type": "market"}
+
+            payload_str = json.dumps(payload)
+
+            # Log first subscription for debugging
+            if not hasattr(self, '_first_sub_logged'):
+                self._first_sub_logged = True
+                logger.info(f"📤 First subscription payload: {payload_str}")
+
+            await self.ws_connection.send(payload_str)
+            logger.info(f"📤 Sent subscription for {len(token_ids)} tokens")
+        except Exception as e:
+            logger.error(f"❌ Failed to send subscription: {e}")
 
     async def _handle_ws_message(self, message: str):
         try:
             data = json.loads(message)
             events = data if isinstance(data, list) else [data]
+
+            # Log first few messages for debugging
+            if not hasattr(self, '_ws_msg_count'):
+                self._ws_msg_count = 0
+            self._ws_msg_count += 1
+            if self._ws_msg_count <= 5:
+                logger.info(f"📨 WebSocket message #{self._ws_msg_count}: {json.dumps(data)[:200]}...")
+
             for event in events:
+                # Check for error messages from server
+                if 'error' in event or event.get('type') == 'error':
+                    logger.error(f"❌ Server error: {event}")
+                    continue
+
+                # Handle 'book' event (order book snapshots)
                 if event.get('event_type') == 'book':
                     asset_id = event.get('asset_id')
                     if asset_id in self.orderbooks:
                         book = self.orderbooks[asset_id]
-                        for p, s in event.get('bids', []): book.update(BUY, float(p), float(s))
-                        for p, s in event.get('asks', []): book.update(SELL, float(p), float(s))
+                        # Handle both dict and list formats for bids/asks
+                        for item in event.get('bids', []):
+                            if isinstance(item, dict):
+                                p, s = item.get('price'), item.get('size')
+                            else:
+                                p, s = item[0], item[1]
+                            book.update(BUY, float(p), float(s))
+                        for item in event.get('asks', []):
+                            if isinstance(item, dict):
+                                p, s = item.get('price'), item.get('size')
+                            else:
+                                p, s = item[0], item[1]
+                            book.update(SELL, float(p), float(s))
                         if asset_id in self.callbacks:
                             for cb in self.callbacks[asset_id]:
                                 if asyncio.iscoroutinefunction(cb): await cb(asset_id, book)
                                 else: cb(asset_id, book)
+                        await self._broadcast_orderbook_snapshot(asset_id, book)
+
+                # Handle 'price_changes' event (price updates)
+                elif 'price_changes' in event:
+                    # Price change events don't update orderbook, just log
+                    logger.debug(f"📊 Price change event: {len(event['price_changes'])} updates")
+
+                # Handle initial snapshot (array format)
+                elif isinstance(event, dict) and 'market' in event and 'timestamp' in event:
+                    # Initial market snapshot - can be used for initialization
+                    logger.debug(f"📸 Market snapshot received for {event.get('market', 'unknown')[:10]}...")
         except json.JSONDecodeError as e:
-            logger.warning(f"⚠️ WebSocket JSON Decode Error: {e} | Msg: {message[:100]}...")
+            msg_clean = message.strip()
+            if msg_clean == "INVALID OPERATION":
+                logger.debug(f"⚠️ WS received 'INVALID OPERATION' (likely due to keep-alive or auth glitch) - ignoring.")
+            elif msg_clean.upper() == "PONG":
+                 logger.debug("   🏓 WS PONG")
+            else:
+                logger.warning(f"⚠️ WebSocket JSON Decode Error: {e} | Msg: {message[:100]}...")
         except Exception as e:
             logger.error(f"❌ WebSocket Handler Error: {e}")
 
@@ -286,6 +386,9 @@ class PolyClient:
         Execute multiple market orders in a single API batch request.
         orders_data: List of {'token_id': str, 'side': str, 'shares': float, 'price': float}
         """
+        PROM_API_REQUESTS.labels(service="clob_batch_order").inc()
+        start_time = time.time()
+        
         logger.info(f"🚀 [EXECUTION] Entering place_batch_market_orders for {len(orders_data)} orders")
         
         if self.config.DRY_RUN:
@@ -294,6 +397,7 @@ class PolyClient:
             return {"status": "OK", "orders": [{"orderID": f"mock_batch_{i}", "price": o['price']} for i, o in enumerate(orders_data)]}
 
         if not self.rest_client:
+            PROM_API_ERRORS.labels(service="clob_batch_order", error_type="no_client").inc()
             logger.error("❌ REST client not initialized")
             return None
 
@@ -309,6 +413,7 @@ class PolyClient:
                     priority=priority
                 )
                 if not allocation_id:
+                    PROM_API_ERRORS.labels(service="clob_batch_order", error_type="budget_denied").inc()
                     logger.warning(f"⚠️ Batch order denied: Need ${total_usd:.2f}")
                     return None
 
@@ -327,6 +432,8 @@ class PolyClient:
             logger.info(f"⚡ Executing batch of {len(batch_orders)} orders (Total: ${total_usd:.2f})")
             resp = self.rest_client.create_batch_orders(batch_orders)
             
+            PROM_LATENCY.labels(service="clob_batch_order").observe(time.time() - start_time)
+
             # 4. Release Budget
             if self.budget_manager and allocation_id:
                 await self.budget_manager.release_allocation(
@@ -337,6 +444,7 @@ class PolyClient:
             return resp
 
         except Exception as e:
+            PROM_API_ERRORS.labels(service="clob_batch_order", error_type="exception").inc()
             logger.error(f"❌ Batch order failed: {e}")
             return None
 
@@ -414,17 +522,32 @@ class PolyClient:
         Place a Limit Order (Maker).
         Returns order_id if successful, None otherwise.
         """
+        PROM_API_REQUESTS.labels(service="clob_limit_order").inc()
+        start_time = time.time()
+
         if self.config.DRY_RUN:
             logger.info(f"🧪 [DRY RUN] Simulating {side} {size} @ ${price} on {token_id[:10]}...")
             return f"mock_order_{os.urandom(4).hex()}"
 
         if not self.rest_client:
+            PROM_API_ERRORS.labels(service="clob_limit_order", error_type="no_client").inc()
             logger.error("❌ REST client not initialized")
             return None
 
         try:
-            # 1. Budget Check
+            # 1. Minimum Order Value Check
             total_usd = Decimal(str(price)) * Decimal(str(size))
+            min_order_value = float(os.getenv("MIN_ORDER_VALUE_USD", "5.0"))
+
+            if float(total_usd) < min_order_value:
+                PROM_API_ERRORS.labels(service="clob_limit_order", error_type="order_too_small").inc()
+                logger.warning(
+                    f"⚠️ Order rejected: ${total_usd:.2f} < minimum ${min_order_value:.2f} "
+                    f"(Polymarket typically rejects orders below $5)"
+                )
+                return None
+
+            # 2. Budget Check
             allocation_id = None
             if self.budget_manager:
                 allocation_id = await self.budget_manager.request_allocation(
@@ -433,10 +556,11 @@ class PolyClient:
                     priority="normal"
                 )
                 if not allocation_id:
+                    PROM_API_ERRORS.labels(service="clob_limit_order", error_type="budget_denied").inc()
                     logger.warning(f"⚠️ Limit order denied: Need ${total_usd:.2f}")
                     return None
 
-            # 2. Create Order Args
+            # 3. Create Order Args
             order_args = OrderArgs(
                 price=float(price),
                 size=float(size),
@@ -444,23 +568,57 @@ class PolyClient:
                 token_id=token_id
             )
 
-            # 3. Send Order
+            # 4. Sign and Post Order
             logger.info(f"🧱 Placing LIMIT {side} {size} @ ${price} (Total: ${total_usd:.2f})")
-            resp = self.rest_client.create_order(order_args)
-            
-            order_id = resp.get("orderID") or resp.get("id")
-            
+
+            # Step 1: Sign the order locally
+            signed_order = self.rest_client.create_order(order_args)
+            logger.info(f"✍️ Order Signed: {type(signed_order).__name__}")
+
+            # Step 2: Post the signed order to the exchange
+            resp = self.rest_client.post_order(signed_order)
+            logger.info(f"📤 Order Posted: {type(resp).__name__}")
+
+            PROM_LATENCY.labels(service="clob_limit_order").observe(time.time() - start_time)
+
+            # Handle both dict and SignedOrder object responses
+            if isinstance(resp, dict):
+                order_id = resp.get("orderID") or resp.get("id")
+            else:
+                # Debug SignedOrder object structure
+                logger.info(f"📋 Response object type: {type(resp)}")
+                logger.info(f"📋 Response attributes: {dir(resp)}")
+
+                # Try common attribute names
+                order_id = (
+                    getattr(resp, "orderID", None) or
+                    getattr(resp, "id", None) or
+                    getattr(resp, "order_id", None)
+                )
+
+                # Try nested order object
+                if not order_id and hasattr(resp, "order"):
+                    order_obj = resp.order
+                    order_id = (
+                        getattr(order_obj, "id", None) or
+                        getattr(order_obj, "orderID", None) or
+                        getattr(order_obj, "order_id", None)
+                    )
+
             if order_id:
                 logger.info(f"   ✅ Order Placed: {order_id}")
                 return order_id
             else:
-                logger.error(f"   ❌ Order failed: {resp}")
+                PROM_API_ERRORS.labels(service="clob_limit_order", error_type="api_failure").inc()
+                logger.error(f"   ❌ Order failed - could not extract order_id from: {resp}")
+                logger.error(f"   Response type: {type(resp)}, Has order attr: {hasattr(resp, 'order')}")
                 # Release budget if failed
                 if self.budget_manager and allocation_id:
                     await self.budget_manager.release_allocation(self.strategy_name, allocation_id, float(total_usd))
                 return None
 
         except Exception as e:
+            PROM_API_ERRORS.labels(service="clob_limit_order", error_type="exception").inc()
             logger.error(f"❌ Limit order exception: {e}")
             return None
 
@@ -532,6 +690,31 @@ class PolyClient:
             }
         return None
 
+    async def place_unprotected_aggressive_order(
+        self,
+        token_id: str,
+        side: str,
+        amount: float,
+        priority: str = "normal",
+    ) -> Optional[Dict]:
+        """
+        Submit an aggressively priced IOC-style limit order without any slippage cap.
+        BUY orders use 0.99, SELL orders use 0.001 to maximize fill probability.
+        """
+        side = side.upper()
+        limit_price = 0.99 if side == "BUY" else 0.001
+        logger.warning(
+            "🚨 [UNPROTECTED] Submitting %s of %.2f @ %.3f for %s",
+            side,
+            amount,
+            limit_price,
+            token_id[:10],
+        )
+        order_id = await self.place_limit_order(token_id, side, limit_price, amount)
+        if order_id:
+            return {"orderID": order_id, "price": limit_price, "filled": amount}
+        return None
+
     async def cancel_order(self, order_id: str):
         """Cancel a specific order"""
         if not self.rest_client: return
@@ -552,6 +735,60 @@ class PolyClient:
         except Exception as e:
             logger.error(f"❌ Cancel all failed: {e}")
 
+    async def get_real_market_price(
+        self,
+        token_id: str,
+        condition_id: Optional[str] = None
+    ) -> Optional[float]:
+        """
+        Fetch the most recent executable price by preferring MCP trade data,
+        with orderbook fallbacks.
+        """
+        if condition_id:
+            try:
+                if not self.price_history_api:
+                    self.price_history_api = PolymarketHistoryAPI(use_mcp=True)
+                price = await self.price_history_api.get_recent_trade_price(
+                    condition_id=condition_id,
+                    minutes=30
+                )
+                if price is not None:
+                    logger.debug(
+                        f"📡 PriceFeed: MCP trade price for {condition_id[:10]} -> {price:.4f}"
+                    )
+                    return float(price)
+            except Exception as exc:
+                logger.debug(f"⚠️ MCP price fetch failed for {condition_id}: {exc}")
+
+        best_bid = best_ask = 0.0
+
+        if token_id in self.orderbooks:
+            book = self.orderbooks[token_id]
+            best_ask, _ = book.get_best_ask()
+            best_bid, _ = book.get_best_bid()
+        else:
+            try:
+                if self.rest_client:
+                    ob = self.rest_client.get_order_book(token_id)
+                    if ob.asks:
+                        best_ask = float(ob.asks[0].price)
+                    if ob.bids:
+                        best_bid = float(ob.bids[0].price)
+            except Exception as exc:
+                logger.debug(f"Order book lookup failed for {token_id}: {exc}")
+
+        if best_bid > 0 and best_ask > 0:
+            mid = (best_bid + best_ask) / 2.0
+            logger.debug(f"📡 PriceFeed: Midpoint price for {token_id[:10]} -> {mid:.4f}")
+            return mid
+        if best_bid > 0:
+            logger.debug(f"📡 PriceFeed: Bid-only price for {token_id[:10]} -> {best_bid:.4f}")
+            return best_bid
+        if best_ask > 0:
+            logger.debug(f"📡 PriceFeed: Ask-only price for {token_id[:10]} -> {best_ask:.4f}")
+            return best_ask
+        return None
+
     async def get_order_status(self, order_id: str) -> Optional[str]:
         """
         Check status of an order. 
@@ -562,7 +799,111 @@ class PolyClient:
             order = self.rest_client.get_order(order_id)
             # Map status from API response
             # Typically returns: "status": "open" | "matched" | "cancelled"
-            return order.get("status", "").upper()
+            # Handle both dict and object responses
+            if isinstance(order, dict):
+                status = order.get("status", "")
+            else:
+                status = getattr(order, "status", "")
+            return status.upper() if status else None
         except Exception as e:
             logger.error(f"❌ Get status failed: {e}")
             return None
+
+    async def close(self):
+        """Gracefully release network resources."""
+        self.ws_running = False
+        if self.ws_connection:
+            try:
+                await self.ws_connection.close()
+            except Exception as exc:
+                logger.debug(f"WebSocket close error: {exc}")
+            finally:
+                self.ws_connection = None
+
+        if self.price_history_api:
+            try:
+                await self.price_history_api.close()
+            except Exception as exc:
+                logger.debug(f"Price history API close error: {exc}")
+            finally:
+                self.price_history_api = None
+
+    async def _broadcast_orderbook_snapshot(self, token_id: str, book: "LocalOrderBook"):
+        if not self.signal_bus:
+            return
+        best_bid, _ = book.get_best_bid()
+        best_ask, _ = book.get_best_ask()
+        if not best_bid and not best_ask:
+            return
+        try:
+            await self.signal_bus.update_market_metrics(
+                token_id=token_id,
+                best_bid=float(best_bid) if best_bid else None,
+                best_ask=float(best_ask) if best_ask else None,
+            )
+        except Exception as exc:
+            logger.debug(f"SignalBus spread update failed for {token_id[:8]}: {exc}")
+
+    async def get_usdc_balance(self) -> float:
+        """
+        Return the live collateral (USDC) balance.
+        Prefers authenticated REST client, falls back to public endpoint.
+        """
+        # Method 1: Use authenticated client (Reliable)
+        if self.rest_client:
+            try:
+                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+                # py_clob_client calls are synchronous
+                resp = self.rest_client.get_balance_allowance(params)
+                
+                balance_raw = 0.0
+                if isinstance(resp, dict):
+                    balance_raw = float(resp.get("balance", 0))
+                else:
+                    balance_raw = float(getattr(resp, "balance", 0))
+                
+                balance = balance_raw / 1e6  # USDC uses 6 decimals
+                self._last_known_balance = balance
+                return balance
+            except Exception as e:
+                logger.error(f"❌ REST client balance fetch failed: {e}", exc_info=True)
+
+        # Method 2: Fallback to manual endpoint
+        address = self.config.FUNDER_ADDRESS
+        if not address:
+            return 0.0
+
+        url = f"https://clob.polymarket.com/data/balances?address={address}"
+        max_retries = 3
+
+        for attempt in range(max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=5) as resp:
+                        if resp.status != 200:
+                            logger.warning("Balance query failed HTTP %s for %s", resp.status, url)
+                            continue
+                        payload = await resp.json()
+                        for entry in payload:
+                            if entry.get("asset_type") == "COLLATERAL":
+                                raw = float(entry.get("balance", 0.0))
+                                balance = raw / 1e6  # USDC uses 6 decimals
+                                self._last_known_balance = balance
+                                return balance
+
+                        # No collateral entry found; treat as zero.
+                        self._last_known_balance = 0.0
+                        return 0.0
+            except Exception as exc:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                else:
+                    logger.warning(f"Failed to fetch balance after {max_retries} attempts: {exc}")
+
+        if self._last_known_balance is not None:
+            logger.info(
+                "Using cached balance ($%.2f) due to connection failure.",
+                self._last_known_balance,
+            )
+            return self._last_known_balance
+        return None

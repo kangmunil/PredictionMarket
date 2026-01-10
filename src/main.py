@@ -8,22 +8,24 @@ from src.strategies.stat_arb import StatArbStrategy
 from src.strategies.ai_model import AIModelStrategy
 from src.core.wallet_watcher import WalletWatcher
 from src.strategies.elite_mimic import EliteMimicAgent
-
-# Configure Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler()]
-)
-logger = logging.getLogger("PolyBot")
+from src.core.structured_logger import setup_logging
 
 async def main():
     parser = argparse.ArgumentParser(description="Polymarket Trading Bot")
     parser.add_argument("--strategy", type=str, required=True, 
                         choices=["arbitrage", "stat_arb", "ai", "copy", "elitemimic"],
                         help="Strategy to run: arbitrage, stat_arb, ai, copy, or elitemimic")
+    parser.add_argument("--json-logs", action="store_true", help="Enable JSON logging output")
     
     args = parser.parse_args()
+    
+    # Configure Logging
+    setup_logging(
+        level=logging.INFO,
+        json_output=args.json_logs,
+        log_file="logs/polybot.log"
+    )
+    logger = logging.getLogger("PolyBot")
     
     logger.info("Initializing PolyClient...")
     client = PolyClient()

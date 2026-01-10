@@ -21,7 +21,7 @@ Created: 2026-01-02
 
 import asyncio
 import logging
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Callable
 from datetime import datetime, timedelta
 from decimal import Decimal
 from dataclasses import dataclass
@@ -178,6 +178,53 @@ class OpenRouterRAGSystem:
         logger.info(f"   Entity Model: {self.entity_model}")
         logger.info(f"   Analysis Model: {self.analysis_model}")
         logger.info(f"   Embedding Model: {self.embedding_model}")
+        self._bg_tasks: set[asyncio.Task] = set()
+
+    def _schedule_supabase_write(self, func: Callable[[], None], description: str) -> None:
+        """
+        Execute Supabase writes off the critical path so trading logic
+        doesn't wait on network latency.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop; execute synchronously as a fallback
+            try:
+                func()
+            except Exception as exc:
+                logger.warning(f"⚠️ Supabase write failed ({description}): {exc}")
+            return
+
+        async def _runner():
+            try:
+                await asyncio.to_thread(func)
+                logger.debug("🗄️ Supabase write completed (%s)", description)
+            except Exception as exc:
+                logger.warning("⚠️ Supabase write failed (%s): %s", description, exc)
+
+        task = loop.create_task(_runner())
+        self._bg_tasks.add(task)
+        task.add_done_callback(lambda t: self._bg_tasks.discard(t))
+
+    async def close(self):
+        """Close network clients and flush pending Supabase writes."""
+        pending = list(self._bg_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._bg_tasks.clear()
+
+        if self.openrouter_client:
+            try:
+                await self.openrouter_client.close()
+            except Exception as exc:
+                logger.debug(f"OpenRouter client close error: {exc}")
+        if self.openai_client:
+            try:
+                await self.openai_client.close()
+            except Exception as exc:
+                logger.debug(f"OpenAI client close error: {exc}")
 
     async def fetch_news_rss(self, feed_url: str, category: str) -> List[NewsEvent]:
         """Fetch news from RSS feed (same as original)"""
@@ -382,8 +429,7 @@ class OpenRouterRAGSystem:
                     ids=[event.event_id]
                 )
 
-            # Store in Supabase (always)
-            self.supabase.table('news_events').upsert({
+            payload = {
                 'event_id': event.event_id,
                 'title': event.title,
                 'content': event.content,
@@ -393,7 +439,12 @@ class OpenRouterRAGSystem:
                 'category': event.category,
                 'url': event.url,
                 'sentiment': event.sentiment
-            }).execute()
+            }
+
+            def _write_event():
+                self.supabase.table('news_events').upsert(payload).execute()
+
+            self._schedule_supabase_write(_write_event, "news_events.upsert")
 
             logger.debug(f"✅ Stored event: {event.title[:50]}...")
 
@@ -591,7 +642,7 @@ Rules:
     ):
         """Store analysis in Supabase"""
         try:
-            self.supabase.table('market_analyses').insert({
+            payload = {
                 'event_id': event.event_id,
                 'market_id': impact.market_id,
                 'market_question': market_question,
@@ -603,7 +654,12 @@ Rules:
                 'expected_value': float(impact.expected_value),
                 'analyzed_at': datetime.now().isoformat(),
                 'model_used': impact.model_used
-            }).execute()
+            }
+
+            def _write_analysis():
+                self.supabase.table('market_analyses').insert(payload).execute()
+
+            self._schedule_supabase_write(_write_analysis, "market_analyses.insert")
         except Exception as e:
             logger.error(f"Failed to store analysis: {e}")
 

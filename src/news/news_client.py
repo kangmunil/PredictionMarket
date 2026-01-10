@@ -241,6 +241,9 @@ class NewsAPIClient:
             return processed
 
         except requests.exceptions.RequestException as e:
+            response = getattr(e, "response", None)
+            if response is not None and response.status_code == 429:
+                raise
             logger.error(f"❌ Network error: {e}")
             return []
         except Exception as e:

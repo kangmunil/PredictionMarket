@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 from datetime import datetime
 from dataclasses import dataclass
 from decimal import Decimal
+from src.core.health_monitor import PROM_TRADES, PROM_PNL_DAILY
 
 logger = logging.getLogger(__name__)
 
@@ -77,15 +78,6 @@ class PnLTracker:
 
         exit_price = float(exit_price)
         
-        # Calculate P&L
-        # Long (BUY): (Exit - Entry) / Entry * Size
-        # Short (SELL): (Entry - Exit) / Entry * Size (Assuming borrowing/shorting mechanics, 
-        # but in Polymarket SELL usually means selling owned shares. 
-        # If we 'SHORT' via 'NO', we 'BUY NO'. 
-        # Here we assume side='BUY' means Long the outcome token. 
-        # If we SELL the token we own: PnL = (Exit - Entry) * Shares
-        # Shares = Size / Entry
-        
         shares = entry.size / entry.entry_price if entry.entry_price > 0 else 0
         
         if entry.side.upper() == "BUY":
@@ -95,13 +87,20 @@ class PnLTracker:
             # PnL = (Entry - Exit) * Shares
             pnl_amount = (entry.entry_price - exit_price) * shares
 
-        pnl_percent = (pnl_amount / entry.size) * 100 if entry.size > 0 else 0.0
+        fee_rate = 0.001
+        fee_cost = entry.size * fee_rate * 2  # Assume round-trip fees
+        net_pnl = pnl_amount - fee_cost
+        pnl_percent = (net_pnl / entry.size) * 100 if entry.size > 0 else 0.0
 
         # Update stats
-        self.total_realized_pnl += pnl_amount
+        self.total_realized_pnl += net_pnl
         if entry.strategy in self.strategy_pnl:
-            self.strategy_pnl[entry.strategy] += pnl_amount
+            self.strategy_pnl[entry.strategy] += net_pnl
         
+        # Update Prometheus Metrics
+        PROM_TRADES.labels(strategy=entry.strategy, outcome="win" if net_pnl > 0 else "loss").inc()
+        PROM_PNL_DAILY.set(self.total_realized_pnl)
+
         # Archive
         record = {
             "trade_id": trade_id,
@@ -111,7 +110,7 @@ class PnLTracker:
             "entry_price": entry.entry_price,
             "exit_price": exit_price,
             "size": entry.size,
-            "pnl": pnl_amount,
+            "pnl": net_pnl,
             "pnl_pct": pnl_percent,
             "entry_time": entry.entry_time.isoformat(),
             "exit_time": datetime.now().isoformat(),
@@ -120,8 +119,12 @@ class PnLTracker:
         self.history.append(record)
         del self.active_trades[trade_id]
 
-        logger.info(f"💰 [PnL] Exit Recorded: {entry.strategy} | PnL: ${pnl_amount:+.2f} ({pnl_percent:+.2f}%) | Total: ${self.total_realized_pnl:+.2f}")
-        return pnl_amount
+        logger.info(
+            f"💰 [PnL FINAL] {trade_id} | Side: {entry.side} | Entry: ${entry.entry_price:.3f} | "
+            f"Exit: ${exit_price:.3f} | Net P&L: ${net_pnl:+.4f} ({pnl_percent:+.2f}%) "
+            f"| Reason: {reason} | Total: ${self.total_realized_pnl:+.2f}"
+        )
+        return net_pnl
 
     def calculate_unrealized_pnl(self, current_prices: Dict[str, float]) -> float:
         """

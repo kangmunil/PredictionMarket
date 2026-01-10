@@ -14,7 +14,7 @@ Created: 2026-01-03
 
 import asyncio
 import logging
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Optional
 from datetime import datetime
 import feedparser
 import aiohttp
@@ -53,6 +53,8 @@ class NewsAggregator:
                  enable_source_filter: bool = False):
         self.sources = {}
         self.enable_source_filter = enable_source_filter
+        self._rss_session: Optional[aiohttp.ClientSession] = None
+        self.newsapi_cooldown_until: Optional[float] = None
 
         if news_api_key:
             self.sources['newsapi'] = NewsAPIClient(api_key=news_api_key)
@@ -77,7 +79,7 @@ class NewsAggregator:
         # 1. API Sources
         if 'tree' in self.sources:
             tasks.append(self._fetch_from_tree(keywords, 20))
-        if 'newsapi' in self.sources:
+        if 'newsapi' in self.sources and not self._newsapi_in_cooldown():
             tasks.append(self._fetch_from_newsapi(keywords, 20))
 
         # 2. RSS Sources (Always available & FREE)
@@ -118,26 +120,26 @@ class NewsAggregator:
         """Fetch and parse a single RSS feed"""
         articles = []
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=10) as response:
-                    content = await response.text()
-                    feed = feedparser.parse(content)
+            session = await self._ensure_rss_session()
+            async with session.get(url, timeout=10) as response:
+                content = await response.text()
+                feed = feedparser.parse(content)
+                
+                for entry in feed.entries[:30]:
+                    title = entry.get('title', '')
+                    summary = entry.get('summary', '') or entry.get('description', '')
+                    link = entry.get('link', '')
                     
-                    for entry in feed.entries[:15]:
-                        title = entry.get('title', '')
-                        summary = entry.get('summary', '') or entry.get('description', '')
-                        link = entry.get('link', '')
-                        
-                        # Filter by keywords (Simple case-insensitive match)
-                        if any(kw.lower() in title.lower() or kw.lower() in summary.lower() for kw in keywords):
-                            articles.append({
-                                "source": {"name": source_name},
-                                "title": title,
-                                "description": summary,
-                                "url": link,
-                                "publishedAt": entry.get('published', datetime.now().isoformat()),
-                                "content": summary
-                            })
+                    # Filter by keywords (Simple case-insensitive match)
+                    if any(kw.lower() in title.lower() or kw.lower() in summary.lower() for kw in keywords):
+                        articles.append({
+                            "source": {"name": source_name},
+                            "title": title,
+                            "description": summary,
+                            "url": link,
+                            "publishedAt": entry.get('published', datetime.now().isoformat()),
+                            "content": summary
+                        })
         except Exception as e:
             logger.debug(f"RSS error ({source_name}): {e}")
         return articles
@@ -150,7 +152,18 @@ class NewsAggregator:
                 None,
                 lambda: self.sources['newsapi'].get_breaking_news(keywords=keywords, max_results=limit)
             )
-        except: return []
+        except Exception as e:
+            error_text = str(e).lower()
+            if any(keyword in error_text for keyword in ("429", "too many requests", "rate limit")):
+                backoff_seconds = 300
+                self.newsapi_cooldown_until = time.time() + backoff_seconds
+                logger.warning(
+                    "🛑 NewsAPI rate limit detected (via exception). Backing off for %ss",
+                    backoff_seconds,
+                )
+            else:
+                logger.error(f"NewsAPI fetch error: {e}")
+            return []
 
     async def _fetch_from_tree(self, keywords: List[str], limit: int) -> List[Dict]:
         # ... (same as original tree news fetch) ...
@@ -185,6 +198,22 @@ class NewsAggregator:
 
     def get_stats(self) -> Dict:
         return {"sources": list(self.sources.keys()) + ["RSS"], "total_seen": len(self.seen_urls)}
+
+    async def _ensure_rss_session(self) -> aiohttp.ClientSession:
+        if self._rss_session is None or self._rss_session.closed:
+            self._rss_session = aiohttp.ClientSession()
+        return self._rss_session
+
+    async def close(self):
+        if self._rss_session and not self._rss_session.closed:
+            await self._rss_session.close()
+            logger.info("✅ NewsAggregator RSS session closed")
+
+    def _newsapi_in_cooldown(self) -> bool:
+        return (
+            self.newsapi_cooldown_until is not None
+            and time.time() < self.newsapi_cooldown_until
+        )
 
 
 # Standalone test

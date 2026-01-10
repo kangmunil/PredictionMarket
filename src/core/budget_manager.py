@@ -129,6 +129,17 @@ class BudgetManager:
                     self.balances[strategy] += unused
                     logger.info(f"💸 Returned ${unused:.2f} to {strategy}")
 
+    async def get_balances(self) -> Dict[str, Decimal]:
+        """
+        Get all balances including reserve.
+        Required by HealthMonitor.
+        """
+        async with self._lock:
+            # Create a copy including reserve
+            balances = self.balances.copy()
+            balances['reserve'] = self.reserve_balance
+            return balances
+
     async def get_status(self) -> dict:
         return {
             "total_capital": float(self.total_capital),

@@ -1,3 +1,4 @@
+import json
 import os
 from dotenv import load_dotenv
 
@@ -84,3 +85,80 @@ class Config:
     @property
     def BUDGET_MODE(self) -> str:
         return os.getenv("BUDGET_MODE", "simulation")
+
+    @property
+    def TAKER_FEE(self) -> float:
+        return float(os.getenv("TAKER_FEE", "0.002"))
+
+    @property
+    def SLIPPAGE_BUFFER(self) -> float:
+        return float(os.getenv("SLIPPAGE_BUFFER", "0.001"))  # 0.0015 -> 0.001 (0.1%)
+
+    @property
+    def DISABLE_SLIPPAGE_PROTECTION(self) -> bool:
+        val = os.getenv("DISABLE_SLIPPAGE_PROTECTION", "false").lower()
+        return val in ("true", "1", "yes", "on")
+
+    @property
+    def DELTA_LIMITS(self) -> dict:
+        """
+        Returns a dictionary of market-group delta limits.
+        Structure:
+        {
+            "BTC_15M": {"hard": 2000.0, "soft": 1500.0},
+            "ETH_15M": {"hard": 1500.0, "soft": 1100.0},
+            "DEFAULT": {"hard": 800.0, "soft": 600.0},
+        }
+        """
+        defaults = {
+            "BTC_15M": {
+                "hard": float(os.getenv("DELTA_LIMIT_BTC15M_HARD", "2000")),
+                "soft": float(os.getenv("DELTA_LIMIT_BTC15M_SOFT", "1500")),
+            },
+            "ETH_15M": {
+                "hard": float(os.getenv("DELTA_LIMIT_ETH15M_HARD", "1500")),
+                "soft": float(os.getenv("DELTA_LIMIT_ETH15M_SOFT", "1100")),
+            },
+            "CRYPTO": {
+                "hard": float(os.getenv("DELTA_LIMIT_CRYPTO_HARD", "1200")),
+                "soft": float(os.getenv("DELTA_LIMIT_CRYPTO_SOFT", "900")),
+            },
+            "DEFAULT": {
+                "hard": float(os.getenv("DELTA_LIMIT_DEFAULT_HARD", "800")),
+                "soft": float(os.getenv("DELTA_LIMIT_DEFAULT_SOFT", "600")),
+            },
+        }
+
+        overrides = os.getenv("DELTA_LIMITS_JSON")
+        if overrides:
+            try:
+                parsed = json.loads(overrides)
+                for key, value in parsed.items():
+                    if isinstance(value, dict):
+                        normalized_key = str(key).upper()
+                        defaults[normalized_key] = {
+                            "hard": float(value.get("hard"))
+                            if value.get("hard") is not None
+                            else None,
+                            "soft": float(value.get("soft"))
+                            if value.get("soft") is not None
+                            else None,
+                        }
+            except json.JSONDecodeError:
+                pass
+
+        return defaults
+
+    @property
+    def SPREAD_REGIME_THRESHOLDS(self) -> dict:
+        """
+        Returns thresholds for classifying spread regimes.
+        efficient: spreads below this are considered efficient (skip/size down)
+        neutral: spreads below this (but above efficient) are neutral; above is inefficient
+        """
+        # Defaults expressed as ratios of mid-price (0.005 == 50 bps, 0.02 == 200 bps)
+        efficient = float(os.getenv("SPREAD_EFFICIENT_MAX", "0.005"))
+        neutral = float(os.getenv("SPREAD_NEUTRAL_MAX", "0.02"))
+        if neutral <= efficient:
+            neutral = efficient * 2.0
+        return {"efficient": efficient, "neutral": neutral}

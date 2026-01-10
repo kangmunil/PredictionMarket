@@ -17,13 +17,14 @@ Created: 2026-01-03
 
 import asyncio
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from datetime import datetime, timedelta
 from decimal import Decimal
 import time
 from collections import defaultdict
 import os
 import json
+from contextlib import suppress
 from dateutil import parser as date_parser
 
 from .news_aggregator import NewsAggregator
@@ -32,6 +33,9 @@ from .market_matcher import MarketMatcher
 from src.core.risk_manager import RiskManager
 from src.core.decision_logger import DecisionLogger
 from src.core.allocation_manager import AllocationManager
+from src.core.config import Config
+from src.core.fee_model import FeeModel
+from src.core.aggression import seconds_to_expiry, aggression_profile
 
 # RAG System (Advanced AI Analysis)
 try:
@@ -66,9 +70,11 @@ class OptimizedNewsScalper:
         supabase_url: str = None,
         supabase_key: str = None,
         signal_bus = None,
-        swarm_system = None
+        swarm_system = None,
+        delta_tracker = None
     ):
         # ... existing init code ...
+        self.config = Config()
         self.news_aggregator = NewsAggregator(
             news_api_key=news_api_key,
             tree_api_key=tree_news_api_key
@@ -96,8 +102,12 @@ class OptimizedNewsScalper:
         self.use_rag = use_rag and RAG_AVAILABLE
         # ... rest of init ...
         
-        # Initialize Risk Manager
-        self.risk_manager = RiskManager()
+        self.fee_model = FeeModel(taker_fee=self.config.TAKER_FEE)
+        self.slippage_buffer = self.config.SLIPPAGE_BUFFER
+
+        # Initialize Risk Manager (cap dry-run trades at $2, live at $50)
+        max_bet = 2.0 if dry_run else 50.0
+        self.risk_manager = RiskManager(max_bet_usd=max_bet)
         
         # Initialize Decision Logger
         notifier = self.swarm_system.notifier if self.swarm_system else None
@@ -124,6 +134,12 @@ class OptimizedNewsScalper:
         self.clob_client = clob_client
         self.budget_manager = budget_manager
         self.dry_run = dry_run
+        self.delta_tracker = delta_tracker
+        default_hold = "1.5"
+        self.signal_cooldown = timedelta(
+            minutes=float(os.getenv("NEWS_SIGNAL_COOLDOWN_MINUTES", "15"))
+        )
+        self.max_hold_hours = float(os.getenv("NEWS_MAX_HOLD_HOURS", default_hold))
 
         # Bridge: Connects News to Stat Arb
         try:
@@ -139,10 +155,27 @@ class OptimizedNewsScalper:
         # Trading config (OPTIMIZED FOR 50% PROBABILITY)
         self.min_confidence = 0.50       # 50% 확률이면 진입
         self.high_impact_threshold = 0.70 # 70% 이상이면 고영향 뉴스로 판단
-        self.min_market_volume = 1.0     # 거래량 문턱을 낮춰 더 많은 시장 매칭
-        self.position_size = 10.0        # 기본 진입 금액 $10
+        self.min_market_volume = 0.3     # 거래량 문턱 완화 (1.0 -> 0.3) - 더 많은 시장 매칭
+        self.position_size = 6.0        # 기본 진입 금액 $6 (Polymarket 최소 주문 금액 $5 이상)
         self.max_positions = 5
-        self.stop_loss_pct = -0.05  # -5% stop-loss (권장: -3% ~ -5%)
+        self.take_profit_pct = float(os.getenv("NEWS_TAKE_PROFIT_PCT", "0.05"))
+        self.stop_loss_pct = float(os.getenv("NEWS_STOP_LOSS_PCT", "0.03"))
+        self.trade_fee_rate = float(os.getenv("POLYMARKET_FEE_RATE", "0.001"))
+        self.scale_in_multiplier = float(os.getenv("NEWS_SCALE_IN_MULTIPLIER", "0.5"))
+        self.scale_in_min_usd = float(os.getenv("NEWS_SCALE_IN_MIN_USD", "5.0"))
+        self.scale_in_max_usd = float(os.getenv("NEWS_SCALE_IN_MAX_USD", "15.0"))
+        # Lower default EV floor to allow more trades (0.05 -> 0.025)
+        self.efficient_ev_floor = float(os.getenv("NEWS_EFFICIENT_EV_FLOOR", "0.025"))
+        self.inefficient_slippage_buffer = float(
+            os.getenv("NEWS_INEFFICIENT_SLIPPAGE_BUFFER", "0.008")  # 0.01 -> 0.008 완화
+        )
+        self.phase_multipliers = {
+            "EARLY": float(os.getenv("NEWS_PHASE_MULT_EARLY", "1.0")),
+            "MID": float(os.getenv("NEWS_PHASE_MULT_MID", "1.2")),
+            "LATE": float(os.getenv("NEWS_PHASE_MULT_LATE", "2.0")),
+            "ENDGAME": float(os.getenv("NEWS_PHASE_MULT_ENDGAME", "3.0")),
+        }
+        self.inefficient_phase_boost = float(os.getenv("NEWS_PHASE_INEFF_BOOST", "1.2"))
 
         # Performance optimization: Market cache
         self.market_cache = {}  # keyword -> [markets]
@@ -154,7 +187,10 @@ class OptimizedNewsScalper:
 
         # State tracking
         self.positions = {}
+        self.cooldown_until: Dict[str, datetime] = {}
+        self.latest_signals: Dict[str, Dict[str, float]] = {}
         self.processed_news = set()
+        self._subscribed_books: Set[str] = set()
         self.stats = {
             "news_checked": 0,
             "signals_generated": 0,
@@ -170,6 +206,56 @@ class OptimizedNewsScalper:
 
         self.start_time = None
         self._is_warmed_up = False
+
+    def _passes_cooldown_gate(
+        self,
+        token_id: str,
+        signal_side: str,
+        *,
+        is_scale: bool = False,
+        delta_ok: bool = False,
+    ) -> bool:
+        """
+        Centralized cooldown enforcement. Scale-ins may bypass once the
+        delta controller approves, while fresh entries remain throttle-bound.
+        """
+        cooldown_ts = self.cooldown_until.get(token_id)
+        if not cooldown_ts:
+            return True
+
+        now = datetime.now()
+        if now >= cooldown_ts:
+            self.cooldown_until.pop(token_id, None)
+            return True
+
+        if is_scale and delta_ok:
+            logger.info(
+                "   🟢 Cooldown bypassed for scale-in (%s | side=%s)",
+                token_id[:12],
+                signal_side,
+            )
+            return True
+
+        remaining = (cooldown_ts - now).total_seconds() / 60
+        logger.info(
+            "   ⏳ Cooldown active for %s (%.1fm left); skipping signal",
+            token_id[:12],
+            remaining,
+        )
+        return False
+
+    async def _ensure_orderbook_subscription(self, token_id: str) -> None:
+        """Guarantee that the SignalBus receives book data for the target token."""
+        if not token_id or not self.clob_client:
+            return
+        if token_id in self._subscribed_books:
+            return
+        try:
+            await self.clob_client.subscribe_orderbook([token_id])
+            self._subscribed_books.add(token_id)
+            logger.info("   📡 Orderbook stream subscribed for %s", token_id[:15])
+        except Exception as exc:
+            logger.warning("   ⚠️ Failed to subscribe orderbook for %s: %s", token_id[:10], exc)
 
     async def warmup(self, keywords: List[str]):
         """
@@ -613,10 +699,15 @@ class OptimizedNewsScalper:
         """Execute trade with improved token ID extraction"""
         market_question = market.get('question', '')
         logger.info(f"🚀 [SCALPER] Entering _execute_trade for '{market_question[:30]}...'")
+        market_group = self._infer_market_group(market)
+        market_expiry = self._parse_market_expiry(market)
+        expiry_seconds = seconds_to_expiry(market_expiry)
         
         allocation_id: Optional[str] = None
         allocation_amount: Optional[Decimal] = None
         position_opened = False
+        current_price: Optional[float] = None
+        position_size: Optional[float] = None
 
         try:
             # 🚀 유연한 레이블 처리 (AI 출력값 대응)
@@ -625,8 +716,10 @@ class OptimizedNewsScalper:
             
             if raw_label in ["positive", "buy"]:
                 side = "BUY"
+                label = "buy"
             elif raw_label in ["negative", "sell"]:
                 side = "SELL"
+                label = "sell"
             else:
                 logger.info(f"   ⏭️  Skipping: Label '{raw_label}' is not actionable (HOLD)")
                 return
@@ -655,22 +748,233 @@ class OptimizedNewsScalper:
                 logger.warning(f"   ⚠️  [EXECUTION ABORTED] Could not extract valid Token ID for: {market_question[:30]}...")
                 return
 
-            logger.info(f"   ✅ Target Token Resolved: {token_id[:15]}...")
+            logger.info(f"   ✅ Target Token Resolved: {token_id[:15]}... (group={market_group})")
+            await self._ensure_orderbook_subscription(token_id)
+            condition_id = market.get("condition_id") or market.get("id")
+
+            if self.signal_bus and market_expiry:
+                try:
+                    await self.signal_bus.update_market_metrics(
+                        token_id=token_id,
+                        metadata={"expires_at": market_expiry.isoformat()},
+                    )
+                except Exception as exc:
+                    logger.debug(f"SignalBus expiry update failed: {exc}")
+
+            # Prevent overlapping positions or spam on identical market
+            existing_position = self.positions.get(token_id)
+            if existing_position:
+                if existing_position["side"].upper() != side:
+                    logger.info("   🔄 Opposite signal detected while position open; closing existing exposure.")
+                    await self._close_position(token_id, existing_position, "SignalFlip")
+                else:
+                    current_price = await self._get_current_price(token_id, condition_id=condition_id)
+                    if current_price is None or current_price <= 0:
+                        current_price = 0.5
+                    position_size = self.risk_manager.calculate_position_size(
+                        prob_win=sentiment["score"],
+                        current_price=current_price,
+                        category="crypto",
+                        volatility_score=0.1,
+                    )
+                    if position_size <= 0:
+                        logger.info(
+                            "   🛑 [RISK REJECTED] Size: $%.2f | Reason: Low EV (Prob %.2f vs Price %.2f)",
+                            position_size,
+                            sentiment["score"],
+                            current_price,
+                        )
+                        return
+                    await self._refresh_position_signal(
+                        token_id=token_id,
+                        position=existing_position,
+                        sentiment=sentiment,
+                        article=article,
+                        market=market,
+                        current_price=current_price,
+                        base_position_size=position_size,
+                        market_group=market_group,
+                        market_expiry=market_expiry,
+                        condition_id=condition_id,
+                        is_high_impact=is_high_impact,
+                    )
+                    return
+                if token_id in self.positions:
+                    return
+
+            if not self._passes_cooldown_gate(token_id, side):
+                return
+
+            prev_signal = self.latest_signals.get(token_id)
+            if prev_signal and prev_signal.get("label") != label:
+                if prev_signal.get("score", 0.0) >= sentiment["score"]:
+                    logger.info(
+                        "   ↔️ Conflicting signal detected; existing higher-confidence directive in effect."
+                    )
+                    return
+                logger.info("   🔁 Overriding weaker opposing signal with higher confidence trade.")
 
             # 🛡️ DYNAMIC POSITION SIZING (Kelly Criterion)
-            current_price = await self._get_current_price(token_id)
-            if current_price <= 0: current_price = 0.5 # Safety fallback
+            if current_price is None:
+                current_price = await self._get_current_price(token_id, condition_id=condition_id)
+            if current_price is None or current_price <= 0:
+                current_price = 0.5 # Safety fallback
             
-            position_size = self.risk_manager.calculate_position_size(
-                prob_win=sentiment["score"],
-                current_price=current_price,
-                category="crypto", # Can be dynamic based on news
-                volatility_score=0.1 # Placeholder: would calculate from spread
+            if position_size is None:
+                position_size = self.risk_manager.calculate_position_size(
+                    prob_win=sentiment["score"],
+                    current_price=current_price,
+                    category="crypto", # Can be dynamic based on news
+                    volatility_score=0.1 # Placeholder: would calculate from spread
             )
             
+            # Enforce minimum order size (Polymarket requirement)
+            if position_size > 0 and position_size < 5.0 and not self.dry_run:
+                logger.info(f"   ⚠️ Enforcing minimum order size: ${position_size:.2f} -> $5.00")
+                position_size = 5.0
+
             if position_size <= 0:
-                logger.info(f"   🛑 [RISK REJECTED] Size: ${position_size:.2f} | Reason: Low EV (Prob {sentiment['score']:.2f} vs Price {current_price:.2f}) or Volatility Penalty")
+                logger.info(
+                    "   🛑 [RISK REJECTED] Size: $%.2f | Reason: Low EV (Prob %.2f vs Price %.2f) or Volatility Penalty",
+                    position_size,
+                    sentiment["score"],
+                    current_price,
+                )
                 return
+
+            spread_for_ev = 0.0
+            spread_regime = "UNKNOWN"
+            spread_bps = 0.0
+            expiry_phase = "EARLY"
+            expiry_minutes = None
+            if self.signal_bus:
+                try:
+                    market_signal = await self.signal_bus.get_signal(token_id)
+                    spread_for_ev = getattr(market_signal, "spread", 0.0) or 0.0
+                    spread_regime = (
+                        getattr(market_signal, "spread_regime", "UNKNOWN") or "UNKNOWN"
+                    )
+                    spread_bps = getattr(market_signal, "spread_bps", 0.0) or 0.0
+                    expiry_ctx = (market_signal.metadata or {}).get("expiry") or {}
+                    expiry_phase = (expiry_ctx.get("phase") or "EARLY").upper()
+                    expiry_minutes = expiry_ctx.get("minutes_remaining")
+                except Exception as exc:
+                    logger.debug(f"SignalBus lookup failed for EV check: {exc}")
+
+            time_multiplier = self._time_phase_multiplier(expiry_phase)
+            phase_reason = ""
+            if (
+                spread_regime.upper() == "INEFFICIENT"
+                and expiry_phase in ("LATE", "ENDGAME")
+            ):
+                time_multiplier *= self.inefficient_phase_boost
+                phase_reason = " + spread boost"
+            if abs(time_multiplier - 1.0) > 1e-6:
+                scaled_size = position_size * time_multiplier
+                logger.info(
+                    "   ⏱️ Time aggression %s (≈%s min) scaled size from $%.2f → $%.2f%s",
+                    expiry_phase,
+                    f"{expiry_minutes:.0f}" if expiry_minutes is not None else "?",
+                    position_size,
+                    scaled_size,
+                    phase_reason,
+                )
+                position_size = scaled_size
+
+            expected_edge = self._compute_expected_edge(sentiment["score"], current_price, side)
+            regime_upper = (spread_regime or "UNKNOWN").upper()
+            slippage_override = None
+            if regime_upper == "EFFICIENT":
+                if expected_edge < self.efficient_ev_floor:
+                    logger.info(
+                        "   🛑 Spread regime %s (≈%.0f bps) demands EV >= %.2f; edge %.4f → SKIP",
+                        regime_upper,
+                        spread_bps,
+                        self.efficient_ev_floor,
+                        expected_edge,
+                    )
+                    return
+                logger.info(
+                    "   ⚠️ Efficient book overridden because EV %.4f ≥ %.2f",
+                    expected_edge,
+                    self.efficient_ev_floor,
+                )
+            elif regime_upper == "INEFFICIENT":
+                slippage_override = max(self.slippage_buffer, self.inefficient_slippage_buffer)
+                logger.info(
+                    "   ⚡ Inefficient regime detected (≈%.0f bps); slippage buffer elevated to %.4f",
+                    spread_bps,
+                    slippage_override,
+                )
+
+            if not self._passes_ev_filter(
+                expected_edge,
+                spread_for_ev,
+                current_price,
+                position_size,
+                slippage_override=slippage_override,
+            ):
+                logger.info("   ⚠️ EV filter rejected trade (edge %.4f < threshold)", expected_edge)
+                return
+
+            spread_multiplier = self._spread_multiplier_for_regime(regime_upper)
+            if spread_multiplier <= 0:
+                logger.info(
+                    "   🧊 Spread regime %s (Δ=%.4f) indicates efficient book; standing down.",
+                    spread_regime,
+                    spread_for_ev,
+                )
+                return
+            if spread_multiplier < 1.0:
+                adjusted = position_size * spread_multiplier
+                logger.info(
+                    "   ⚖️ Spread regime %s scaled size from $%.2f → $%.2f",
+                    spread_regime,
+                    position_size,
+                    adjusted,
+                )
+                position_size = adjusted
+
+            agg_multiplier, agg_stage = aggression_profile(expiry_seconds)
+            if agg_multiplier <= 0:
+                logger.info("   🕒 Aggression stage %s suppressed trade (no exposure).", agg_stage)
+                return
+            if abs(agg_multiplier - 1.0) > 1e-6:
+                scaled = position_size * agg_multiplier
+                logger.info(
+                    "   ⚡ Aggression stage %s (t=%.0fs) scaled size from $%.2f → $%.2f",
+                    agg_stage,
+                    expiry_seconds if expiry_seconds is not None else float("nan"),
+                    position_size,
+                    scaled,
+                )
+                position_size = scaled
+
+            if self.delta_tracker:
+                delta_decision = await self.delta_tracker.check_allowance(
+                    token_id=token_id,
+                    side=side,
+                    size=position_size,
+                    market_group=market_group,
+                    condition_id=condition_id,
+                )
+                if not delta_decision.allowed:
+                    limits_desc = f"hard={delta_decision.hard_limit} soft={delta_decision.soft_limit}"
+                    logger.info(
+                        "   🛑 Delta guard blocked trade (%s) [group=%s current=%.2f -> projected=%.2f | %s]",
+                        delta_decision.reason,
+                        delta_decision.group,
+                        delta_decision.current_delta,
+                        delta_decision.projected_delta,
+                        limits_desc,
+                    )
+                    return
+                elif delta_decision.reduce_only:
+                    logger.info(
+                        "   ⚠️ Delta reduce-only mode; proceeding because exposure shrinks (current=%.2f -> projected=%.2f)",
+                        delta_decision.current_delta,
+                        delta_decision.projected_delta,
+                    )
 
             if self.balance_allocator:
                 adjusted_size = await self.balance_allocator.allocate_for_market(
@@ -712,7 +1016,7 @@ class OptimizedNewsScalper:
 
             if self.dry_run:
                 # PAPER TRADING: Get real entry price
-                entry_price = await self._get_current_price(token_id)
+                entry_price = await self._get_current_price(token_id, condition_id=condition_id)
 
                 logger.info(f"   🧪 PAPER TRADING: Would execute slippage-protected {side} order")
                 logger.info(f"      Entry price: ${entry_price:.4f}")
@@ -731,7 +1035,11 @@ class OptimizedNewsScalper:
                     "article": article,
                     "is_high_impact": is_high_impact,
                     "allocation_id": allocation_id,
-                    "allocation_amount": allocation_amount
+                    "allocation_amount": allocation_amount,
+                    "condition_id": condition_id,
+                    "market_group": market_group,
+                    "expires_at": market_expiry,
+                    "pnl_tids": [],
                 }
                 self.stats["trades_executed"] += 1
                 self.stats["positions_opened"] += 1
@@ -742,28 +1050,66 @@ class OptimizedNewsScalper:
                     self.swarm_system.add_trade_record(side, token_id, entry_price, position_size)
                     # 🚀 PnL Tracker 기록 추가
                     if hasattr(self.swarm_system, 'pnl_tracker'):
-                        self.positions[token_id]["pnl_tid"] = self.swarm_system.pnl_tracker.record_entry(
+                        entry_tid = self.swarm_system.pnl_tracker.record_entry(
                             strategy="news_scalper",
                             token_id=token_id,
                             side=side,
                             price=entry_price,
                             size=position_size
                         )
-            else:
-                # LIVE MODE: Use slippage-protected order
-                logger.info(f"   🛡️  Using slippage protection (max 2%)")
-
-                order_result = await self.clob_client.place_limit_order_with_slippage_protection(
-                    token_id=token_id,
-                    side=side,
-                    amount=position_size,
-                    max_slippage_pct=2.0,  # Max 2% slippage
-                    priority="high" if is_high_impact else "normal"
+                        self.positions[token_id]["pnl_tids"].append(entry_tid)
+                await self._record_delta_trade(
+                    token_id,
+                    side,
+                    position_size,
+                    entry_price,
+                    market,
+                    condition_id,
+                    market_group,
                 )
+                self.latest_signals[token_id] = {
+                    "label": label,
+                    "score": sentiment["score"]
+                }
+            else:
+                disable_slippage = getattr(self.config, "DISABLE_SLIPPAGE_PROTECTION", False)
+
+                if disable_slippage:
+                    logger.warning("   🚨 Slippage protection disabled; sending aggressive IOC order")
+                    order_result = await self.clob_client.place_unprotected_aggressive_order(
+                        token_id=token_id,
+                        side=side,
+                        amount=position_size,
+                        priority="high" if is_high_impact else "normal",
+                    )
+                else:
+                    # LIVE MODE: Use slippage-protected order
+                    logger.info(f"   🛡️  Using slippage protection (max 2%)")
+
+                    order_result = await self.clob_client.place_limit_order_with_slippage_protection(
+                        token_id=token_id,
+                        side=side,
+                        amount=position_size,
+                        max_slippage_pct=2.0,  # Max 2% slippage
+                        priority="high" if is_high_impact else "normal"
+                    )
 
                 if order_result:
-                    logger.info(f"   ✅ Order executed with slippage protection")
+                    logger.info(f"   ✅ Order executed{' without protection' if disable_slippage else ' with slippage protection'}")
                     entry_price = float(order_result.get('price', 0.5))
+
+                    if disable_slippage and current_price is not None:
+                        intended_price = float(current_price)
+                        slippage_cost = (
+                            entry_price - intended_price
+                            if side.upper() == "BUY"
+                            else intended_price - entry_price
+                        )
+                        logger.warning(
+                            "   💸 Unprotected fill deviated by %.4f (%+.2fbps)",
+                            slippage_cost,
+                            (slippage_cost / max(intended_price, 1e-6)) * 10000,
+                        )
 
                     # Track position
                     self.positions[token_id] = {
@@ -778,7 +1124,11 @@ class OptimizedNewsScalper:
                         "is_high_impact": is_high_impact,
                         "order_id": order_result.get('orderID'),
                         "allocation_id": allocation_id,
-                        "allocation_amount": allocation_amount
+                        "allocation_amount": allocation_amount,
+                        "condition_id": condition_id,
+                        "market_group": market_group,
+                        "expires_at": market_expiry,
+                        "pnl_tids": [],
                     }
                     self.stats["trades_executed"] += 1
                     self.stats["positions_opened"] += 1
@@ -786,13 +1136,27 @@ class OptimizedNewsScalper:
                     
                     # 🚀 PnL Tracker 기록 추가 (Live)
                     if self.swarm_system and hasattr(self.swarm_system, 'pnl_tracker'):
-                        self.positions[token_id]["pnl_tid"] = self.swarm_system.pnl_tracker.record_entry(
+                        entry_tid = self.swarm_system.pnl_tracker.record_entry(
                             strategy="news_scalper",
                             token_id=token_id,
                             side=side,
                             price=entry_price,
                             size=position_size
                         )
+                        self.positions[token_id]["pnl_tids"].append(entry_tid)
+                    await self._record_delta_trade(
+                        token_id,
+                        side,
+                        position_size,
+                        entry_price,
+                        market,
+                        condition_id,
+                        market_group,
+                    )
+                    self.latest_signals[token_id] = {
+                        "label": label,
+                        "score": sentiment["score"]
+                    }
                 else:
                     logger.warning(f"   ⚠️  Order cancelled (slippage too high)")
 
@@ -809,11 +1173,238 @@ class OptimizedNewsScalper:
         if not self.positions:
             return
 
+        logger.debug(f"🕵️ Monitoring {len(self.positions)} open positions for dynamic exits")
+
         for token_id, position in list(self.positions.items()):
             try:
                 await self._check_position_exit(token_id, position)
             except Exception as e:
                 logger.error(f"❌ Error monitoring position: {e}")
+
+    def _parse_market_expiry(self, market: Optional[Dict]) -> Optional[datetime]:
+        if not market:
+            return None
+        end_raw = (
+            market.get("end_date")
+            or market.get("endDate")
+            or market.get("ends_at")
+            or market.get("endDateISO")
+        )
+        if not end_raw:
+            return None
+        try:
+            return date_parser.parse(end_raw)
+        except Exception:
+            return None
+
+    def _infer_market_group(self, market: Optional[Dict]) -> str:
+        """Rudimentary classifier for delta guardrails."""
+        if not market:
+            return "DEFAULT"
+
+        question = (market.get("question") or "").lower()
+        tags = " ".join(map(str, market.get("tags", []))).lower()
+        text = f"{question} {tags}"
+
+        if any(key in text for key in ("15m", "15 m", "15-minute", "15 minute")):
+            if "bitcoin" in text or "btc" in text:
+                return "BTC_15M"
+            if "eth" in text or "ethereum" in text:
+                return "ETH_15M"
+
+        if "bitcoin" in text or "btc" in text:
+            return "CRYPTO"
+        if "eth" in text or "ethereum" in text or "sol" in text:
+            return "CRYPTO"
+        return "DEFAULT"
+
+    def _spread_multiplier_for_regime(self, regime: str) -> float:
+        regime_key = (regime or "UNKNOWN").upper()
+        mapping = {
+            "INEFFICIENT": 1.0,
+            "NEUTRAL": 0.6,
+            "EFFICIENT": 0.0,
+            "UNKNOWN": 1.0,
+        }
+        return mapping.get(regime_key, 1.0)
+
+    def _time_phase_multiplier(self, phase: str) -> float:
+        phase_key = (phase or "EARLY").upper()
+        return self.phase_multipliers.get(phase_key, 1.0)
+
+    async def _record_delta_trade(
+        self,
+        token_id: str,
+        side: str,
+        size: float,
+        price: float,
+        market: Optional[Dict],
+        condition_id: Optional[str],
+        market_group: Optional[str],
+    ):
+        if not self.delta_tracker or not token_id:
+            return
+
+        if not market_group:
+            market_group = self._infer_market_group(market)
+
+        expires_at = self._parse_market_expiry(market)
+        market_name = market.get("question") if market else None
+
+        await self.delta_tracker.record_trade(
+            token_id=token_id,
+            side=side,
+            size=float(size),
+            price=float(price),
+            condition_id=condition_id,
+            market_name=market_name,
+            expires_at=expires_at,
+            market_group=market_group,
+        )
+
+    async def _refresh_position_signal(
+        self,
+        token_id: str,
+        position: Dict,
+        sentiment: Dict,
+        article: Dict,
+        market: Dict,
+        current_price: float,
+        base_position_size: float,
+        market_group: str,
+        market_expiry: Optional[datetime],
+        condition_id: Optional[str],
+        is_high_impact: bool,
+    ):
+        scale_candidate = base_position_size * self.scale_in_multiplier
+        scale_candidate = max(scale_candidate, self.scale_in_min_usd)
+        scale_candidate = min(scale_candidate, self.scale_in_max_usd)
+        if scale_candidate <= 0:
+            logger.info("   💤 Scale-in candidate size is zero; skipping refresh.")
+            return
+
+        addition_size = float(scale_candidate)
+        delta_allows_scale = self.delta_tracker is None
+        if self.delta_tracker:
+            delta_decision = await self.delta_tracker.check_allowance(
+                token_id=token_id,
+                side=position["side"],
+                size=addition_size,
+                market_group=market_group,
+                condition_id=condition_id,
+            )
+            if not delta_decision.allowed:
+                logger.info(
+                    "   🛑 Delta guard blocked scale-in (%s) [group=%s current=%.2f -> projected=%.2f]",
+                    delta_decision.reason,
+                    delta_decision.group,
+                    delta_decision.current_delta,
+                    delta_decision.projected_delta,
+                )
+                return
+            elif delta_decision.reduce_only:
+                logger.info(
+                    "   ⚠️ Delta reduce-only active; scale-in skipped (current=%.2f -> projected=%.2f)",
+                    delta_decision.current_delta,
+                    delta_decision.projected_delta,
+                )
+                return
+            else:
+                delta_allows_scale = True
+
+        if not self._passes_cooldown_gate(
+            token_id,
+            position["side"],
+            is_scale=True,
+            delta_ok=delta_allows_scale,
+        ):
+            return
+
+        entry_price = current_price
+        if entry_price is None or entry_price <= 0:
+            entry_price = await self._get_current_price(token_id, condition_id=condition_id)
+        if entry_price is None or entry_price <= 0:
+            logger.warning("   ⚠️ Unable to fetch scale-in price; skipping.")
+            return
+
+        previous_size = float(position["size"])
+        new_total_size = previous_size + addition_size
+        if new_total_size <= 0:
+            logger.warning("   ⚠️ Scale-in would reduce size below zero; skipping.")
+            return
+
+        weighted_price = (
+            (position["entry_price"] * previous_size) + (entry_price * addition_size)
+        ) / new_total_size
+        position["size"] = new_total_size
+        position["entry_price"] = weighted_price
+        position.setdefault("scale_events", []).append(
+            {
+                "timestamp": datetime.now().isoformat(),
+                "added_size": addition_size,
+                "price": entry_price,
+                "score": sentiment.get("score"),
+            }
+        )
+
+        if self.swarm_system:
+            self.swarm_system.add_trade_record("SCALE", token_id, entry_price, addition_size)
+            if hasattr(self.swarm_system, 'pnl_tracker'):
+                scale_tid = self.swarm_system.pnl_tracker.record_entry(
+                    strategy="news_scalper_scale",
+                    token_id=token_id,
+                    side=position["side"],
+                    price=entry_price,
+                    size=addition_size
+                )
+                position.setdefault("pnl_tids", []).append(scale_tid)
+
+        await self._record_delta_trade(
+            token_id=token_id,
+            side=position["side"],
+            size=addition_size,
+            price=entry_price,
+            market=market,
+            condition_id=condition_id,
+            market_group=market_group,
+        )
+
+        logger.info(
+            "   🔁 Scaled existing %s position by $%.2f (total $%.2f)",
+            position["side"],
+            addition_size,
+            new_total_size,
+        )
+        self.stats["trades_executed"] += 1
+
+    def _compute_expected_edge(self, sentiment_score: float, current_price: float, side: str) -> float:
+        side = side.upper()
+        if side == "BUY":
+            return max(0.0, sentiment_score - current_price)
+        return max(0.0, current_price - sentiment_score)
+
+    def _passes_ev_filter(
+        self,
+        expected_edge: float,
+        spread: float,
+        price: float,
+        size: float,
+        slippage_override: Optional[float] = None,
+    ) -> bool:
+        fee_cost = self.fee_model.cost(price=price, size=size, is_taker=True)
+        slippage_buffer = slippage_override if slippage_override is not None else self.slippage_buffer
+        min_edge = spread + fee_cost + slippage_buffer
+        verdict = expected_edge > min_edge
+        logger.debug(
+            "[EV CHECK] edge=%.4f spread=%.4f fee=%.4f slip=%.4f min_required=%.4f -> %s",
+            expected_edge,
+            spread,
+            fee_cost,
+            slippage_buffer,
+            min_edge,
+            "EXECUTE" if verdict else "SKIP",
+        )
+        return verdict
 
     async def _check_position_exit(self, token_id: str, position: Dict):
         """
@@ -825,44 +1416,87 @@ class OptimizedNewsScalper:
         """
         entry_time = position["entry_time"]
         entry_price = position["entry_price"]
-        side = position["side"]
+        side = position["side"].upper()
+        condition_id = position.get("condition_id") or position.get("market", {}).get("condition_id")
+        current_price = await self._get_current_price(token_id, condition_id=condition_id)
 
-        # 1. Stop-Loss Check (P&L based)
-        current_price = await self._get_current_price(token_id)
-
-        # Calculate P&L percentage
-        if side == "BUY":
-            # Long position: profit if price goes up
-            pnl_pct = (current_price - entry_price) / entry_price
-        else:
-            # Short position: profit if price goes down
-            pnl_pct = (entry_price - current_price) / entry_price
-
-        # Trigger stop-loss if P&L drops below threshold
-        if pnl_pct <= self.stop_loss_pct:
-            logger.warning(f"🛑 Stop-Loss triggered for {token_id[:16]}...")
-            logger.warning(f"   Entry: ${entry_price:.4f}")
-            logger.warning(f"   Current: ${current_price:.4f}")
-            logger.warning(f"   P&L: {pnl_pct:.2%} (threshold: {self.stop_loss_pct:.2%})")
-            await self._close_position(token_id, position, f"Stop-loss ({pnl_pct:.2%})")
+        if current_price is None:
             return
 
-        # 2. Time-based exit check
-        hold_duration = (datetime.now() - entry_time).total_seconds() / 3600
-        # Force exit after 90 minutes regardless of signal class
-        max_hold = 1.5
+        if side == "BUY":
+            pnl_pct = (current_price - entry_price) / entry_price
+        else:
+            pnl_pct = (entry_price - current_price) / entry_price
 
-        if hold_duration >= max_hold:
-            await self._close_position(token_id, position, f"Max hold time ({max_hold}h)")
+        exit_reason = None
+        now = datetime.now()
+        elapsed_seconds = (now - entry_time).total_seconds()
 
-    async def _get_current_price(self, token_id: str) -> float:
+        if pnl_pct >= self.take_profit_pct:
+            exit_reason = f"🎯 Take-Profit Reached ({pnl_pct:+.2%})"
+        elif pnl_pct <= -self.stop_loss_pct:
+            exit_reason = f"🛑 Stop-Loss Triggered ({pnl_pct:+.2%})"
+        else:
+            # Enforce minimum hold period (default 5 minutes) to avoid spread-churn exits.
+            min_hold_seconds = getattr(self, "min_hold_seconds", 300)
+            if elapsed_seconds < min_hold_seconds and pnl_pct < 0.02:
+                logger.info(
+                    "⏳ Holding %s (%.1fs elapsed < %ss); PnL %.2f%% not decisive yet.",
+                    token_id[:12],
+                    elapsed_seconds,
+                    min_hold_seconds,
+                    pnl_pct * 100,
+                )
+                return
+
+            # Strict flip handling: only close on strong opposite signal or when already profitable.
+            latest_signal = self.latest_signals.get(token_id)
+            if latest_signal:
+                signal_label = str(latest_signal.get("label", "")).upper()
+                signal_side = "BUY" if signal_label in ("BUY", "POSITIVE") else "SELL" if signal_label in ("SELL", "NEGATIVE") else None
+                if signal_side and signal_side != side:
+                    confidence = float(latest_signal.get("score") or 0.0)
+                    strong_flip = confidence >= 0.75
+                    profitable = pnl_pct > 0
+                    if strong_flip or profitable:
+                        exit_reason = f"🔁 SignalFlip ({confidence:.0%} conf, PnL {pnl_pct:+.2%})"
+                    else:
+                        logger.info(
+                            "[%s] Holding through weak flip (Conf %.2f, PnL %.2f%%)",
+                            token_id[:12],
+                            confidence,
+                            pnl_pct * 100,
+                        )
+                        return
+
+            hold_duration_hours = elapsed_seconds / 3600
+            if hold_duration_hours >= self.max_hold_hours:
+                exit_reason = f"⏰ Max hold time ({self.max_hold_hours}h) reached ({pnl_pct:+.2%})"
+
+        if exit_reason:
+            await self._close_position(
+                token_id,
+                position,
+                exit_reason,
+                exit_price=current_price
+            )
+
+    async def _get_current_price(self, token_id: str, condition_id: Optional[str] = None) -> float:
         """
         Get current market price for token.
 
         Uses CLOB orderbook to get best bid/ask price.
         """
         try:
-            if self.clob_client:
+            if self.clob_client and hasattr(self.clob_client, "get_real_market_price"):
+                price = await self.clob_client.get_real_market_price(
+                    token_id=token_id,
+                    condition_id=condition_id
+                )
+                if price is not None:
+                    return float(price)
+
+            if self.clob_client and self.clob_client.rest_client:
                 # Live mode: Use CLOB orderbook
                 book = self.clob_client.rest_client.get_order_book(token_id)
                 if book.bids and len(book.bids) > 0:
@@ -890,7 +1524,13 @@ class OptimizedNewsScalper:
             logger.warning(f"⚠️  Failed to get current price for {token_id}: {e}")
             return 0.5
 
-    async def _close_position(self, token_id: str, position: Dict, reason: str):
+    async def _close_position(
+        self,
+        token_id: str,
+        position: Dict,
+        reason: str,
+        exit_price: Optional[float] = None
+    ):
         """
         Close position with REAL P&L calculation (Paper Trading).
 
@@ -898,25 +1538,31 @@ class OptimizedNewsScalper:
         """
         try:
             logger.info(f"\n🚪 Closing position: {reason}")
+            condition_id = position.get("condition_id") or position.get("market", {}).get("condition_id")
+            current_price = exit_price
 
             if self.dry_run:
-                # PAPER TRADING: Get real market price
-                current_price = await self._get_current_price(token_id)
+                if current_price is None:
+                    current_price = await self._get_current_price(token_id, condition_id=condition_id)
+                if current_price is None:
+                    logger.warning("⚠️ Unable to fetch exit price; aborting close.")
+                    return
+
                 entry_price = position["entry_price"]
                 size = position["size"]
-                side = position["side"]
+                side = position["side"].upper()
+                current_price = float(current_price)
 
-                # Calculate REAL P&L based on actual price movement
                 if side == "BUY":
-                    # Long position: profit if price went up
                     price_change = current_price - entry_price
                     pnl = (price_change / entry_price) * size
                 else:
-                    # Short position: profit if price went down
                     price_change = entry_price - current_price
                     pnl = (price_change / entry_price) * size
 
-                # Track win/loss
+                fee_cost = size * self.trade_fee_rate * 2
+                pnl -= fee_cost
+
                 if pnl > 0:
                     self.stats["wins"] += 1
                     result = "WIN"
@@ -925,33 +1571,45 @@ class OptimizedNewsScalper:
                     result = "LOSS"
 
                 self.stats["total_pnl"] += pnl
-
-                # Calculate win rate
                 total_trades = self.stats["wins"] + self.stats["losses"]
                 win_rate = (self.stats["wins"] / total_trades * 100) if total_trades > 0 else 0
 
-                # Log detailed results
                 logger.info(f"   📊 Paper Trading Results:")
                 logger.info(f"      Entry: ${entry_price:.4f}")
                 logger.info(f"      Exit:  ${current_price:.4f}")
                 logger.info(f"      Move:  {((current_price - entry_price) / entry_price * 100):+.2f}%")
+                logger.info(f"      Fees:  ${fee_cost:.4f}")
                 logger.info(f"      P&L:   ${pnl:+.2f} ({result})")
                 logger.info(f"      Win Rate: {win_rate:.1f}% ({self.stats['wins']}/{total_trades})")
             else:
-                # LIVE MODE: Close actual position
                 if self.clob_client:
-                    # Execute close order
                     opposite_side = "SELL" if position["side"] == "BUY" else "BUY"
+                    if current_price is None:
+                        current_price = await self._get_current_price(token_id, condition_id=condition_id)
                     await self.clob_client.place_market_order(
                         token_id=token_id,
                         side=opposite_side,
                         amount=position["size"]
                     )
-                    logger.info(f"   ✅ Position closed")
+                    logger.info("   ✅ Position closed")
+
+            closing_side = "SELL" if position["side"].upper() == "BUY" else "BUY"
+            if current_price is not None:
+                await self._record_delta_trade(
+                    token_id,
+                    closing_side,
+                    position["size"],
+                    current_price,
+                    position.get("market"),
+                    condition_id,
+                    position.get("market_group"),
+                )
 
             del self.positions[token_id]
+            self.cooldown_until[token_id] = datetime.now() + self.signal_cooldown
+            self.latest_signals.pop(token_id, None)
             self.stats["positions_closed"] += 1
-            
+
             allocation_id = position.get("allocation_id")
             if self.budget_manager and allocation_id:
                 await self.budget_manager.release_allocation(
@@ -960,13 +1618,16 @@ class OptimizedNewsScalper:
                     Decimal("0")
                 )
 
-            # 🚀 PnL Tracker 청산 기록 추가
-            if self.swarm_system and hasattr(self.swarm_system, 'pnl_tracker') and "pnl_tid" in position:
-                self.swarm_system.pnl_tracker.record_exit(
-                    trade_id=position["pnl_tid"],
-                    exit_price=current_price,
-                    reason=reason
-                )
+            if self.swarm_system and hasattr(self.swarm_system, 'pnl_tracker'):
+                exit_val = current_price if current_price is not None else exit_price
+                tids = position.get("pnl_tids", [])
+                if exit_val is not None:
+                    for tid in tids:
+                        self.swarm_system.pnl_tracker.record_exit(
+                            trade_id=tid,
+                            exit_price=float(exit_val),
+                            reason=reason
+                        )
 
         except Exception as e:
             logger.error(f"❌ Error closing position: {e}")
@@ -1029,3 +1690,21 @@ class OptimizedNewsScalper:
         logger.info(f"   Target: <2000ms")
         logger.info(f"   Status: {'✅ PASS' if avg_latency < 2000 else '⚠️  SLOW'}")
         logger.info("=" * 80)
+
+    async def shutdown(self):
+        """External shutdown hook for SwarmSystem."""
+        if self.stream_task:
+            self.stream_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.stream_task
+            self.stream_task = None
+
+        if self.start_time:
+            with suppress(Exception):
+                await self._shutdown()
+
+        if self.rag_system and hasattr(self.rag_system, "close"):
+            await self.rag_system.close()
+        
+        if hasattr(self.news_aggregator, "close"):
+            await self.news_aggregator.close()
