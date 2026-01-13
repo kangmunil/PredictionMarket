@@ -155,7 +155,7 @@ class NewsAggregator:
         except Exception as e:
             error_text = str(e).lower()
             if any(keyword in error_text for keyword in ("429", "too many requests", "rate limit")):
-                backoff_seconds = 300
+                backoff_seconds = 60
                 self.newsapi_cooldown_until = time.time() + backoff_seconds
                 logger.warning(
                     "🛑 NewsAPI rate limit detected (via exception). Backing off for %ss",

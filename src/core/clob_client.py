@@ -191,7 +191,7 @@ class PolyClient:
                 host=self.config.HOST,
                 key=self.config.PRIVATE_KEY,
                 chain_id=self.config.CHAIN_ID,
-                signature_type=1,
+                signature_type=self.config.SIGNATURE_TYPE,
                 funder=self.config.FUNDER_ADDRESS,
             )
             creds = self.rest_client.create_or_derive_api_creds()
@@ -501,6 +501,18 @@ class PolyClient:
             if price > 0: return price
         return 0.0 # Or fallback to REST if needed
 
+    def get_best_ask(self, token_id: str) -> Tuple[float, float]:
+        """Get best ask (price, size)"""
+        if token_id in self.orderbooks:
+             return self.orderbooks[token_id].get_best_ask()
+        return (0.0, 0.0)
+
+    def get_best_bid(self, token_id: str) -> Tuple[float, float]:
+        """Get best bid (price, size)"""
+        if token_id in self.orderbooks:
+             return self.orderbooks[token_id].get_best_bid()
+        return (0.0, 0.0) # Or fallback to REST if needed
+
     async def place_market_order(self, token_id: str, side: str, amount: float):
         """
         Execute a market order by placing an aggressive limit order 
@@ -622,16 +634,17 @@ class PolyClient:
             logger.error(f"❌ Limit order exception: {e}")
             return None
 
-    async def place_limit_order_with_slippage_protection(self, token_id: str, side: str, amount: float, max_slippage_pct: float = 1.0, priority: str = "normal") -> Optional[Dict]:
+    async def place_limit_order_with_slippage_protection(self, token_id: str, side: str, amount: float, max_slippage_pct: float = 1.0, priority: str = "normal", target_price: Optional[float] = None) -> Optional[Dict]:
         """
         Place a limit order with aggressive pricing to ensure fill within slippage limits.
         
         Args:
             token_id: The market token ID
             side: 'BUY' or 'SELL'
-            amount: Number of shares
+            amount: USD amount (NOT shares)
             max_slippage_pct: Max allowed price deviation (e.g., 2.0 for 2%)
             priority: Budget priority
+            target_price: Optional desired limit price for fallback (AI suggested price)
             
         Returns:
             Dict with orderID and price, or None if failed.
@@ -656,8 +669,15 @@ class PolyClient:
                 best_price = 0.0
                 
         if best_price <= 0:
-            logger.warning(f"⚠️ Cannot place protected order: No liquidity for {token_id}")
-            return None
+            logger.warning(f"⚠️ No visible liquidity for {token_id[:16]}... Placing limit order at target price.")
+            # Fallback: Place limit order at target_price (patient order)
+            return await self.place_unprotected_aggressive_order(
+                token_id=token_id,
+                side=side,
+                amount=amount,
+                priority="high",
+                target_price=target_price  # Use AI suggested price
+            )
             
         # 2. Calculate Limit Price with Slippage
         # BUY: We are willing to pay MORE (up to slippage)
@@ -673,20 +693,34 @@ class PolyClient:
             # Floor at 0.00
             limit_price = max(limit_price, 0.001)
             
-        # Round to valid tick size (usually 2-4 decimals, mostly raw float works but being safe)
-        limit_price = round(limit_price, 4)
+        # Round to valid tick size
+        # Round to valid tick size (Strict)
+        limit_price = float(f"{limit_price:.3f}")
         
-        logger.info(f"🛡️ Slippage Protection: Market ${best_price:.3f} -> Limit ${limit_price:.3f} ({max_slippage_pct}%)")
+        # 3. Calculate Shares
+        # Initial calculation based on market price
+        shares = float(amount) / best_price
         
-        # 3. Place Order
-        # We reuse place_limit_order but catch the string return and wrap it
-        order_id = await self.place_limit_order(token_id, side, limit_price, amount)
+        # Recalculate if SELLING (limit < market) brings value below minimum
+        limit_val = shares * limit_price
+        if limit_val < 5.0 and amount >= 5.0:
+            logger.info(f"   ⚖️ Limit val ${limit_val:.2f} < $5.00. Adjusting shares using Limit Price ${limit_price:.3f}")
+            shares = 5.0 / limit_price
+            shares *= 1.01 # 1% safety buffer
+
+        shares = float(f"{shares:.2f}")
+        
+        logger.info(f"🛡️ Slippage Protection: Market ${best_price:.3f} → Limit ${limit_price:.3f} ({max_slippage_pct}%)")
+        logger.info(f"   📊 Converting ${amount:.2f} USD → {shares:.2f} shares")
+        
+        # 4. Place Order
+        order_id = await self.place_limit_order(token_id, side, limit_price, shares)
         
         if order_id:
             return {
                 "orderID": order_id,
                 "price": limit_price,
-                "filled": amount # Assumption for now, real fill needs ws confirmation
+                "filled": shares
             }
         return None
 
@@ -694,25 +728,82 @@ class PolyClient:
         self,
         token_id: str,
         side: str,
-        amount: float,
+        amount: float,  # USD amount, not shares
         priority: str = "normal",
+        target_price: Optional[float] = None,  # User's desired limit price
     ) -> Optional[Dict]:
         """
-        Submit an aggressively priced IOC-style limit order without any slippage cap.
-        BUY orders use 0.99, SELL orders use 0.001 to maximize fill probability.
+        Submit a limit order. If target_price is provided, places order at that price
+        (patient order waiting for counterparty). Otherwise uses aggressive pricing.
+        
+        NOTE: `amount` is in USD. We convert to shares using the limit price.
         """
         side = side.upper()
-        limit_price = 0.99 if side == "BUY" else 0.001
-        logger.warning(
-            "🚨 [UNPROTECTED] Submitting %s of %.2f @ %.3f for %s",
+        
+        # Get reference price for share calculation
+        book = self.orderbooks.get(token_id)
+        if side == "BUY":
+            ref_price, _ = book.get_best_ask() if book else (0.50, 0)
+        else:
+            ref_price, _ = book.get_best_bid() if book else (0.50, 0)
+        
+        # Determine limit price
+        if target_price is not None and 0.01 <= target_price <= 0.99:
+            limit_price = round(target_price, 4) # Ensure precision for signing
+            logger.info(f"📋 Placing limit order at target price ${limit_price:.3f}")
+        else:
+            # Aggressive fallback
+            limit_price = 0.99 if side == "BUY" else 0.01
+            logger.warning(f"🚨 [AGGRESSIVE] Using extreme limit ${limit_price:.3f}")
+        
+        # Safety: ensure ref_price is valid for share calculation
+        calc_price = ref_price if ref_price > 0.01 else limit_price
+        if calc_price <= 0.01:
+            calc_price = 0.50
+            logger.warning(f"⚠️ Invalid reference price, using 0.50 for share calculation")
+        
+        # Convert USD to shares
+        # Note: If placing a patient limit order (target_price), we should calculate shares based on that price
+        # to ensure the total value is correct.
+        calc_price = limit_price if target_price else calc_price
+        
+        shares = float(amount) / calc_price
+        
+        # Adjust for minimum order value ($5)
+        # If shares * limit_price < 5 (e.g. due to rounding or different ref price), bump it
+        # But here calc_price IS limit_price for patient orders, so it should be exact.
+        # Just need to handle rounding.
+        
+        shares = round(shares, 2)
+        
+        if shares * limit_price < 4.99:
+             # Bump shares to hit $5
+             shares = 5.0 / limit_price
+             # Safety buffer and round again
+             shares *= 1.01 
+
+        # Strict Rounding via String Formatting to avoid float ghosts
+        shares = float(f"{shares:.2f}")
+        limit_price = float(f"{limit_price:.3f}")
+        
+        logger.info(
+            "📝 Submitting %s limit order: %.2f shares ($%.2f) @ $%.3f for %s...",
             side,
+            shares,
             amount,
             limit_price,
-            token_id[:10],
+            token_id[:12],
         )
-        order_id = await self.place_limit_order(token_id, side, limit_price, amount)
+        
+        # Validate minimum order value (allow ~$5.00 with small tolerance)
+        order_value = shares * limit_price
+        if order_value < 4.99:
+            logger.warning(f"⚠️ Order rejected: ${order_value:.2f} < minimum $5.00")
+            return None
+        
+        order_id = await self.place_limit_order(token_id, side, limit_price, shares)
         if order_id:
-            return {"orderID": order_id, "price": limit_price, "filled": amount}
+            return {"orderID": order_id, "price": limit_price, "filled": shares}
         return None
 
     async def cancel_order(self, order_id: str):
@@ -734,6 +825,20 @@ class PolyClient:
             logger.info("   ✅ All orders cancelled")
         except Exception as e:
             logger.error(f"❌ Cancel all failed: {e}")
+
+    async def get_all_positions(self) -> List[Dict]:
+        """Fetch all open positions (held tokens)"""
+        if not self.rest_client: return []
+        try:
+            # Assuming py-clob-client likely returns a list of positions
+            # If standard endpoint: /data/positions?limit=100
+            # Library method name might be get_positions or get_trades
+            # Try get_positions first.
+            resp = self.rest_client.get_positions(limit=100)
+            return resp if isinstance(resp, list) else []
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch positions: {e}")
+            return []
 
     async def get_real_market_price(
         self,

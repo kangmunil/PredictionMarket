@@ -32,6 +32,7 @@ from scipy import stats
 from src.core.clob_client import PolyClient
 from src.core.decision_logger import DecisionLogger
 from src.core.aggression import seconds_to_expiry, aggression_profile
+from src.core.gamma_client import GammaClient
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,7 @@ class EnhancedStatArbStrategy:
         delta_tracker=None,
     ):
         self.client = client
+        self.gamma = GammaClient()
         self.budget_manager = budget_manager
         self.signal_bus = signal_bus # Hive Mind Connection
         self.pnl_tracker = pnl_tracker # Unified P&L Logger
@@ -428,6 +430,67 @@ class EnhancedStatArbStrategy:
 
         except:
             return float('inf')
+
+    async def _scan_high_probability_bets(self):
+        """
+        Mimic 'Sharky6999': Find high probability (>98%) markets for yield farming.
+        """
+        try:
+            # High volume ensures liquidity for 'Sure Bets'
+            markets = await self.gamma.get_active_markets(limit=20, volume_min=10000.0)
+            
+            for market in markets:
+                # Check simplified price (Gamma snapshot)
+                # Ideally we check Real CLOB price, but this filters first
+                tokens = market.get('tokens', [])
+                if not tokens: continue
+                
+                # Assume Binary for simplicity
+                yes_token = tokens[0] 
+                price = float(yes_token.get('price', 0.5))
+                
+                signal_side = None
+                target_price = None
+                
+                # Logic: If 98% confident, bet for the last 2% yield
+                if price >= 0.98 and price < 0.995: # Don't buy 0.999 (no yield)
+                    signal_side = "BUY"
+                    target_price = price
+                    reason = "Yield Farming (>98%)"
+                
+                # Logic: If <2%, maybe shorting is hard, but buying 'No' (Selling Yes) is good yield?
+                # Selling Yes at 0.02 is risky (max loss 0.98).
+                # Only buying Yes at 0.98 is "Yield Farming" (Risk 0.98 to make 0.02).
+                
+                if signal_side:
+                     token_id = yes_token.get('token_id')
+                     
+                     # Check if we already have position
+                     if token_id in self.active_positions: continue
+                     
+                     logger.info(f"💎 SURE BET SIGNAL: {market.get('question')} | Price: ${price}")
+                     
+                     if not self.client.config.DRY_RUN:
+                         # Place large meaningful bet (Sharky style)
+                         # Scaled down for our budget
+                         amount = 20.0 
+                         
+                         await self.client.place_limit_order_with_slippage_protection(
+                             token_id=token_id,
+                             side=signal_side,
+                             amount=amount,
+                             priority="high",
+                             target_price=target_price
+                         )
+                         
+                         # Log position
+                         self.active_positions[token_id] = {
+                             'strategy': 'yield_farm',
+                             'entry_price': price,
+                             'timestamp': datetime.now()
+                         }
+        except Exception as e:
+            logger.error(f"Error scanning sure bets: {e}")
 
     async def scan_for_entries(self):
         """Scan cointegrated pairs for entry signals"""
@@ -972,7 +1035,7 @@ class EnhancedStatArbStrategy:
             try:
                 logger.info("🔍 StatArb: Running Advanced Market Discovery...")
                 # 더 많은 후보군 확보 (100개 -> 200개)
-                markets = await gamma.get_active_markets(limit=200, volume_min=2000, max_hours_to_close=24)
+                markets = await gamma.get_active_markets(limit=200, volume_min=1000, max_hours_to_close=48)
                 
                 # 1. 자산-프록시(Proxy Peg) 탐색 로직 확장
                 proxies = {

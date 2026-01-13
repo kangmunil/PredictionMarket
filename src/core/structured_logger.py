@@ -139,3 +139,25 @@ def setup_logging(
         root_logger.addHandler(file_handler)
 
     logging.info(f"Logging initialized (level={logging.getLevelName(level)}, json={json_output})")
+
+# Added for Dashboard Integration
+class DashboardHandler(logging.Handler):
+    def __init__(self, reporter):
+        super().__init__()
+        self.reporter = reporter
+    
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.reporter.add_log(msg, record.levelname)
+        except Exception:
+            self.handleError(record)
+
+def attach_dashboard_handler(reporter):
+    """
+    Attach the dashboard reporter to the root logger.
+    """
+    logger = logging.getLogger()
+    handler = DashboardHandler(reporter)
+    handler.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(handler)

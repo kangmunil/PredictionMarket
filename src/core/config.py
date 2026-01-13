@@ -17,6 +17,10 @@ class Config:
         return int(os.getenv("POLY_CHAIN_ID", 137))
 
     @property
+    def SIGNATURE_TYPE(self):
+        return int(os.getenv("POLY_SIGNATURE_TYPE", 1))
+
+    @property
     def PRIVATE_KEY(self):
         return os.getenv("PRIVATE_KEY")
 
@@ -85,6 +89,16 @@ class Config:
     @property
     def BUDGET_MODE(self) -> str:
         return os.getenv("BUDGET_MODE", "simulation")
+
+    @property
+    def MAX_POSITION_SIZE(self) -> float:
+        """Max USD size for a single position"""
+        return float(os.getenv("MAX_POSITION_SIZE", "10.0"))
+
+    @property
+    def RISK_PER_TRADE_PERCENT(self) -> float:
+        """Percentage of portfolio to risk per trade (0.01 = 1%)"""
+        return float(os.getenv("RISK_PER_TRADE_PERCENT", "0.02"))
 
     @property
     def TAKER_FEE(self) -> float:

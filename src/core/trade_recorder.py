@@ -95,3 +95,39 @@ class TradeRecorder:
             
         except Exception as e:
             logger.error(f"❌ Failed to log exit: {e}")
+
+    def log_completed_trade(self, trade_data: dict, filename="data/trades_log.csv"):
+        """
+        Log a fully completed trade with rich metadata for analysis.
+        Standardize fields for specialized analysis.
+        """
+        try:
+            # Ensure dir exists
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            
+            # Define headers
+            headers = [
+                'timestamp', 'market_question', 'tags', 'strategy', 
+                'side', 'entry_price', 'exit_price', 'size', 
+                'pnl', 'pnl_pct', 'reason'
+            ]
+            
+            file_exists = os.path.exists(filename)
+            
+            with open(filename, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                if not file_exists:
+                    writer.writeheader()
+                
+                # Filter/Prepare data
+                row = {k: trade_data.get(k, '') for k in headers}
+                # Ensure timestamp
+                if not row['timestamp']: 
+                    row['timestamp'] = datetime.now().isoformat()
+                
+                writer.writerow(row)
+                
+            logger.info(f"💾 Trade logged to {filename} (PnL: {trade_data.get('pnl', 0):.2f})")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to log completed trade: {e}")

@@ -33,11 +33,12 @@ class RiskManager:
         total_capital: float = 1000.0,
         risk_multiplier: float = 0.25,
         max_bet_usd: Optional[float] = None,
+        max_bet_cap_pct: float = 0.10 
     ):
         self.total_capital = float(total_capital)
-        self.risk_multiplier = risk_multiplier # Quarter Kelly (0.25)
-        self.max_bet_cap_pct = 0.10  # Max 10% of portfolio per trade
-        self.max_daily_loss_pct = 0.03 # 3% daily loss limit
+        self.risk_multiplier = risk_multiplier 
+        self.max_bet_cap_pct = float(max_bet_cap_pct)  # Dynamic Risk Cap
+        self.max_daily_loss_pct = 0.03 
         self.max_bet_usd = float(max_bet_usd) if max_bet_usd is not None else None
         
         # State tracking
@@ -58,6 +59,7 @@ class RiskManager:
         self, 
         prob_win: float, 
         current_price: float, 
+        portfolio_balance: Optional[float] = None,
         category: str = "general",
         volatility_score: float = 0.0
     ) -> float:
@@ -128,13 +130,20 @@ class RiskManager:
         final_fraction = min(safe_fraction, self.max_bet_cap_pct)
         
         # 8. Calculate Dollar Amount
-        bet_amount = self.total_capital * final_fraction
+        # Use dynamic portfolio balance if available (Dynamic Risk Engine)
+        capital_base = portfolio_balance if portfolio_balance is not None else self.total_capital
+        
+        # Default risk per trade is often handled in config, but here we use the Kelly fraction directly
+        # or we limit it by a standard "Risk Per Trade" setting if we want to be more conservative.
+        # For now, we trust the Kelly/Fraction logic but applied to the REAL balance.
+        
+        bet_amount = capital_base * final_fraction
         
         if self.max_bet_usd is not None and bet_amount > self.max_bet_usd:
             logger.info(f"🔒 Absolute Bet Cap Applied: ${bet_amount:.2f} → ${self.max_bet_usd:.2f}")
             bet_amount = self.max_bet_usd
 
-        logger.info(f"⚖️ Risk Sizing: P({prob_win:.2f}) vs Price({current_price:.2f}) -> Kelly({kelly_fraction:.2%}) -> Safe({final_fraction:.2%}) -> ${bet_amount:.2f}")
+        logger.info(f"⚖️ Risk Sizing: Cap(${capital_base:.2f}) * Frac({final_fraction:.2%}) = ${bet_amount:.2f}")
         
         return max(bet_amount, 0.0)
 
@@ -170,4 +179,39 @@ class RiskManager:
             self.daily_pnl = 0.0
             self.daily_start_capital = self.total_capital
             self.last_reset_date = today
+            self.last_reset_date = today
             self.circuit_breaker_active = False
+
+    def check_exit_conditions(
+        self,
+        entry_price: float,
+        current_price: float,
+        side: str,
+        hold_duration_minutes: float = 0
+    ) -> (bool, str):
+        """
+        Check if position should be closed based on PnL (Stop Loss / Take Profit).
+        Returns: (should_exit, reason)
+        """
+        if entry_price <= 0: return False, ""
+        
+        # Calculate PnL %
+        if side.upper() == "BUY":
+            pnl_pct = (current_price - entry_price) / entry_price
+        else: # SELL (Short)
+            pnl_pct = (entry_price - current_price) / entry_price
+        
+        # 1. Hard Stop Loss (-15%)
+        # Allow wider stop for volatile crypto markets?
+        STOP_LOSS_PCT = -0.15 
+        if pnl_pct <= STOP_LOSS_PCT:
+            return True, f"Stop Loss Hit ({pnl_pct:.1%})"
+            
+        # 2. Take Profit (+25%)
+        # Scalping strategy might want tighter TP? 
+        # But for 'News' we want to ride big moves.
+        TAKE_PROFIT_PCT = 0.25
+        if pnl_pct >= TAKE_PROFIT_PCT:
+            return True, f"Take Profit Hit ({pnl_pct:.1%})"
+            
+        return False, ""

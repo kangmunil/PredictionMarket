@@ -525,10 +525,10 @@ Return JSON ONLY:
 }}
 
 Rules:
-- Be calibrated. If news directly affects the outcome, reflect the probability shift accurately.
-- Do not default to HOLD if there is actionable information.
-- If the news is irrelevant to the market, set confidence to 0.0.
+- **Consider 2nd Order Effects**: If the news indirectly affects the outcome (e.g., "crypto crash" affects "will bitcoin hit 100k"), adjust the price accordingly.
+- Be calibrated but decisive. If there is a logical link, do not default to 0 confidence.
 - If the news confirms the current trend, suggest a price movement in that direction.
+- Only use "HOLD" / 0.0 confidence if the news is completely unrelated (e.g., Sports news for a Politics market).
 """
 
     async def analyze_market_impact(

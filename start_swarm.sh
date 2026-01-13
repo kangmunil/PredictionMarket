@@ -58,7 +58,43 @@ if [ "$1" == "--help" ] || [ "$1" == "-h" ]; then
     exit 0
 fi
 
-# Forward all arguments to run_swarm.py
-echo -e "${GREEN}🚀 Starting Swarm System...${NC}"
-echo ""
-exec "$PYTHON" run_swarm.py "$@"
+# Handle UI Mode
+UI_MODE=false
+ARGS=()
+
+for arg in "$@"; do
+    if [ "$arg" == "--ui" ]; then
+        UI_MODE=true
+    else
+        ARGS+=("$arg")
+    fi
+done
+
+if [ "$UI_MODE" = true ]; then
+    echo -e "${GREEN}📺 Launching with Live Dashboard...${NC}"
+    
+    # 1. Start Bot in Background (redirect output to log file)
+    LOG_FILE="logs/latest_swarm.log"
+    mkdir -p logs
+    
+    echo "Starting Swarm Bot (PID $$)..."
+    "$PYTHON" run_swarm.py "${ARGS[@]}" > "$LOG_FILE" 2>&1 &
+    BOT_PID=$!
+    
+    echo "Bot started with PID $BOT_PID. Logs -> $LOG_FILE"
+    
+    # 2. Wait a moment for bot to init
+    sleep 2
+    
+    # 3. Start Dashboard in Foreground
+    # Trap Ctrl+C to kill bot when dashboard exits
+    trap "kill $BOT_PID" EXIT
+    
+    "$PYTHON" src/dashboard/monitor.py
+    
+else
+    # Legacy/Headless Mode
+    echo -e "${GREEN}🚀 Starting Swarm System (Headless)...${NC}"
+    echo ""
+    exec "$PYTHON" run_swarm.py "${ARGS[@]}"
+fi

@@ -21,8 +21,12 @@ class TelegramNotifier:
         self.commands: Dict[str, Callable] = {}
         self._poll_error_streak = 0
         
+        # Rate Limiting
+        self._msg_queue = asyncio.Queue()
+        self._worker_task = None
+        
         if self.enabled:
-            logger.info("📱 Telegram Notifier V2 Enabled")
+            logger.info("📱 Telegram Notifier V2 Enabled (HTML Mode + Rate Limiting)")
         else:
             logger.warning("📱 Telegram Notifier disabled (Check .env)")
 
@@ -32,8 +36,12 @@ class TelegramNotifier:
         logger.info(f"⌨️ Registered Telegram command: {command}")
 
     async def start_polling(self):
-        """Message polling loop with command handling"""
+        """Message polling loop + Queue Worker"""
         if not self.enabled: return
+        
+        # Start Queue Worker
+        if not self._worker_task:
+            self._worker_task = asyncio.create_task(self._process_queue())
         
         logger.info("👂 Telegram Listener Active...")
         # startup message moved to orchestrator to avoid duplication
@@ -106,42 +114,58 @@ class TelegramNotifier:
                 })
         except: pass
 
-    async def send_message(self, text: str, parse_mode: str = "Markdown", use_menu: bool = False, inline_keyboard: Any = None):
-        """Send message with optional menu or inline keyboard"""
+    async def _process_queue(self):
+        """Background worker to send messages with rate limiting (20/min per chat ~ 3s delay)"""
+        while True:
+            try:
+                task = await self._msg_queue.get()
+                text, parse_mode, keyboard = task
+                
+                await self._send_payload(text, parse_mode, keyboard)
+                self._msg_queue.task_done()
+                
+                # Rate limit: 1 message every 3 seconds to be safe
+                await asyncio.sleep(3.0) 
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Telegram queue error: {e}")
+
+    async def send_message(self, text: str, parse_mode: str = "HTML", use_menu: bool = False, inline_keyboard: Any = None):
+        """Enqueue message for sending"""
         if not self.enabled: return
         
-        payload = {
-            "chat_id": self.chat_id,
-            "text": text,
-            "parse_mode": parse_mode
-        }
-        
+        keyboard = None
         if inline_keyboard:
-            payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
+            keyboard = {"inline_keyboard": inline_keyboard}
         elif use_menu:
-            # Default control menu
-            payload["reply_markup"] = {
+             keyboard = {
                 "inline_keyboard": [
                     [{"text": "📊 Status", "callback_data": "/status"}, {"text": "📜 History", "callback_data": "/history"}],
                     [{"text": "🛑 STOP", "callback_data": "/stop"}, {"text": "▶️ RESUME", "callback_data": "/resume"}]
                 ]
             }
+            
+        await self._msg_queue.put((text, parse_mode, keyboard))
 
+    async def _send_payload(self, text, parse_mode, reply_markup):
+        """Internal sender"""
+        payload = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": parse_mode
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+            
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.post(f"{self.base_url}/sendMessage", json=payload, timeout=10)
+            
             if resp.status_code != 200:
-                preview = resp.text[:200] if hasattr(resp, "text") else ""
-                logger.error(f"Telegram sendMessage HTTP {resp.status_code}: {preview}")
-                if parse_mode and resp.status_code == 400 and "parse" in preview.lower():
-                    safe_payload = dict(payload)
-                    safe_payload.pop("parse_mode", None)
-                    async with httpx.AsyncClient() as client:
-                        retry = await client.post(f"{self.base_url}/sendMessage", json=safe_payload, timeout=10)
-                    if retry.status_code != 200:
-                        logger.error(f"Telegram fallback send failed HTTP {retry.status_code}: {retry.text[:200]}")
+                logger.error(f"Telegram send failed {resp.status_code}: {resp.text[:100]}")
         except Exception as e:
-            logger.error(f"Failed to send message: {e}")
+            logger.error(f"Telegram connection failed: {e}")
 
     async def send_menu(self, text: str):
         """Helper to send a message with the main control menu"""
@@ -149,32 +173,72 @@ class TelegramNotifier:
 
     # --- Rich Trading Notifications ---
 
-    async def notify_trade(self, side: str, asset: str, price: float, size: float, profit: float = 0.0, condition_id: str = ""):
-        """Enhanced trade notification with Polymarket links"""
-        emoji = "📈" if side.upper() == "YES" or side.upper() == "BUY" else "📉"
+    async def notify_trade(
+        self, 
+        side: str, 
+        asset: str, 
+        price: float, 
+        size: float, 
+        profit: float = 0.0, 
+        condition_id: str = "", 
+        brain_score: float = 1.0,
+        reasoning: str = "",
+        strategy: str = "Unknown"
+    ):
+        """Enhanced HTML trade notification with Brain Score & Reasoning"""
+        emoji = "🟢" if side.upper() in ["YES", "BUY"] else "🔴"
         
         market_link = f"https://polymarket.com/event/{condition_id}" if condition_id else ""
-        link_text = f"\n🔗 [View on Polymarket]({market_link})" if market_link else ""
+        link_text = f'\n🔗 <a href="{market_link}">View on Polymarket</a>' if market_link else ""
+
+        # Brain Context
+        brain_text = ""
+        if brain_score > 1.0:
+            brain_text = f"🧠 <b>Brain Boost:</b> x{brain_score:.2f} (High Confidence)\n"
+        elif brain_score < 1.0:
+            brain_text = f"🧠 <b>Brain Penalty:</b> x{brain_score:.2f} (Caution)\n"
+
+        # Reasoning Section
+        reasoning_text = ""
+        if reasoning:
+            reasoning_text = f"💡 <b>AI Prediction:</b>\n<i>{reasoning}</i>\n"
 
         text = (
-            f"{emoji} *TRADE EXECUTED* {emoji}\n"
+            f"{emoji} <b>TRADE EXECUTED</b> | {strategy}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"*Asset:* `{asset}`\n"
-            f"*Action:* {side.upper()}\n"
-            f"*Size:* `${size:.2f}`\n"
-            f"*Price:* `${price:.4f}`\n"
+            f"<b>Asset:</b> <code>{asset}</code>\n"
+            f"<b>Action:</b> {side.upper()}\n"
+            f"<b>Size:</b> ${size:.2f}\n"
+            f"<b>Price:</b> ${price:.4f}\n"
+            f"{brain_text}"
+            f"{reasoning_text}"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 *Expected PnL:* `${profit:+.4f}`\n"
+            f"💰 <b>Exp. PnL:</b> ${profit:+.4f}\n"
             f"⏰ {datetime.now().strftime('%H:%M:%S')}"
             f"{link_text}"
         )
         
-        # Inline button for specific market
+        # Inline button
         keyboard = None
         if market_link:
             keyboard = [[{"text": "🌐 Open Market", "url": market_link}]]
             
         await self.send_message(text, inline_keyboard=keyboard)
+
+    async def notify_daily_summary(self, stats: Dict):
+        """Send daily performance summary"""
+        text = (
+            f"📅 <b>DAILY REPORT</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>Trades:</b> {stats.get('total_trades', 0)}\n"
+            f"<b>Volume:</b> ${stats.get('total_volume', 0.0):,.2f}\n"
+            f"<b>Wins:</b> {stats.get('wins', 0)}\n"
+            f"<b>Gains:</b> ${stats.get('pnl', 0.0):+,.2f}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🤖 <b>Bot Health:</b> 100% Active"
+        )
+        await self.send_message(text)
+
 
     async def send_alert(self, level: str, title: str, message: str):
         """Prioritized alerts: INFO, WARNING, CRITICAL"""

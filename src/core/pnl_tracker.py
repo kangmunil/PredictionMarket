@@ -65,6 +65,26 @@ class PnLTracker:
         )
         self.active_trades[trade_id] = entry
         logger.info(f"📝 [PnL] Entry Recorded: {strategy} {side} {token_id[:10]} @ ${price:.3f} (${size:.2f})")
+        self.active_trades[trade_id] = entry
+        logger.info(f"📝 [PnL] Entry Recorded: {strategy} {side} {token_id[:10]} @ ${price:.3f} (${size:.2f})")
+        return trade_id
+
+    def record_existing_trade(self, strategy: str, token_id: str, side: str, price: float, size: float):
+        """
+        Hydrate an existing trade from API data (for restart persistence).
+        """
+        # Create a unique ID that persists (if possible) or new one
+        trade_id = f"{strategy}_{token_id}_hydrated"
+        entry = TradeEntry(
+            trade_id=trade_id,
+            strategy=strategy,
+            token_id=token_id,
+            side=side,
+            entry_price=float(price),
+            size=float(size),
+            entry_time=datetime.now() # We don't know original time, use now
+        )
+        self.active_trades[trade_id] = entry
         return trade_id
 
     def record_exit(self, trade_id: str, exit_price: float, reason: str = "Signal Close"):

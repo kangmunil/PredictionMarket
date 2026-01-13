@@ -33,9 +33,11 @@ from .market_matcher import MarketMatcher
 from src.core.risk_manager import RiskManager
 from src.core.decision_logger import DecisionLogger
 from src.core.allocation_manager import AllocationManager
+from src.core.allocation_manager import AllocationManager
 from src.core.config import Config
 from src.core.fee_model import FeeModel
 from src.core.aggression import seconds_to_expiry, aggression_profile
+from src.core.trade_recorder import TradeRecorder
 
 # RAG System (Advanced AI Analysis)
 try:
@@ -71,10 +73,13 @@ class OptimizedNewsScalper:
         supabase_key: str = None,
         signal_bus = None,
         swarm_system = None,
-        delta_tracker = None
+        delta_tracker = None,
+        market_specialist = None # Added for feedback loop
     ):
-        # ... existing init code ...
         self.config = Config()
+        self.news_api_key = news_api_key
+        self.tree_news_api_key = tree_news_api_key
+        self.market_specialist = market_specialist
         self.news_aggregator = NewsAggregator(
             news_api_key=news_api_key,
             tree_api_key=tree_news_api_key
@@ -107,11 +112,16 @@ class OptimizedNewsScalper:
 
         # Initialize Risk Manager (cap dry-run trades at $2, live at $50)
         max_bet = 2.0 if dry_run else 50.0
-        self.risk_manager = RiskManager(max_bet_usd=max_bet)
+        risk_pct = getattr(self.config, "RISK_PER_TRADE_PERCENT", 0.02)
+        self.risk_manager = RiskManager(
+            max_bet_usd=max_bet,
+            max_bet_cap_pct=risk_pct
+        )
         
         # Initialize Decision Logger
         notifier = self.swarm_system.notifier if self.swarm_system else None
         self.decision_logger = DecisionLogger("NewsScalper", notifier=notifier)
+        self.trade_recorder = TradeRecorder(filename="data/trades_log.csv")
         
         logger.info("🛡️ Risk Manager Initialized (Dynamic Kelly Sizing)")
 
@@ -333,8 +343,8 @@ class OptimizedNewsScalper:
 
     async def run(
         self,
-        keywords: List[str],
-        check_interval: int = 60,
+        keywords: List[str] = [],
+        check_interval: int = 10,
         max_runtime: Optional[int] = None
     ):
         """Main monitoring loop with optimizations"""
@@ -580,7 +590,9 @@ class OptimizedNewsScalper:
                     "label": label,
                     "score": score,
                     "reasoning": impact.reasoning,
-                    "model": impact.model_used
+                    "model": impact.model_used,
+                    "expected_value": float(impact.expected_value),  # Pre-calculated EV from RAG
+                    "suggested_price": float(impact.suggested_price)  # AI's target price
                 }
 
                 await self._execute_trade(
@@ -815,23 +827,104 @@ class OptimizedNewsScalper:
                 logger.info("   🔁 Overriding weaker opposing signal with higher confidence trade.")
 
             # 🛡️ DYNAMIC POSITION SIZING (Kelly Criterion)
-            if current_price is None:
-                current_price = await self._get_current_price(token_id, condition_id=condition_id)
-            if current_price is None or current_price <= 0:
+            # 🛡️ PRICE & SPREAD CHECK (Prevent "Stupid Losses")
+            try:
+                ask_p, ask_s = self.clob_client.get_best_ask(token_id)
+                bid_p, bid_s = self.clob_client.get_best_bid(token_id)
+            except Exception as e:
+                logger.warning(f"   ⚠️ Failed to fetch orderbook: {e}")
+                return
+
+            if ask_p == 0 or bid_p == 0:
+                logger.warning("   ⚠️ Orderbook incomplete (Zero Bid/Ask). Aborting.")
+                return
+
+            spread = ask_p - bid_p
+            mid_p = (ask_p + bid_p) / 2
+            spread_pct = spread / mid_p if mid_p > 0 else 1.0
+            
+            logger.info(f"   📊 Market: Bid ${bid_p:.3f} | Ask ${ask_p:.3f} | Spread {spread_pct:.1%}")
+
+            MAX_SPREAD = 0.05 # 5% Limit
+            if spread_pct > MAX_SPREAD:
+                logger.warning(f"   🛑 Spread too wide ({spread_pct:.1%} > {MAX_SPREAD:.0%}). Aborting trade to avoid instant loss.")
+                return
+
+            # Set execution price based on SIDE (Taker Price)
+            # If BUY, we pay ASK. If SELL, we sell at BID.
+            if side == "BUY":
+                current_price = ask_p
+            else:
+                current_price = bid_p
+            
+            logger.info(f"   💲 Execution Price: ${current_price:.3f} ({side})")
+
+            # Fallback (Should not happen if logic holds)
+            if current_price <= 0:
+                current_price = 0.5
+            
                 current_price = 0.5 # Safety fallback
             
+
+
+            # Fetch real wallet balance for dynamic sizing
+            if portfolio_balance <= 0 or portfolio_balance is None:
+                portfolio_balance = 1000.0 # Fallback for dry-run
+            # 5. Calculate position size (Kelly-based)
+            # 🧠 Dynamic Risk Adjustment
+            size_multiplier = 1.0
+            if self.market_specialist:
+                 size_multiplier = self.market_specialist.get_market_score(market)
+                 if size_multiplier != 1.0:
+                     logger.info(f"🧠 Specialist Adjusted Size: x{size_multiplier:.2f} based on history/backtest")
+
             if position_size is None:
                 position_size = self.risk_manager.calculate_position_size(
                     prob_win=sentiment["score"],
                     current_price=current_price,
-                    category="crypto", # Can be dynamic based on news
-                    volatility_score=0.1 # Placeholder: would calculate from spread
+                    portfolio_balance=portfolio_balance, # Dynamic Sizing
+                    category="crypto", 
+                    volatility_score=0.1 
             )
             
+            # Apply Specialist Multiplier
+            position_size = position_size * size_multiplier
+            
+            # Additional logic for scaling in...
             # Enforce minimum order size (Polymarket requirement)
             if position_size > 0 and position_size < 5.0 and not self.dry_run:
                 logger.info(f"   ⚠️ Enforcing minimum order size: ${position_size:.2f} -> $5.00")
                 position_size = 5.0
+
+            # 🛡️ MAX EXPOSURE CHECK (Moved here to ensure position_size is valid)
+            # Calculate Total Equity (Cash + Positions)
+            portfolio_balance = await self.clob_client.get_usdc_balance() or 0.0
+            
+            # Calculate Value of controlled positions
+            positions_value = sum(p["size"] * p.get("entry_price", current_price) for p in self.positions.values())
+            
+            total_equity = portfolio_balance + positions_value
+            if total_equity <= 0: total_equity = 1000.0 # Dry run fallback
+            
+            # Current Exposure for THIS token
+            current_exposure_val = 0.0
+            existing = self.positions.get(token_id)
+            if existing:
+                current_exposure_val = existing["size"] * existing.get("entry_price", current_price)
+            
+            # Proposed New Exposure
+            new_exposure_val = position_size
+            total_exposure = current_exposure_val + new_exposure_val
+            
+            exposure_pct = total_exposure / total_equity
+            MAX_EXPOSURE_PCT = 0.20 # 20% Cap per market
+            
+            if exposure_pct > MAX_EXPOSURE_PCT:
+                logger.warning(
+                    f"   🛑 RISK: Max Exposure Limit Reached! ({exposure_pct:.1%} > {MAX_EXPOSURE_PCT:.0%}). "
+                    f"Holding ${current_exposure_val:.2f} of ${total_equity:.2f}. Rejecting ADD."
+                )
+                return
 
             if position_size <= 0:
                 logger.info(
@@ -881,7 +974,12 @@ class OptimizedNewsScalper:
                 )
                 position_size = scaled_size
 
-            expected_edge = self._compute_expected_edge(sentiment["score"], current_price, side)
+            # Use RAG's calculated EV if available (More accurate)
+            if isinstance(sentiment, dict) and "expected_value" in sentiment:
+                expected_edge = float(sentiment["expected_value"])
+                logger.info(f"   🧠 Using RAG-calculated EV: {expected_edge:.4f}")
+            else:
+                expected_edge = self._compute_expected_edge(sentiment["score"], current_price, side)
             regime_upper = (spread_regime or "UNKNOWN").upper()
             slippage_override = None
             if regime_upper == "EFFICIENT":
@@ -914,8 +1012,16 @@ class OptimizedNewsScalper:
                 position_size,
                 slippage_override=slippage_override,
             ):
-                logger.info("   ⚠️ EV filter rejected trade (edge %.4f < threshold)", expected_edge)
-                return
+                # 🔥 HIGH SENTIMENT BYPASS: Allow trades with very strong AI confidence
+                sentiment_score = sentiment.get("score", 0.5) if isinstance(sentiment, dict) else 0.5
+                if sentiment_score >= 0.70:
+                    logger.info(
+                        "   🔥 EV filter BYPASSED due to high sentiment (%.2f >= 0.70)",
+                        sentiment_score
+                    )
+                else:
+                    logger.info("   ⚠️ EV filter rejected trade (edge %.4f < threshold)", expected_edge)
+                    return
 
             spread_multiplier = self._spread_multiplier_for_regime(regime_upper)
             if spread_multiplier <= 0:
@@ -1047,7 +1153,10 @@ class OptimizedNewsScalper:
 
                 # 🐝 HIVE MIND HISTORY: Report to orchestrator
                 if self.swarm_system:
-                    self.swarm_system.add_trade_record(side, token_id, entry_price, position_size)
+                    self.swarm_system.add_trade_record(
+                        side, token_id, entry_price, position_size, 
+                        brain_score=size_multiplier
+                    )
                     # 🚀 PnL Tracker 기록 추가
                     if hasattr(self.swarm_system, 'pnl_tracker'):
                         entry_tid = self.swarm_system.pnl_tracker.record_entry(
@@ -1085,13 +1194,17 @@ class OptimizedNewsScalper:
                 else:
                     # LIVE MODE: Use slippage-protected order
                     logger.info(f"   🛡️  Using slippage protection (max 2%)")
+                    
+                    # Get AI's suggested price for fallback limit order
+                    ai_suggested_price = sentiment.get("suggested_price") if isinstance(sentiment, dict) else None
 
                     order_result = await self.clob_client.place_limit_order_with_slippage_protection(
                         token_id=token_id,
                         side=side,
                         amount=position_size,
                         max_slippage_pct=2.0,  # Max 2% slippage
-                        priority="high" if is_high_impact else "normal"
+                        priority="high" if is_high_impact else "normal",
+                        target_price=float(ai_suggested_price) if ai_suggested_price else None
                     )
 
                 if order_result:
@@ -1628,6 +1741,22 @@ class OptimizedNewsScalper:
                             exit_price=float(exit_val),
                             reason=reason
                         )
+
+            # 💾 RECORD COMPLETED TRADE FOR SPECIALIST ANALYSIS
+            if pnl is not None:
+                self.trade_recorder.log_completed_trade({
+                    "timestamp": datetime.now().isoformat(),
+                    "market_question": position.get("market", {}).get("question", "Unknown"),
+                    "tags": str(position.get("market", {}).get("tags", [])), 
+                    "strategy": "news_scalper",
+                    "side": position["side"],
+                    "entry_price": position["entry_price"],
+                    "exit_price": current_price,
+                    "size": position["size"],
+                    "pnl": pnl,
+                    "pnl_pct": (pnl_pct * 100) if 'pnl_pct' in locals() else 0.0,
+                    "reason": reason
+                })
 
         except Exception as e:
             logger.error(f"❌ Error closing position: {e}")

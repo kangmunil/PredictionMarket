@@ -42,53 +42,73 @@ class ArbitrageStrategy:
             await asyncio.sleep(1) # 루프 유지
 
     def _is_crypto_15min_market(self, market: dict) -> bool:
-        """Check if market is a short-cycle crypto price market (15min, Hourly, etc.)"""
+        """Check if market is a crypto price market (any timeframe)"""
         question = market.get('question', '').lower()
         
-        # Crypto asset filter (Expanded to SOL, XRP, DOGE)
-        crypto_keywords = ['btc', 'bitcoin', 'eth', 'ethereum', 'sol', 'solana', 'xrp', 'ripple', 'doge', 'dogecoin']
+        # Crypto asset filter (broad)
+        crypto_keywords = ['btc', 'bitcoin', 'eth', 'ethereum', 'sol', 'solana', 
+                          'xrp', 'ripple', 'doge', 'dogecoin', 'crypto', 'coin']
         has_crypto = any(k in question for k in crypto_keywords)
 
-        # Short timeframe filter (15min, Hourly, Next 1h, Price at)
-        timeframe_keywords = ['15 min', '15min', 'hourly', '1 hour', '1h', 'next hour', 'price at', 'price of']
-        is_short_cycle = any(k in question for k in timeframe_keywords)
+        return has_crypto
 
-        return has_crypto and is_short_cycle
+    def _is_valid_yesno_market(self, market: dict) -> bool:
+        """Check if market has valid Yes/No tokens for arbitrage"""
+        tokens = market.get('tokens', [])
+        if len(tokens) != 2:
+            return False
+        
+        outcomes = {t.get('outcome', '').lower() for t in tokens}
+        return 'yes' in outcomes and 'no' in outcomes
 
     async def _market_update_loop(self):
-        """초단기 크립토 마켓을 1분마다 초고속 탐색하여 구독"""
+        """모든 활성 마켓을 1분마다 탐색하여 아비트라지 기회 발굴"""
         while self.is_running:
             try:
                 if self.gamma_client:
-                    # 초단기 마켓은 거래량이 낮아도 기회가 많으므로 문턱을 $10로 낮춤
-                    markets = await self.gamma_client.get_active_markets(limit=100, volume_min=10)
+                    # 1. Crypto 마켓 스캔 (모든 크립토)
+                    markets = await self.gamma_client.get_active_markets(limit=200, volume_min=10)
                     new_assets = []
+                    crypto_count = 0
+                    general_count = 0
                     
                     for m in markets:
-                        if not self._is_crypto_15min_market(m):
+                        # Valid Yes/No market check
+                        if not self._is_valid_yesno_market(m):
                             continue
 
                         tokens = m.get('tokens', [])
-                        if len(tokens) == 2:
-                            y_id = next(t['token_id'] for t in tokens if t['outcome'].lower() == 'yes')
-                            n_id = next(t['token_id'] for t in tokens if t['outcome'].lower() == 'no')
+                        y_id = next((t['token_id'] for t in tokens if t['outcome'].lower() == 'yes'), None)
+                        n_id = next((t['token_id'] for t in tokens if t['outcome'].lower() == 'no'), None)
+                        
+                        if not y_id or not n_id:
+                            continue
 
-                            self.market_map[y_id] = n_id
-                            self.market_map[n_id] = y_id
+                        self.market_map[y_id] = n_id
+                        self.market_map[n_id] = y_id
 
-                            if y_id not in self.subscribed_ids:
-                                new_assets.extend([y_id, n_id])
-                                self.subscribed_ids.update([y_id, n_id])
+                        if y_id not in self.subscribed_ids:
+                            new_assets.extend([y_id, n_id])
+                            self.subscribed_ids.update([y_id, n_id])
+                            
+                            if self._is_crypto_15min_market(m):
+                                crypto_count += 1
+                            else:
+                                general_count += 1
                     
                     if new_assets:
-                        logger.info(f"🎯 ArbHunter: Found {len(new_assets)//2} new SHORT-CYCLE crypto markets")
+                        logger.info(f"🎯 ArbHunter: Subscribed to {len(new_assets)//2} markets (Crypto: {crypto_count}, General: {general_count})")
                         # WebSocket 구독 업데이트
                         await self.client.subscribe_orderbook(new_assets, self.on_book_update)
+                    
+                    # 로그 상태 출력
+                    if len(self.subscribed_ids) > 0:
+                        logger.info(f"📊 ArbHunter Status: Monitoring {len(self.subscribed_ids)//2} markets for arbitrage")
                 
             except Exception as e:
-                logger.error(f"Short-cycle market update error: {e}")
+                logger.error(f"Market update error: {e}")
             
-            await asyncio.sleep(60) # 1분마다 초고속 갱신 (기존 5분)
+            await asyncio.sleep(60) # 1분마다 갱신
 
     async def _monitor_bus_updates(self):
         while self.is_running:

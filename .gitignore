@@ -51,3 +51,5 @@ temp/
 
 .cluade
 /.claude
+data/backtest_cache/0x19ee98fe1a1379ef360f5e24965e84a991eb80f6.csv
+/data

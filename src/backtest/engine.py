@@ -1,127 +1,170 @@
 import logging
-import pandas as pd
-import numpy as np
-import asyncio
-from datetime import datetime, timedelta
-from src.strategies.ai_model import AIModelStrategy
+import os
+from datetime import datetime
+from typing import Dict, List, Optional
+from src.core.budget_manager import BudgetManager
+from src.backtest.data_loader import DataLoader
 
-# Configure Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("Backtest")
+logger = logging.getLogger(__name__)
+
+class MockClient:
+    """
+    Simulates PolyClient behavior using historical data.
+    """
+    def __init__(self, price_feed: Dict[str, float]):
+        self.price_feed = price_feed # Ref to current prices in engine
+        self.orders = []
+        self.config = type('Config', (), {'DRY_RUN': False, 'TAKER_FEE': 0.0, 'SLIPPAGE_BUFFER': 0.0})()
+        
+    def get_best_ask_price(self, token_id: str) -> float:
+        return self.price_feed.get(token_id, 0.5)
+
+    def get_best_bid_price(self, token_id: str) -> float:
+        # Simulate spread
+        return self.price_feed.get(token_id, 0.5) * 0.99
+
+    async def place_limit_order(self, token_id: str, side: str, price: float, size: float) -> Optional[str]:
+        # Assume fill if price matches (optimistic execution)
+        current = self.price_feed.get(token_id)
+        if current is None:
+            return None
+            
+        filled = False
+        if side.upper() == "BUY" and current <= price:
+            filled = True
+        elif side.upper() == "SELL" and current >= price:
+            filled = True
+            
+        if filled:
+            oid = f"mock_{len(self.orders)}_{int(datetime.now().timestamp())}"
+            self.orders.append({
+                "orderID": oid, "token_id": token_id, "side": side, 
+                "price": price, "size": size, "filled": size, 
+                "timestamp": datetime.now()
+            })
+            logger.info(f"✅ [MOCK FILL] {side} {token_id} @ {price:.3f} (Size: {size}) -> PnL Simulation")
+            return oid
+        
+        return None
+
+    async def get_usdc_balance(self) -> float:
+        return 10000.0 # Mock balance
+
+    async def get_order_status(self, order_id: str) -> str:
+        return "FILLED" # Optimistic
 
 class BacktestEngine:
-    """
-    Realistic Backtest Engine for EliteMimic Agent.
-    No look-ahead bias, includes fees and slippage.
-    """
-    def __init__(self, initial_capital=1000.0):
-        self.capital = initial_capital
-        self.balance = initial_capital
-        self.history = []
-        self.total_trades = 0
-        self.winning_trades = 0
-        self.fee_rate = 0.005 # 0.5% per trade
+    def __init__(self):
+        self.data_loader = DataLoader()
+        self.current_prices = {}
+        self.client = MockClient(self.current_prices)
+        self.budget_manager = BudgetManager(total_capital=1000.0)
+        self.pnl = 0.0
 
-    def load_historical_data(self):
-        """
-        Generates 500 hours of realistic market noise.
-        Sentiment is decoupled from future prices.
-        """
-        logger.info("📊 Generating 500 hours of realistic market data...")
-        np.random.seed(42) # For reproducibility
+    async def run(self, strategy_class, token_id: str, days: int = 7, tags: List[str] = None):
+        logger.info(f"🚀 Starting Backtest for {token_id}...")
         
-        dates = [datetime.now() - timedelta(hours=i) for i in range(500, 0, -1)]
-        
-        # 1. Price: Mean-reverting Random Walk
-        prices = [0.5]
-        for _ in range(499):
-            drift = (0.5 - prices[-1]) * 0.05 # Pull towards 0.5
-            shock = np.random.normal(0, 0.02)
-            prices.append(np.clip(prices[-1] + drift + shock, 0.1, 0.9))
-        
-        # 2. Sentiment: Decoupled noise (Real world is messy)
-        # Only 5% of sentiment actually correlates with the NEXT move
-        sentiments = []
-        for i in range(len(prices)):
-            actual_next_move = (prices[i+1] - prices[i]) if i < len(prices)-1 else 0
-            predictive_signal = actual_next_move * 2 # Small real signal
-            noise = np.random.normal(0, 0.4)
-            sentiments.append(np.clip(predictive_signal + noise, -1.0, 1.0))
+        # 1. Load Data
+        csv_path = await self.data_loader.download_history(token_id, days)
+        if not csv_path:
+            logger.error("No data available.")
+            return None
 
-        self.df = pd.DataFrame({
-            'timestamp': dates,
-            'price': prices,
-            'sentiment': sentiments
-        })
+        history = self.data_loader.load_data(token_id)
+        if not history:
+            return None
 
-    async def run(self):
-        logger.info(f"🚀 Starting Backtest with ${self.balance:.2f}...")
+        # 2. Initialize Strategy with Mock Client
+        strategy = strategy_class(client=self.client, budget_manager=self.budget_manager)
         
-        for i in range(len(self.df) - 10): # Leave room for exit
-            row = self.df.iloc[i]
-            current_price = row['price']
-            sentiment = row['sentiment']
+        # 3. Replay Loop
+        start_equity = 1000.0 # From Mock Balance
+        
+        for point in history:
+            ts = point['timestamp']
+            price = point['price']
             
-            # AI Logic: Prob = Base + Sentiment Adjustment
-            prob = 0.5 + (sentiment * 0.1) # AI is only slightly confident
-            ev = prob - current_price
+            # Update Simulated Market
+            self.current_prices[token_id] = price
             
-            # 3% EV Threshold to enter
-            if ev > 0.03:
-                trade_amount = self.balance * 0.05 # Risk 5% per trade
-                self.execute_trade(i, trade_amount, "BUY")
+            # Tick Strategy (Simulation Hook)
+            if hasattr(strategy, "on_tick"):
+                 await strategy.on_tick(token_id, price, ts)
+        
+        # 4. Calculate Results
+        # Mark to market all open positions at last price
+        last_price = history[-1]['price']
+        total_pnl = 0.0
+        
+        # Simple aggregated PnL from closed trades (if we tracked them) + open positions
+        # For now, we rely on MockClient orders
+        trades = self.client.orders
+        wins = 0
+        volume = 0.0
+        
+        for order in trades:
+            # Simplified PnL: updates assumes purely directional long/short relative to exit at end
+            # In reality, need matching engine for entries/exits. 
+            # This is a basic estimation: Entry vs Last Price
+            entry = order['price']
+            size = order['size']
+            side = order['side']
+            volume += (entry * size)
+            
+            trade_pnl = 0.0
+            if side == "BUY":
+                trade_pnl = (last_price - entry) * size
+            else:
+                trade_pnl = (entry - last_price) * size
+            
+            total_pnl += trade_pnl
+            if trade_pnl > 0: wins += 1
+            
+        win_rate = (wins / len(trades)) * 100 if trades else 0.0
+        roi = (total_pnl / start_equity) * 100
+        
+        if tags is None:
+            tags = ["backtest"]
+            
+        results = {
+            "token_id": token_id,
+            "days": days,
+            "trades_count": len(trades),
+            "win_rate": win_rate,
+            "total_pnl": total_pnl,
+            "total_volume": volume,
+            "roi_percent": roi,
+            "final_equity": start_equity + total_pnl,
+            "tags": tags
+        }
+        
+        self.generate_report(results)
+        self.export_for_specialist(results)
+        return results
 
-        self.report()
+    def generate_report(self, results):
+        report = f"""
+        ========================================
+        📊 BACKTEST REPORT: {results['token_id'][:10]}...
+        ========================================
+        Duration:     {results['days']} days
+        Trades:       {results['trades_count']}
+        Win Rate:     {results['win_rate']:.1f}%
+        Total PnL:    ${results['total_pnl']:.2f}
+        ROI:          {results['roi_percent']:.2f}%
+        Final Equity: ${results['final_equity']:.2f}
+        ========================================
+        """
+        print(report)
+        logger.info(report)
 
-    def execute_trade(self, entry_idx, amount, side):
-        entry_row = self.df.iloc[entry_idx]
-        entry_price = entry_row['price']
+    def export_for_specialist(self, results):
+        """Save results for MarketSpecialist (or other agents) to consume."""
+        import json
+        output_dir = "data/backtest_results"
+        os.makedirs(output_dir, exist_ok=True)
+        filename = f"{output_dir}/result_{results['token_id']}.json"
         
-        # Exit after 4 hours
-        exit_idx = entry_idx + 4
-        exit_price = self.df.iloc[exit_idx]['price']
-        
-        # Costs: Entry Fee + Slippage
-        entry_cost = amount * (1 + self.fee_rate)
-        shares = amount / entry_price
-        
-        # Revenue: Exit Fee
-        revenue = (shares * exit_price) * (1 - self.fee_rate)
-        profit = revenue - entry_cost
-        
-        self.balance += profit
-        self.total_trades += 1
-        if profit > 0: self.winning_trades += 1
-        
-        self.history.append({
-            'time': entry_row['timestamp'],
-            'profit': profit,
-            'balance': self.balance
-        })
-
-    def report(self):
-        roi = ((self.balance - self.capital) / self.capital) * 100
-        win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
-        
-        print("\n" + "="*45)
-        print("📉 REALISTIC BACKTEST REPORT: EliteMimic Agent")
-        print("="*45)
-        print(f"Initial Capital: ${self.capital:.2f}")
-        print(f"Final Balance:   ${self.balance:.2f}")
-        print(f"Total ROI:       {roi:.2f}%")
-        print(f"Win Rate:        {win_rate:.2f}% ({self.winning_trades}/{self.total_trades})")
-        
-        if self.total_trades > 0:
-            print(f"Avg Profit/Trade: ${((self.balance-self.capital)/self.total_trades):.2f}")
-        
-        if roi < 0:
-            print("\n💡 ADVICE: Strategy is currently losing money.")
-            print("   Try increasing the EV threshold or refining the AI model.")
-        else:
-            print("\n✅ ADVICE: Strategy shows potential. Test with real data next.")
-        print("="*45)
-
-if __name__ == "__main__":
-    engine = BacktestEngine()
-    engine.load_historical_data()
-    asyncio.run(engine.run())
+        with open(filename, 'w') as f:
+            json.dump(results, f, indent=2)
+        logger.info(f"💾 Results exported to {filename}")

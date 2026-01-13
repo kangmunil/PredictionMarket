@@ -24,12 +24,15 @@ from src.core.pnl_tracker import PnLTracker
 from src.core.delta_tracker import DeltaTracker
 from src.core.structured_logger import setup_logging, StructuredLogger
 from src.core.health_monitor import get_health_monitor, record_heartbeat
+from src.core.status_reporter import StatusReporter # Added Producer
+from src.core.market_specialist import MarketSpecialist
 
 # Strategies & Agents
 from src.news.news_scalper_optimized import OptimizedNewsScalper
 from src.strategies.stat_arb_enhanced import EnhancedStatArbStrategy
 from src.strategies.elite_mimic import EliteMimicAgent
 from src.strategies.arbitrage import ArbitrageStrategy
+from src.strategies.trend_follower import SmartTrendFollower
 
 # Setup Logging
 # Initial logging before args are parsed
@@ -50,6 +53,12 @@ class SwarmSystem:
         self.notifier = None
         self.health_monitor = None
         self.s_logger = None
+        
+        # Dashboard Reporter
+        self.status_reporter = StatusReporter()
+        
+        # Market Specialist (The "Brain" that learns from backtests)
+        self.market_specialist = MarketSpecialist()
 
         # Trading Control
         self.trading_enabled = True
@@ -64,6 +73,7 @@ class SwarmSystem:
         self.stat_arb_agent = None
         self.mimic_agent = None
         self.arb_agent = None
+        self.trend_agent = None
 
         self.running = True
         self.tasks = []
@@ -80,6 +90,10 @@ class SwarmSystem:
             json_output=self.json_logs,
             log_file=f"logs/swarm_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         )
+        # Dashboard Logging Hook
+        from src.core.structured_logger import attach_dashboard_handler
+        attach_dashboard_handler(self.status_reporter)
+
         self.s_logger = StructuredLogger("SwarmOrchestrator")
         self.s_logger.info(f"🐝 Initializing Swarm Intelligence System... (Mode: {'DRY RUN' if dry_run else 'LIVE'})")
 
@@ -105,7 +119,7 @@ class SwarmSystem:
         self.client.config.DRY_RUN = dry_run
         
         # Budget
-        initial_capital = 1000.0
+        initial_capital = 10000.0 # Bumping to $10k for smoother dry-run testing
         if not dry_run:
             try:
                 # Attempt to fetch real balance
@@ -113,8 +127,8 @@ class SwarmSystem:
                 initial_capital = float(balance_str)
                 logger.info(f"💳 Wallet Balance Detected: ${initial_capital:.2f}")
             except Exception as e:
-                logger.warning(f"⚠️ Could not fetch balance, defaulting to $44.0: {e}")
-                initial_capital = 44.0
+                logger.warning(f"⚠️ Could not fetch balance, defaulting to $50.0: {e}")
+                initial_capital = 50.0
 
         self.budget_manager = BudgetManager(total_capital=initial_capital)
         
@@ -131,7 +145,8 @@ class SwarmSystem:
             supabase_url=os.getenv("SUPABASE_URL"),
             supabase_key=os.getenv("SUPABASE_KEY"),
             swarm_system=self,
-            delta_tracker=self.delta_tracker
+            delta_tracker=self.delta_tracker,
+            market_specialist=self.market_specialist
         )
 
         # 2. Stat Arb
@@ -159,7 +174,8 @@ class SwarmSystem:
         self.mimic_agent = EliteMimicAgent(
             client=self.client,
             signal_bus=self.bus,
-            budget_manager=self.budget_manager
+            budget_manager=self.budget_manager,
+            swarm_system=self
         )
 
         # 4. Pure Arb
@@ -170,6 +186,12 @@ class SwarmSystem:
             budget_manager=self.budget_manager
         )
         self.arb_agent.notifier = self.notifier
+
+        # 5. Trend Follower
+        self.trend_agent = SmartTrendFollower(
+            client=self.client,
+            budget_manager=self.budget_manager
+        )
 
         # 5. Health Monitor
         import redis.asyncio as aioredis
@@ -189,6 +211,7 @@ class SwarmSystem:
         self.notifier.register_command("/resume", self.handle_resume)
         self.notifier.register_command("/history", self.handle_history)
         self.notifier.register_command("/top", self.handle_top)
+        self.notifier.register_command("/pnl", self.handle_pnl)
 
     async def handle_help(self, text):
         msg = (
@@ -199,7 +222,8 @@ class SwarmSystem:
             "• /top - See current best market opportunities\n\n"
             "*Control:*\n"
             "• /stop - Pause all automated trading\n"
-            "• /resume - Re-enable automated trading\n\n"
+            "• /resume - Re-enable automated trading\n"
+            "• /pnl - Check daily profit/loss\n\n"
             "*Info:*\n"
             "• /help - Show this manual\n\n"
             "Keep hunting for that alpha! 🚀"
@@ -305,10 +329,27 @@ class SwarmSystem:
             except Exception as exc:
                 logger.error(f"Live balance fetch failed: {exc}")
 
+        # Brain Metrics (Specialist)
+        brain_metrics = []
+        if self.market_specialist:
+            for tag, stats in self.market_specialist.tag_stats.items():
+                multiplier = self.market_specialist._get_tag_multiplier(tag)
+                total = stats["wins"] + stats["losses"]
+                wr = (stats["wins"] / total * 100) if total > 0 else 0.0
+                brain_metrics.append({
+                    "tag": tag.upper(),
+                    "multiplier": multiplier,
+                    "win_rate": wr,
+                    "pnl": stats["pnl"],
+                    "samples": total
+                })
+        brain_metrics.sort(key=lambda x: x['multiplier'], reverse=True)
+
         payload = {
             "type": "STATUS_SNAPSHOT",
             "snapshot_id": str(uuid4()),
             "timestamp": datetime.now().isoformat(),
+            "brain": brain_metrics, 
             "mode": "DRY_RUN" if self.client.config.DRY_RUN else "LIVE",
             "trading": {
                 "enabled": self.trading_enabled,
@@ -475,16 +516,77 @@ class SwarmSystem:
         
         await self.notifier.send_message(msg)
 
-    def add_trade_record(self, side, token, price, size, pnl=0.0):
+    async def handle_pnl(self, text):
+        pnl_data = self.pnl_tracker.get_summary()
+        msg = (
+            f"💰 *PnL Report*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Daily PnL: ${pnl_data['total_pnl']:+.2f}\n"
+            f"Open Positions: {pnl_data['open_positions']}\n"
+            f"Closed Trades: {pnl_data['closed_trades']}"
+        )
+        await self.notifier.send_message(msg)
+
+    def add_trade_record(self, side, token, price, size, pnl=0.0, condition_id: str = "", brain_score: float = 1.0):
         self.completed_trades.append({
             "time": datetime.now().strftime("%H:%M"),
             "side": side, "asset": token, "price": price, "size": size, "pnl": pnl
         })
         if len(self.completed_trades) > 50: self.completed_trades.pop(0)
 
+        # Notify via Telegram
+        if self.notifier and self.notifier.enabled:
+             asyncio.create_task(
+                self.notifier.notify_trade(
+                    side, token, price, size, 
+                    profit=pnl,
+                    condition_id=condition_id, 
+                    brain_score=brain_score
+                )
+            )
+
+    async def _hydrate_positions(self):
+        """Fetch existing positions from API and populate PnLTracker"""
+        logger.info("💧 Hydrating active positions from API...")
+        try:
+            positions = await self.client.get_all_positions()
+            logger.info(f"🔍 Raw Positions Response: {positions}")
+            count = 0
+            for pos in positions:
+                size = float(pos.get("size", 0))
+                if size < 0.0001: continue
+                
+                token_id = pos.get("asset")
+                if not token_id: continue
+                
+                # Try to get avg entry price, imply from cost if available, else current market
+                # Some APIs return 'avgPrice' or 'entryPrice'
+                entry_price = float(pos.get("avgPrice") or pos.get("curPrice") or 0.5)
+                
+                self.pnl_tracker.record_existing_trade(
+                    strategy="Hydrated",
+                    token_id=token_id,
+                    side="BUY", 
+                    price=entry_price,
+                    size=size
+                )
+                
+                # Also hydrate NewsScalper so it knows exposure
+                if self.news_agent:
+                    self.news_agent.hydrate_position(token_id, size, entry_price)
+
+                count += 1
+            logger.info(f"✅ Hydrated {count} positions into PnL Tracker & NewsScalper")
+        except Exception as e:
+            logger.error(f"⚠️ Failed to hydrate positions: {e}")
+
     async def run(self, dry_run: bool = False):
         try:
             await self.setup(dry_run=dry_run)
+            
+            # Hydrate positions immediately after setup
+            if not dry_run:
+                await self._hydrate_positions()
 
             # 설정에서 감시 키워드 로드 ( .env 또는 기본값 )
             keywords = self.config.MONITOR_KEYWORDS
@@ -495,10 +597,10 @@ class SwarmSystem:
             enable_websocket = os.getenv("ENABLE_WEBSOCKET", "true").lower() in ("true", "1", "yes", "on")
 
             if enable_websocket:
-                logger.info("📋 Starting 9 bots: PolyWS, NewsScalper, StatArb, EliteMimic, PureArb, HealthMonitor, DailyReport, StatusWatchdog, Heartbeat")
+                logger.info("📋 Starting 10 bots: PolyWS, NewsScalper, StatArb, EliteMimic, PureArb, TrendFollower, HealthMonitor, DailyReport, StatusWatchdog, Heartbeat")
             else:
                 logger.warning("⚠️ WebSocket DISABLED - Using REST API only (Set ENABLE_WEBSOCKET=true to enable)")
-                logger.info("📋 Starting 8 bots: NewsScalper, StatArb, EliteMimic, PureArb, HealthMonitor, DailyReport, StatusWatchdog, Heartbeat")
+                logger.info("📋 Starting 9 bots: NewsScalper, StatArb, EliteMimic, PureArb, TrendFollower, HealthMonitor, DailyReport, StatusWatchdog, Heartbeat")
 
             # 모든 에이전트를 동일한 루프에서 동시에 실행
             self.tasks = [
@@ -506,10 +608,12 @@ class SwarmSystem:
                 asyncio.create_task(self.stat_arb_agent.run(), name="StatArb"),
                 asyncio.create_task(self.mimic_agent.run(), name="EliteMimic"),
                 asyncio.create_task(self.arb_agent.run(), name="PureArb"),
+                asyncio.create_task(self.trend_agent.run(), name="TrendFollower"),
                 asyncio.create_task(self.health_monitor.run(), name="HealthMonitor"),
                 asyncio.create_task(self._daily_report_task(), name="DailyReport"),
                 asyncio.create_task(self._status_watchdog_task(), name="StatusWatchdog"),
                 asyncio.create_task(self._swarm_heartbeat_task(), name="Heartbeat"),
+                asyncio.create_task(self._dashboard_ticker_task(), name="DashboardTicker"),
             ]
 
             # Add WebSocket task only if enabled
@@ -537,6 +641,49 @@ class SwarmSystem:
             if self.notifier and self.notifier.enabled:
                 await self.notifier.send_message(msg)
 
+    async def _dashboard_ticker_task(self):
+        """High-frequency update for the TUI Dashboard (2s interval)."""
+        while self.running:
+            try:
+                # 1. Fetch Basic Metrics
+                pnl_summary = self.pnl_tracker.get_summary()
+                status = await self.budget_manager.get_status()
+                balances = status.get('balances', {})
+                
+                # 2. Update Metrics in Reporter
+                self.status_reporter.update_metrics(
+                    balance=float(balances.get('total_equity', 0.0)),
+                    pnl=float(pnl_summary['total_pnl'])
+                )
+                
+                # 3. Update Active Positions
+                # Transform PnLTracker active_trades to Reporter format
+                active_trades = []
+                for trade_id, trade in self.pnl_tracker.active_trades.items():
+                    # Calculate current PnL
+                    current_price = self.client.get_best_ask_price(trade.token_id)
+                    entry_price = trade.entry_price
+                    pnl_amt = (current_price - entry_price) * trade.size if current_price > 0 else 0.0
+                    
+                    active_trades.append({
+                        "symbol": trade.asset_name or trade.token_id[:10],
+                        "size": trade.size * entry_price, # Approximate USD size
+                        "entry": entry_price,
+                        "current": current_price,
+                        "pnl": pnl_amt
+                    })
+                self.status_reporter.update_active_positions(active_trades)
+                
+                # 4. Update Signals
+                hot_tokens = await self.bus.get_hot_tokens(min_sentiment=0.1)
+                for tid, sig in hot_tokens.items():
+                    self.status_reporter.update_signal(tid[:10], sig.sentiment_score)
+                    
+            except Exception as e:
+                logger.debug(f"Dashboard ticker error: {e}")
+                
+            await asyncio.sleep(2)
+
     async def _swarm_heartbeat_task(self):
         """Send heartbeats for all active agents to Redis"""
         redis = self.health_monitor.redis
@@ -546,6 +693,7 @@ class SwarmSystem:
             if self.stat_arb_agent: await record_heartbeat(redis, "StatArb")
             if self.mimic_agent: await record_heartbeat(redis, "EliteMimic")
             if self.arb_agent: await record_heartbeat(redis, "PureArb")
+            if self.trend_agent: await record_heartbeat(redis, "TrendFollower")
             await asyncio.sleep(30)
 
     async def _monitor_swarm_health(self):
@@ -598,6 +746,16 @@ class SwarmSystem:
             self._last_total_pnl = total_pnl
 
             if not reason:
+                # Still flush to reporter regardless of alert
+                self.status_reporter.update_metrics(
+                    balance=payload["balances"].get("wallet_usdc"),
+                    pnl=total_pnl
+                )
+                self.status_reporter.update_active_positions([
+                    {
+                        "symbol": x, "size": 0.0, "pnl": 0.0 # Placeholder: PnLTracker active trades better
+                    } for x in payload.get("positions", {}).get("open_list", [])
+                ])
                 continue
 
             self._log_status_snapshot(payload)
@@ -637,6 +795,7 @@ class SwarmSystem:
         await _close_agent(self.stat_arb_agent)
         await _close_agent(self.mimic_agent)
         await _close_agent(self.arb_agent)
+        await _close_agent(self.trend_agent)
         await _close_agent(self.health_monitor)
 
         if self.client:
@@ -652,17 +811,15 @@ class SwarmSystem:
                 logger.error(f"GammaClient close error: {exc}")
 
 
-import argparse
-from src.ui.dashboard import SwarmDashboard
-
-async def _main(args):
+async def main(args):
+    # Initialize and run
     system = SwarmSystem(json_logs=args.json_logs)
+    
     loop = asyncio.get_running_loop()
 
     def _handle_signal():
-        if system.running:
-            logger.info("⚠️ Signal received. Initiating graceful shutdown...")
-            asyncio.create_task(system.shutdown())
+        logger.info("🛑 Shutdown signal received...")
+        asyncio.create_task(system.shutdown())
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -670,14 +827,11 @@ async def _main(args):
         except NotImplementedError:
             pass
 
-    if args.ui:
-        dashboard = SwarmDashboard(system)
-        await dashboard.run(dry_run=args.dry_run)
-    else:
-        await system.run(dry_run=args.dry_run)
-
+    # Always run the swarm directly (UI is now external)
+    await system.run(dry_run=args.dry_run)
 
 if __name__ == "__main__":
+    import argparse
     parser = argparse.ArgumentParser(description="Hive Mind Swarm System")
     parser.add_argument("--dry-run", action="store_true", help="Run in paper trading mode")
     parser.add_argument("--ui", action="store_true", help="Launch TUI Dashboard")
@@ -685,6 +839,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
-        asyncio.run(_main(args))
+        import asyncio
+        asyncio.run(main(args))
     except KeyboardInterrupt:
         pass
+

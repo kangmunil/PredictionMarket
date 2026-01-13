@@ -29,6 +29,7 @@ from src.core.polymarket_mcp_client import (
     PolymarketMCPClient,
 )
 from src.core.market_registry import market_registry
+from src.core.market_specialist import MarketSpecialist
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,11 @@ class MarketMatcher:
         if use_mcp is None:
             use_mcp = bool(os.getenv("POLYMARKET_MCP_URL"))
         self._mcp_enabled = use_mcp
+        self._mcp_enabled = use_mcp
         self._mcp_client: Optional[PolymarketMCPClient] = None
+        
+        # 🧠 Initialize Specialist
+        self.specialist = MarketSpecialist()
 
     def extract_entities(self, text: str) -> Dict[str, List[str]]:
         """
@@ -171,9 +176,19 @@ class MarketMatcher:
                 market.get("question", ""),
                 keywords
             )
+            
+            # Apply Specialist Multiplier (Boost high-win categories)
+            multiplier = self.specialist.get_market_score(market)
+            if multiplier != 1.0:
+                logger.debug(f"   ✨ Specialist Boost for '{market.get('question','')[:20]}...': {multiplier}x")
+            
+            final_score = score * multiplier
+            
             scored_markets.append({
                 **market,
-                "relevance_score": score
+                "relevance_score": final_score,
+                "raw_relevance": score,
+                "specialist_multiplier": multiplier
             })
 
         # Sort by score (descending)
