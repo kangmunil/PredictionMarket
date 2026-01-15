@@ -19,7 +19,7 @@ class ArbitrageStrategy:
         self.budget_manager = budget_manager
         self.notifier = None
         
-        self.min_profit_threshold = Decimal("0.020") # 2.0% min profit (covers gas + fees + slippage)
+        self.min_profit_threshold = Decimal("0.005") # 0.5% min profit (Aggressive for neglected markets)
         self.default_trade_size = 50.0             # USD per leg
         
         self.local_orderbook = {} # token_id -> best_ask

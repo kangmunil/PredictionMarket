@@ -153,11 +153,19 @@ class PolymarketHistoryAPI:
         end_time: datetime,
         min_points: int = 10,
     ) -> Tuple[List[Dict], str]:
+        # 1. Try CLOB History API (Gold Standard)
+        clob_points = await self._fetch_clob_history(condition_id)
+        if len(clob_points) >= min_points:
+             logger.info(f"Using CLOB history for {condition_id} ({len(clob_points)} pts)")
+             return clob_points, "CLOB_API"
+
+        # 2. Try MCP
         mcp_points = await self._fetch_trades_via_mcp(condition_id, days, start_time)
         if mcp_points:
             logger.info(f"Using MCP trade history for {condition_id} ({len(mcp_points)} pts)")
             return mcp_points, "MCP_TRADES"
 
+        # 3. Try Gamma Events
         events = await self._fetch_events_from_gamma(condition_id, start_time, end_time)
         if events:
             price_points = self._parse_events_to_prices(events)
@@ -169,6 +177,46 @@ class PolymarketHistoryAPI:
         logger.warning(f"Using synthetic history for {condition_id}")
         synthetic = self._generate_synthetic_history(condition_id, days)
         return synthetic, "SYNTHETIC"
+
+    async def _fetch_clob_history(self, condition_id: str, interval: str = "1d") -> List[Dict]:
+        """Fetch history from CLOB API using resolved Token ID"""
+        try:
+            # 1. Get Market Snapshot for Token ID
+            snapshot = await self._fetch_market_snapshot(condition_id)
+            if not snapshot or 'tokens' not in snapshot:
+                return []
+            
+            # Find YES token or first token
+            yes_token = next((t for t in snapshot.get('tokens', []) if t.get('outcome') == 'Yes'), None)
+            if not yes_token and snapshot['tokens']:
+                 yes_token = snapshot['tokens'][0]
+            
+            if not yes_token or 'token_id' not in yes_token:
+                return []
+                
+            token_id = yes_token['token_id']
+
+            # 2. Call CLOB API
+            url = "https://clob.polymarket.com/prices-history"
+            params = {"interval": interval, "market": token_id, "fidelity": 500}
+            
+            async with self.session.get(url, params=params, timeout=10) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+                
+                points = []
+                # Ensure correct format (list of {t, p})
+                history = data.get('history', [])
+                for item in history:
+                    points.append({
+                        'timestamp': datetime.fromtimestamp(item['t']),
+                        'price': float(item['p'])
+                    })
+                return points
+        except Exception as e:
+            logger.error(f"CLOB history fetch failed for {condition_id}: {e}")
+            return []
 
     def get_history_source(self, condition_id: str) -> Optional[str]:
         info = self._history_source_cache.get(condition_id)

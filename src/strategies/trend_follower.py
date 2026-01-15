@@ -45,7 +45,7 @@ class SmartTrendFollower:
 
         
         # Strategy Params
-        self.min_volume = 5000.0
+        self.min_volume = 3000.0 # Lowered from 5000 to catch emerging trends
         self.scan_interval = 300 # 5 minutes
         self.min_confidence = 0.75
         self.max_position = 20.0 # Small aggressive bets
@@ -238,18 +238,19 @@ class SmartTrendFollower:
         """
         logger.info("⚡ ScalpScanner: Hunting for 15m crypto opportunities...")
         
-        # 1. Search for 'Crypto' markets (Broader search)
-        markets = await self.gamma.search_markets(query="Crypto", limit=50)
+        # 1. Broaden Search (Crypto, Politics, Sports)
+        # Fetch top active markets by volume (Category Agnostic)
+        markets = await self.gamma.get_active_markets(limit=60, volume_min=self.min_volume)
         
-        # Filter for active, decent volume, and Crypto tag
+        # Filter for Expanded Categories
+        allowed_tags = ['Crypto', 'Politics', 'Sports', 'Business', 'Trump', 'Elon', 'Tech']
+        
         active_markets = [
             m for m in markets 
             if m.get('active') and 
-            float(m.get('volume', 0)) > 1000.0 and
             (
-                'Crypto' in str(m.get('tags', [])) or 
-                'ETH' in m.get('question', '') or 
-                'BTC' in m.get('question', '')
+                any(tag in str(m.get('tags', [])) for tag in allowed_tags) or 
+                any(k in m.get('question', '') for k in ['ETH', 'BTC', 'Fed', 'Rate', 'Trump', 'Elon', 'Kamala'])
             )
         ]
         

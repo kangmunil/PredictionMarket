@@ -715,12 +715,15 @@ class OptimizedNewsScalper:
         market_expiry = self._parse_market_expiry(market)
         expiry_seconds = seconds_to_expiry(market_expiry)
         
+        # Initialize variables for finally block safety
         allocation_id: Optional[str] = None
         allocation_amount: Optional[Decimal] = None
         position_opened = False
         current_price: Optional[float] = None
         position_size: Optional[float] = None
-
+        token_id: Optional[str] = None
+        condition_id: Optional[str] = None
+        
         try:
             # 🚀 유연한 레이블 처리 (AI 출력값 대응)
             raw_label = str(sentiment.get("label", "")).lower()
@@ -736,6 +739,13 @@ class OptimizedNewsScalper:
                 logger.info(f"   ⏭️  Skipping: Label '{raw_label}' is not actionable (HOLD)")
                 return
 
+            # 🛑 BLACKLIST CHECK
+            # Explicitly block trading on ignored markets (e.g. unrealistic targets)
+            ignored_markets = getattr(self.config, "IGNORED_MARKETS", [])
+            if any(blk.lower() in market_question.lower() for blk in ignored_markets):
+                logger.warning(f"   🛑 BLACKLISTED MARKET: '{market_question[:40]}...' - Skipping.")
+                return
+
             # Robust Token ID extraction (matching market_matcher.py logic)
             token_id = None
             clob_ids_raw = market.get("clobTokenIds", [])
@@ -749,12 +759,17 @@ class OptimizedNewsScalper:
             elif isinstance(clob_ids_raw, list) and clob_ids_raw:
                 token_id = clob_ids_raw[0]
 
-            # Fallback: Condition ID를 Token ID로 변환 시도
+            # Fallback based on sentiment (Short logic)
             if not token_id:
                 cid = market.get("condition_id") or market.get("id")
                 if cid:
-                    logger.debug(f"   🔍 Token ID missing, attempting to resolve from CID: {cid[:10]}")
-                    token_id = self.clob_client.get_yes_token_id(cid)
+                    if label == "sell": # Short Logic
+                         logger.debug(f"   🔍 Resolving NO Token (Short) for CID: {cid[:10]}")
+                         token_id = self.clob_client.get_no_token_id(cid)
+                         side = "BUY" # We BUY the NO token
+                    else:
+                         logger.debug(f"   🔍 Resolving YES Token (Long) for CID: {cid[:10]}")
+                         token_id = self.clob_client.get_yes_token_id(cid)
 
             if not token_id:
                 logger.warning(f"   ⚠️  [EXECUTION ABORTED] Could not extract valid Token ID for: {market_question[:30]}...")
@@ -851,7 +866,10 @@ class OptimizedNewsScalper:
                 return
 
             # Set execution price based on SIDE (Taker Price)
-            # If BUY, we pay ASK. If SELL, we sell at BID.
+            # 🛡️ SHORT SELLING LOGIC
+            # If we are BUYING, we pay ASK.
+            # If we were Selling YES (to close), we hit BID.
+            # But now SELL signal -> BUY NO. So side is BUY.
             if side == "BUY":
                 current_price = ask_p
             else:
@@ -867,16 +885,17 @@ class OptimizedNewsScalper:
             
 
 
-            # Fetch real wallet balance for dynamic sizing
-            if portfolio_balance <= 0 or portfolio_balance is None:
-                portfolio_balance = 1000.0 # Fallback for dry-run
-            # 5. Calculate position size (Kelly-based)
-            # 🧠 Dynamic Risk Adjustment
+
             size_multiplier = 1.0
             if self.market_specialist:
                  size_multiplier = self.market_specialist.get_market_score(market)
                  if size_multiplier != 1.0:
                      logger.info(f"🧠 Specialist Adjusted Size: x{size_multiplier:.2f} based on history/backtest")
+
+            # Fetch real wallet balance for dynamic sizing
+            portfolio_balance = await self.clob_client.get_usdc_balance()
+            if portfolio_balance is None or portfolio_balance <= 0:
+                portfolio_balance = 1000.0 # Fallback for dry-run
 
             if position_size is None:
                 position_size = self.risk_manager.calculate_position_size(
@@ -898,7 +917,8 @@ class OptimizedNewsScalper:
 
             # 🛡️ MAX EXPOSURE CHECK (Moved here to ensure position_size is valid)
             # Calculate Total Equity (Cash + Positions)
-            portfolio_balance = await self.clob_client.get_usdc_balance() or 0.0
+            # portfolio_balance already fetched above
+            
             
             # Calculate Value of controlled positions
             positions_value = sum(p["size"] * p.get("entry_price", current_price) for p in self.positions.values())
@@ -916,13 +936,18 @@ class OptimizedNewsScalper:
             new_exposure_val = position_size
             total_exposure = current_exposure_val + new_exposure_val
             
-            exposure_pct = total_exposure / total_equity
-            MAX_EXPOSURE_PCT = 0.20 # 20% Cap per market
-            
-            if exposure_pct > MAX_EXPOSURE_PCT:
+            # 🛡️ Dynamic Risk Cap (Fix for Small Portfolios)
+            # 20% Max Exposure or $5.50 minimum (to allow min bets on small account)
+            MAX_EXPOSURE_PCT = 0.20 
+            min_allowance_usd = 5.5
+            allowed_exposure_usd = max(total_equity * MAX_EXPOSURE_PCT, min_allowance_usd)
+
+            exposure_pct = total_exposure / total_equity # For logging
+
+            if total_exposure > allowed_exposure_usd:
                 logger.warning(
-                    f"   🛑 RISK: Max Exposure Limit Reached! ({exposure_pct:.1%} > {MAX_EXPOSURE_PCT:.0%}). "
-                    f"Holding ${current_exposure_val:.2f} of ${total_equity:.2f}. Rejecting ADD."
+                    f"   🛑 RISK: Max Exposure Limit Reached! ({total_exposure:.2f} > {allowed_exposure_usd:.2f}). "
+                    f"Holding ${current_exposure_val:.2f} of ${total_equity:.2f} ({exposure_pct:.1%}). Rejecting ADD."
                 )
                 return
 
@@ -1280,6 +1305,21 @@ class OptimizedNewsScalper:
         finally:
             if self.budget_manager and allocation_id and not position_opened:
                 await self.budget_manager.release_allocation("arbhunter", allocation_id, Decimal("0"))
+            
+            # Ensure cooldown is strictly enforced even on error/abort
+            if condition_id:
+                self._set_cooldown(condition_id)
+
+    async def hydrate_position(self, token_id: str, position_data: Dict):
+        """Called by Orchestrator on startup to load existing positions"""
+        if token_id not in self.positions:
+            self.positions[token_id] = position_data
+            logger.info(f"💧 Hydrated position for {token_id[:15]}...")
+            
+            # Start monitoring this position
+            if self.delta_tracker:
+                # Ideally we sync with delta tracker too, but for now just local hydration
+                pass
 
     async def _monitor_positions(self):
         """Monitor positions (same as original)"""

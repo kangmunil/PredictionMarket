@@ -60,6 +60,14 @@ class Config:
             "trump", "elon musk", "fed rate", "powell", "inflation", 
             "sec", "crypto regulation", "binance", "coinbase",
             "hack", "listing", "liquidation"
+            "hack", "listing", "liquidation"
+        ]
+
+    @property
+    def IGNORED_MARKETS(self) -> list:
+        """Blacklisted markets to avoid trading"""
+        return [
+            "Will bitcoin hit $1m before GTA VI?",
         ]
 
     @property

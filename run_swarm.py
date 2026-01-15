@@ -604,7 +604,7 @@ class SwarmSystem:
 
             # 모든 에이전트를 동일한 루프에서 동시에 실행
             self.tasks = [
-                asyncio.create_task(self.news_agent.run(keywords=keywords, check_interval=20), name="NewsScalper"),
+                asyncio.create_task(self.news_agent.run(keywords=keywords, check_interval=300), name="NewsScalper"),
                 asyncio.create_task(self.stat_arb_agent.run(), name="StatArb"),
                 asyncio.create_task(self.mimic_agent.run(), name="EliteMimic"),
                 asyncio.create_task(self.arb_agent.run(), name="PureArb"),
@@ -678,11 +678,56 @@ class SwarmSystem:
                 hot_tokens = await self.bus.get_hot_tokens(min_sentiment=0.1)
                 for tid, sig in hot_tokens.items():
                     self.status_reporter.update_signal(tid[:10], sig.sentiment_score)
+                
+                # 5. Dump State for TUI
+                self._dump_dashboard_state()
                     
             except Exception as e:
                 logger.debug(f"Dashboard ticker error: {e}")
                 
             await asyncio.sleep(2)
+            
+    def _dump_dashboard_state(self):
+        """Dump current state to JSON for external dashboard"""
+        try:
+            import json
+            pnl = self.pnl_tracker.get_summary()
+            
+            # Active positions
+            positions = []
+            for tid, t in self.pnl_tracker.active_trades.items():
+                current_price = self.client.get_best_ask_price(t.token_id) or t.entry_price
+                pnl_amt = (current_price - t.entry_price) * t.size if t.side == "BUY" else (t.entry_price - current_price) * t.size
+                
+                positions.append({
+                    "symbol": t.asset_name or t.token_id[:10],
+                    "side": t.side,
+                    "size": t.size,
+                    "entry_price": t.entry_price,
+                    "current_price": current_price,
+                    "pnl": pnl_amt
+                })
+            
+            state = {
+                "timestamp": datetime.now().isoformat(),
+                "status": "RUNNING" if self.running else "STOPPED",
+                "mode": "DRY RUN" if getattr(self.client.config, 'DRY_RUN', True) else "LIVE",
+                "pnl": {
+                    "total_net": pnl.get('total_pnl', 0.0),
+                    "realized": pnl.get('realized_pnl', 0.0),
+                    "unrealized": pnl.get('unrealized_pnl', 0.0),
+                    "win_rate": pnl.get('win_rate', 0.0)*100
+                },
+                "positions": positions,
+                "active_signals": len(hot_tokens) if 'hot_tokens' in locals() else 0
+            }
+            
+            with open("dashboard_state.json", "w") as f:
+                json.dump(state, f, indent=2)
+                
+        except Exception as e:
+            # logger.debug(f"Failed to dump dashboard state: {e}")
+            pass
 
     async def _swarm_heartbeat_task(self):
         """Send heartbeats for all active agents to Redis"""

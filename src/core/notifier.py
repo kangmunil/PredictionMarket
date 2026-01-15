@@ -70,9 +70,17 @@ class TelegramNotifier:
                         await self._handle_message(update["message"])
                     elif "callback_query" in update:
                         await self._handle_callback(update["callback_query"])
+            
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout) as e:
+                self._poll_error_streak += 1
+                wait_time = min(60, 2 * self._poll_error_streak)
+                logger.warning(f"⚠️ Telegram connection issue (Streak: {self._poll_error_streak}): {e}. Retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+                continue
+
             except Exception as e:
                 self._poll_error_streak += 1
-                logger.error(f"Telegram polling error ({type(e).__name__}): {e!r}", exc_info=True)
+                logger.error(f"Telegram polling error ({type(e).__name__}): {e}", exc_info=True)
                 await asyncio.sleep(min(30, 1 + self._poll_error_streak * 2))
                 continue
             await asyncio.sleep(1)

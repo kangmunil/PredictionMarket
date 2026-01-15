@@ -495,6 +495,28 @@ class PolyClient:
             logger.warning(f"⚠️ Failed to parse token IDs: {exc}")
         return None
 
+    def get_no_token_id(self, condition_id: str) -> Optional[str]:
+        """
+        Helper: Resolve condition_id to the NO token_id for CLOB trading.
+        """
+        logger.debug(f"🔍 [CLOB] Resolving NO token for CID: {condition_id[:10]}...")
+        market = self.get_market(condition_id)
+        if not market: return None
+        
+        try:
+            # 1. Check clobTokenIds
+            ids = market.get('clobTokenIds')
+            if isinstance(ids, str): ids = json.loads(ids)
+            if ids and len(ids) > 1: return ids[1] # Index 1 is usually NO
+            
+            # 2. Check tokens list
+            tokens = market.get('tokens')
+            if tokens and len(tokens) > 1:
+                return tokens[1].get('token_id')
+        except Exception as exc:
+            logger.warning(f"⚠️ Failed to parse NO token ID: {exc}")
+        return None
+
     def get_best_ask_price(self, token_id: str) -> float:
         if token_id in self.orderbooks:
             price, _ = self.orderbooks[token_id].get_best_ask()
@@ -827,17 +849,22 @@ class PolyClient:
             logger.error(f"❌ Cancel all failed: {e}")
 
     async def get_all_positions(self) -> List[Dict]:
-        """Fetch all open positions (held tokens)"""
-        if not self.rest_client: return []
+        """Fetch all open positions (held tokens) via manual API call"""
+        address = self.config.FUNDER_ADDRESS
+        if not address: return []
+
+        # Try manual endpoint
+        url = f"https://data-api.polymarket.com/positions?user={address}"
         try:
-            # Assuming py-clob-client likely returns a list of positions
-            # If standard endpoint: /data/positions?limit=100
-            # Library method name might be get_positions or get_trades
-            # Try get_positions first.
-            resp = self.rest_client.get_positions(limit=100)
-            return resp if isinstance(resp, list) else []
+             async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=5) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    else:
+                        logger.warning(f"Positions query failed HTTP {resp.status}")
+                        return []
         except Exception as e:
-            logger.error(f"❌ Failed to fetch positions: {e}")
+            logger.error(f"❌ Failed to fetch positions (manual): {e}")
             return []
 
     async def get_real_market_price(

@@ -125,12 +125,12 @@ class BaitDetector:
                 score += 0.15
 
         # 2. Low Liquidity Market (Manipulation Target)
-        if market.liquidity_depth_10 < 1000:  # Less than $1k liquidity
+        if market.liquidity_depth_10 < 500:  # Relaxed to $500
             red_flags.append(f"LOW_LIQUIDITY: ${market.liquidity_depth_10:.0f}")
             score += 0.30
 
         # 3. Wide Bid-Ask Spread (Illiquid market)
-        if market.bid_ask_spread > 0.05:  # >5% spread
+        if market.bid_ask_spread > 0.10:  # Relaxed to 10%
             red_flags.append(f"WIDE_SPREAD: {market.bid_ask_spread:.2%}")
             score += 0.20
 
@@ -259,7 +259,7 @@ class WhaleProfiler:
 
     def __init__(self):
         self.profiles: Dict[str, WhaleProfile] = {}
-        self.min_trades_for_analysis = 20  # Need at least 20 trades for statistical validity
+        self.min_trades_for_analysis = 5  # Reduced from 20 for faster profiling
 
     def get_or_create_profile(self, address: str, username: str = "") -> WhaleProfile:
         """Get existing profile or create new one"""

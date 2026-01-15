@@ -504,31 +504,41 @@ class OpenRouterRAGSystem:
                 similar_context += f"- {sim['title']} (similarity: {sim['similarity']:.0%})\n"
 
         return f"""
-Analyze this news impact on the prediction market.
+        Analyze this news impact on the prediction market probability using Bayesian reasoning.
 
-**Market Question:** {market_question}
-**Current Price:** {current_price:.3f} (probability: {float(current_price)*100:.1f}%)
+**Market Context:**
+- Question: {market_question}
+- Current Probability: {float(current_price)*100:.1f}%
 
-**News Event:**
-Title: {event.title}
-Content: {event.content}
-Source: {event.source}
-Published: {event.published_at.isoformat()}
+**News Signal:**
+- Title: {event.title}
+- Source: {event.source} (Note: 'Tree News' implies high-speed institutional terminal data)
+- Content: {event.content}
 {similar_context}
 
-Return JSON ONLY:
+**Forecasting Task:**
+Determine the new fair probability given this information.
+1. **Relevance**: Is this news DIRECTLY about the resolution criteria?
+2. **Novelty**: Is this "Breaking News" or likely already priced in?
+3. **Direction**: Does it increase (Buy YES) or decrease (Buy NO/Sell YES) the likelihood?
+4. **Inefficiency Assumption**: Assume the prediction market is inefficient and slow to react. If the news is material, PREDICT A PRICE SHIFT.
+
+**Noise Filtering:**
+- IGNORE news about "Polymarket Traders", "Betting Volume", or "Whales". These are market internal noise, not fundamental signals. If the news is just "Trader bets $100k", recommend "hold".
+- FOCUS on Real World Events (polls, court rulings, official statements, data releases).
+
+**Output Format (JSON Only):**
 {{
-    "suggested_price": 0.XX (new probability 0.0-1.0),
-    "confidence": 0.XX (confidence 0.0-1.0),
-    "reasoning": "Brief explanation",
+    "suggested_price": 0.XX (The new fair probability, e.g., 0.65),
+    "confidence": 0.XX (Your confidence in this assessment, 0.0-1.0),
+    "reasoning": "Brief, decisive rationale focusing on causal link",
     "trade_recommendation": "buy" | "sell" | "hold"
 }}
 
-Rules:
-- **Consider 2nd Order Effects**: If the news indirectly affects the outcome (e.g., "crypto crash" affects "will bitcoin hit 100k"), adjust the price accordingly.
-- Be calibrated but decisive. If there is a logical link, do not default to 0 confidence.
-- If the news confirms the current trend, suggest a price movement in that direction.
-- Only use "HOLD" / 0.0 confidence if the news is completely unrelated (e.g., Sports news for a Politics market).
+**Guidance:**
+- If news is **irrelevant**, **already known**, or **internal market noise**, set `suggested_price` ≈ `current_price` and `trade_recommendation` = "hold".
+- If news is **fundamental and novel**, you MUST recommend a price shift (Buy/Sell). Do NOT assume it is priced in.
+- "sell" recommendation implies the probability has dropped below current price.
 """
 
     async def analyze_market_impact(
