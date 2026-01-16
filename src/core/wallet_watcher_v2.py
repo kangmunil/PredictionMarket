@@ -79,7 +79,7 @@ class EnhancedWalletWatcher:
         # Known whales
         known_whales = [
             {
-                "address": "0xe00740bce60a2533c7009cfecc892e50e88f1b01",
+                "address": "0x8c74b4eef9a894433B8126aA11d1345efb2B0488",
                 "username": "distinct-baguette",
                 "tier": "elite"
             },

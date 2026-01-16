@@ -219,8 +219,8 @@ class EnhancedStatArbStrategy:
         except Exception:
             return None
 
-    def _resolve_condition_expiry(self, condition_id: str) -> Optional[datetime]:
-        market = self.client.get_market(condition_id)
+    async def _resolve_condition_expiry(self, condition_id: str) -> Optional[datetime]:
+        market = await self.client.get_market_cached(condition_id)
         if not market:
             return None
         return self._parse_expiry(market)
@@ -314,9 +314,9 @@ class EnhancedStatArbStrategy:
                 if metrics.is_cointegrated:
                     logger.info(f"✅ {pair_name}: COINTEGRATED - {metrics}")
                     
-                    # Subscribe to real-time orderbook
-                    tid_a = self.client.get_yes_token_id(condition_a)
-                    tid_b = self.client.get_yes_token_id(condition_b)
+                    # Subscribe to real-time orderbook (Cached Async)
+                    tid_a = await self.client.get_yes_token_id_cached(condition_a)
+                    tid_b = await self.client.get_yes_token_id_cached(condition_b)
                     if tid_a and tid_b:
                         asyncio.create_task(self.client.subscribe_orderbook([tid_a, tid_b]))
                 else:
@@ -673,8 +673,8 @@ class EnhancedStatArbStrategy:
                 )
             position_size_dec = Decimal(str(trade_size))
 
-            expiry_a = self._resolve_condition_expiry(signal.token_a)
-            expiry_b = self._resolve_condition_expiry(signal.token_b)
+            expiry_a = await self._resolve_condition_expiry(signal.token_a)
+            expiry_b = await self._resolve_condition_expiry(signal.token_b)
             nearest_expiry = None
             if expiry_a and expiry_b:
                 nearest_expiry = min(expiry_a, expiry_b)

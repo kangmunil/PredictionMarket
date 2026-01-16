@@ -55,13 +55,24 @@ class RiskManager:
             "sports": 0
         }
 
+    def set_risk_multiplier(self, multiplier: float):
+        """Dynamically update risk multiplier via Telegram command"""
+        if 0.05 <= multiplier <= 1.0:
+            old = self.risk_multiplier
+            self.risk_multiplier = multiplier
+            logger.info(f"🔄 Risk Multiplier updated: {old} -> {multiplier}")
+            return True
+        logger.warning(f"⚠️ Invalid Risk Multiplier request: {multiplier}")
+        return False
+
     def calculate_position_size(
         self, 
         prob_win: float, 
         current_price: float, 
         portfolio_balance: Optional[float] = None,
         category: str = "general",
-        volatility_score: float = 0.0
+        volatility_score: float = 0.0,
+        confidence: float = 1.0
     ) -> float:
         """
         Calculate safe position size using Kelly Criterion and risk filters.
@@ -71,6 +82,7 @@ class RiskManager:
             current_price: Current market price (0.0 - 1.0)
             category: Market category for correlation check
             volatility_score: 0.0 (stable) to 1.0 (highly volatile/wide spread)
+            confidence: AI's confidence in its own prediction (0.0 - 1.0)
             
         Returns:
             Float amount in USD to bet. Returns 0.0 if trade is rejected.
@@ -89,18 +101,6 @@ class RiskManager:
             return 0.0
 
         # 3. Kelly Criterion Calculation
-        # b = Net Odds = (1 - price) / price
-        # f* = (bp - q) / b
-        # Simplified for binary options: f = (p - price) / (1 - price) ? No.
-        # Let's stick to the standard formula:
-        # Win Gain (W) = (1 - price)
-        # Loss (L) = price
-        # Edge = p * W - (1-p) * L = p(1-price) - (1-p)price = p - p*price - price + p*price = p - price
-        # Kelly Fraction = Edge / Odds = (p - price) / ((1-price)/price)? 
-        # Actually simpler for "bet 1 to win 1/price": 
-        # f = p/price - (1-p)/(1-price) ... no that's complex.
-        
-        # Using the standard: f = (bp - q) / b
         b = (1.0 - current_price) / current_price
         q = 1.0 - prob_win
         kelly_fraction = (b * prob_win - q) / b
@@ -111,15 +111,29 @@ class RiskManager:
         # 4. Conservative Sizing (Fractional Kelly)
         safe_fraction = kelly_fraction * self.risk_multiplier
         
+        # --- NEW: Win Rate Optimization (Confidence Scaling) ---
+        if confidence < 0.7:
+             logger.info(f"   🧊 RiskManager: Skipping trade due to low confidence ({confidence:.2%})")
+             return 0.0
+             
+        conf_multiplier = 1.0
+        if confidence < 0.8:
+            conf_multiplier = 0.5
+        elif confidence < 0.9:
+            conf_multiplier = 0.8
+            
+        if conf_multiplier < 1.0:
+            logger.info(f"   ⚖️ RiskManager: Applying confidence multiplier {conf_multiplier}x (Confidence: {confidence:.2%})")
+            safe_fraction *= conf_multiplier
+        # ------------------------------------------------------
+
         # 5. Volatility Penalty
-        # If volatility is high (e.g., spread > 5%), reduce size
         if volatility_score > 0.5:
             penalty = 0.5 # 50% reduction
             safe_fraction *= (1.0 - penalty)
             logger.info(f"📉 Volatility Penalty Applied: -50% size")
 
         # 6. Correlation Penalty
-        # If we already have positions in this category, reduce size
         active_count = self.active_positions_count.get(category, 0)
         if active_count >= 2:
             correlation_penalty = 0.5 # Reduce by half if 2+ positions exist
@@ -130,20 +144,14 @@ class RiskManager:
         final_fraction = min(safe_fraction, self.max_bet_cap_pct)
         
         # 8. Calculate Dollar Amount
-        # Use dynamic portfolio balance if available (Dynamic Risk Engine)
         capital_base = portfolio_balance if portfolio_balance is not None else self.total_capital
-        
-        # Default risk per trade is often handled in config, but here we use the Kelly fraction directly
-        # or we limit it by a standard "Risk Per Trade" setting if we want to be more conservative.
-        # For now, we trust the Kelly/Fraction logic but applied to the REAL balance.
-        
         bet_amount = capital_base * final_fraction
         
         if self.max_bet_usd is not None and bet_amount > self.max_bet_usd:
             logger.info(f"🔒 Absolute Bet Cap Applied: ${bet_amount:.2f} → ${self.max_bet_usd:.2f}")
             bet_amount = self.max_bet_usd
 
-        logger.info(f"⚖️ Risk Sizing: Cap(${capital_base:.2f}) * Frac({final_fraction:.2%}) = ${bet_amount:.2f}")
+        logger.info(f"⚖️ Risk Sizing: Cap(${capital_base:.2f}) * Frac({final_fraction:.4f}) = ${bet_amount:.2f}")
         
         return max(bet_amount, 0.0)
 

@@ -9,6 +9,7 @@ from contextlib import suppress
 from datetime import datetime, timedelta
 from uuid import uuid4
 from dotenv import load_dotenv
+import redis.asyncio as redis
 
 # Load Environment Variables
 load_dotenv()
@@ -33,6 +34,7 @@ from src.strategies.stat_arb_enhanced import EnhancedStatArbStrategy
 from src.strategies.elite_mimic import EliteMimicAgent
 from src.strategies.arbitrage import ArbitrageStrategy
 from src.strategies.trend_follower import SmartTrendFollower
+from src.strategies.liquidity_sniper import LiquiditySniper
 
 # Setup Logging
 # Initial logging before args are parsed
@@ -74,6 +76,7 @@ class SwarmSystem:
         self.mimic_agent = None
         self.arb_agent = None
         self.trend_agent = None
+        self.liquidity_sniper = None
 
         self.running = True
         self.tasks = []
@@ -103,6 +106,20 @@ class SwarmSystem:
             chat_id=os.getenv("TELEGRAM_CHAT_ID")
         )
         self._register_commands()
+        
+        # 0.1 Redis Connection (Shared Backbone)
+        try:
+             self.redis = redis.Redis(host='localhost', port=6379, db=0)
+             await self.redis.ping()
+             logger.info("✅ Redis Connection Established (Localhost:6379)")
+             
+             # Inject into SignalBus specific persistence
+             self.bus.set_redis(self.redis)
+             await self.bus.load_state()
+             
+        except Exception as e:
+             logger.error(f"❌ Redis Connection Failed: {e}")
+             self.redis = None
 
         # Start notifier polling in background (non-blocking)
         if self.notifier.enabled:
@@ -146,8 +163,12 @@ class SwarmSystem:
             supabase_key=os.getenv("SUPABASE_KEY"),
             swarm_system=self,
             delta_tracker=self.delta_tracker,
-            market_specialist=self.market_specialist
+            market_specialist=self.market_specialist,
+            redis_client=self.redis # Inject Redis
         )
+        
+        # 1.1 Liquidity Sniper (Helper for News)
+        self.liquidity_sniper = LiquiditySniper(self.client, self.bus)
 
         # 2. Stat Arb
         self.stat_arb_agent = EnhancedStatArbStrategy(
@@ -194,10 +215,9 @@ class SwarmSystem:
         )
 
         # 5. Health Monitor
-        import redis.asyncio as aioredis
-        redis = aioredis.from_url(os.getenv("REDIS_URL", "redis://localhost"))
+        # Use shared redis connection
         self.health_monitor = await get_health_monitor(
-            redis=redis,
+            redis=self.redis,
             budget_manager=self.budget_manager,
             metrics_port=int(os.getenv("METRICS_PORT", "8000"))
         )
@@ -212,6 +232,8 @@ class SwarmSystem:
         self.notifier.register_command("/history", self.handle_history)
         self.notifier.register_command("/top", self.handle_top)
         self.notifier.register_command("/pnl", self.handle_pnl)
+        self.notifier.register_command("/risk", self.handle_risk)
+        self.notifier.register_command("/liquidate", self.handle_liquidate)
 
     async def handle_help(self, text):
         msg = (
@@ -430,9 +452,15 @@ class SwarmSystem:
         else:
             lines.append("💳 *Wallet Balance:* $0.00 _(fetch failed)_")
 
+        # Get current Risk Multiplier
+        current_risk_mult = 0.25 # Default
+        if self.news_agent and hasattr(self.news_agent, 'risk_manager'):
+            current_risk_mult = self.news_agent.risk_manager.risk_multiplier
+
         lines.extend(
             [
                 "",
+                f"⚖️ *Risk Setting:* {current_risk_mult}x", 
                 "💰 *Allocated Balances:*",
                 f"- ARBHUNTER: ${balances['arbhunter']:.2f}",
                 f"- STATARB: ${balances['statarb']:.2f}",
@@ -503,6 +531,104 @@ class SwarmSystem:
         
         await self.notifier.send_message(msg)
 
+    async def handle_risk(self, text):
+        """Handle /risk <level> command"""
+        try:
+            parts = text.split()
+            if len(parts) < 2:
+                await self.notifier.send_message("⚠️ Usage: `/risk <low|mid|high|yolo>`")
+                return
+            
+            level = parts[1].lower()
+            multiplier_map = {
+                "low": 0.1,
+                "mid": 0.25,
+                "high": 0.5,
+                "yolo": 1.0
+            }
+            
+            if level not in multiplier_map:
+                await self.notifier.send_message(f"⚠️ Unknown level '{level}'. Use: low, mid, high, yolo")
+                return
+                
+            new_mult = multiplier_map[level]
+            # Update all strategies that use budget_manager's risk config?
+            # Actually budget manager holds allocation, RiskManager holds logic.
+            # We need to access RiskManager.
+            
+            # Since swarm_system owns the agents, and agents own risk_manager usually...
+            # Wait, news_scalper has its own risk_manager? Or uses shared?
+            # Looking at code: news_scalper.risk_manager is instantiated inside it.
+            # We should probably centralize or update the instance.
+            
+            updated = False
+            if self.news_agent and hasattr(self.news_agent, 'risk_manager'):
+                 if self.news_agent.risk_manager.set_risk_multiplier(new_mult):
+                     updated = True
+                     
+            if updated:
+                emoji = "🐢" if level == "low" else "🚀" if level == "yolo" else "⚖️"
+                await self.notifier.send_message(f"{emoji} **Risk Adjusted**: {level.upper()} ({new_mult}x)")
+            else:
+                await self.notifier.send_message("⚠️ Failed to update risk settings.")
+                
+        except Exception as e:
+            logger.error(f"Error in handle_risk: {e}")
+            await self.notifier.send_message(f"❌ Error: {str(e)}")
+
+    async def handle_liquidate(self, text):
+        """Handle /liquidate <token|all> command"""
+        try:
+            parts = text.split()
+            if len(parts) < 2:
+                await self.notifier.send_message("⚠️ Usage: `/liquidate <token_id|all>`")
+                return
+            
+            target = parts[1].strip()
+            
+            if target.lower() == "all":
+                await self.notifier.send_message("🚨 **EMERGENCY LIQUIDATION INITIATED** 🚨\nClosing ALL positions...")
+                count = 0
+                
+                # Copy list to avoid modification during iteration
+                active_ids = list(self.pnl_tracker.active_trades.keys())
+                
+                for trade_id in active_ids:
+                    trade = self.pnl_tracker.active_trades.get(trade_id)
+                    if not trade: continue
+                    
+                    # Use news agent to close (it has the logic)
+                    if self.news_agent:
+                        # Construct a mock position object since _close_position expects one
+                        # Or better, expose a public close method. 
+                        # NewsScalper._close_position is async and expects (token_id, position_data, reason)
+                        
+                        # We need to find the position data in news_agent.positions
+                        pos_data = self.news_agent.positions.get(trade.token_id)
+                        if pos_data:
+                            await self.news_agent._close_position(trade.token_id, pos_data, "Emergency Command")
+                            count += 1
+                        else:
+                            # If not in scalper memory (e.g. hydrated), try to force close via logic
+                            # Attempting force close without full context
+                            logger.info(f"Force closing orphan trade {trade.token_id}")
+                            # Fallback logic if needed, but for now stick to tracked positions
+                
+                await self.notifier.send_message(f"✅ Liquidation Sequence Complete. Closed {count} positions.")
+                
+            else:
+                # Close specific token
+                if self.news_agent:
+                     pos_data = self.news_agent.positions.get(target)
+                     if pos_data:
+                         await self.news_agent._close_position(target, pos_data, "Command")
+                         await self.notifier.send_message(f"✅ Closed position for `{target[:10]}...`")
+                     else:
+                         await self.notifier.send_message(f"⚠️ Position not found: `{target}`")
+        except Exception as e:
+            logger.error(f"Error in handle_liquidate: {e}")
+            await self.notifier.send_message(f"❌ Error: {str(e)}")
+
     async def handle_top(self, text):
         signals = await self.bus.get_hot_tokens(min_sentiment=0.1)
         if not signals:
@@ -545,6 +671,7 @@ class SwarmSystem:
                 )
             )
 
+
     async def _hydrate_positions(self):
         """Fetch existing positions from API and populate PnLTracker"""
         logger.info("💧 Hydrating active positions from API...")
@@ -573,7 +700,7 @@ class SwarmSystem:
                 
                 # Also hydrate NewsScalper so it knows exposure
                 if self.news_agent:
-                    self.news_agent.hydrate_position(token_id, size, entry_price)
+                    await self.news_agent.hydrate_position(token_id, size, entry_price)
 
                 count += 1
             logger.info(f"✅ Hydrated {count} positions into PnL Tracker & NewsScalper")
@@ -614,6 +741,7 @@ class SwarmSystem:
                 asyncio.create_task(self._status_watchdog_task(), name="StatusWatchdog"),
                 asyncio.create_task(self._swarm_heartbeat_task(), name="Heartbeat"),
                 asyncio.create_task(self._dashboard_ticker_task(), name="DashboardTicker"),
+                asyncio.create_task(self.liquidity_sniper.run(), name="LiquiditySniper"),
             ]
 
             # Add WebSocket task only if enabled

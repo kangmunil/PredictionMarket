@@ -23,6 +23,7 @@ from decimal import Decimal
 import time
 from collections import defaultdict
 import os
+import hashlib
 import json
 from contextlib import suppress
 from dateutil import parser as date_parser
@@ -74,7 +75,8 @@ class OptimizedNewsScalper:
         signal_bus = None,
         swarm_system = None,
         delta_tracker = None,
-        market_specialist = None # Added for feedback loop
+        market_specialist = None, # Added for feedback loop
+        redis_client = None
     ):
         self.config = Config()
         self.news_api_key = news_api_key
@@ -145,6 +147,11 @@ class OptimizedNewsScalper:
         self.budget_manager = budget_manager
         self.dry_run = dry_run
         self.delta_tracker = delta_tracker
+        self.redis = redis_client
+        
+        # Deduplication state
+        self.processed_cache = set()
+        self.processed_redis_key = "news:processed_ids"
         default_hold = "1.5"
         self.signal_cooldown = timedelta(
             minutes=float(os.getenv("NEWS_SIGNAL_COOLDOWN_MINUTES", "15"))
@@ -264,8 +271,18 @@ class OptimizedNewsScalper:
             await self.clob_client.subscribe_orderbook([token_id])
             self._subscribed_books.add(token_id)
             logger.info("   📡 Orderbook stream subscribed for %s", token_id[:15])
+            
+            # ⏳ WAIT for WS Data (Race Condition Fix)
+            await asyncio.sleep(2.0)
+            
         except Exception as exc:
             logger.warning("   ⚠️ Failed to subscribe orderbook for %s: %s", token_id[:10], exc)
+
+    def _set_cooldown(self, condition_id: str):
+        """Set execution cooldown to prevent churn loops"""
+        expiry = datetime.now() + timedelta(seconds=60)
+        self.cooldowns[condition_id] = expiry
+        logger.debug(f"   🧊 Cooldown set for {condition_id[:10]} until {expiry.strftime('%H:%M:%S')}")
 
     async def warmup(self, keywords: List[str]):
         """
@@ -472,11 +489,15 @@ class OptimizedNewsScalper:
         title = article.get("title", "")
         content = article.get("description", "") or article.get("content", "")
 
-        # Skip if processed
-        if url in self.processed_news:
+        if not url: return None
+
+        # Robust Deduplication (Redis + SHA256)
+        news_id = hashlib.sha256(url.encode()).hexdigest()
+        if await self._is_processed(news_id):
             return None
 
-        self.processed_news.add(url)
+        # Optimistically mark as processed (will unmark on error)
+        await self._mark_processed(news_id)
 
         # Start latency timer
         start_time = time.time()
@@ -524,6 +545,13 @@ class OptimizedNewsScalper:
 
                 # 4. Analyze market impact with RAG System
                 best_market = markets[0]
+                relevance = best_market.get("relevance_score", 0.0)
+                
+                # 🛑 Optimization: Skip RAG if match quality is too low
+                if relevance < 0.4:
+                    logger.debug(f"   ⚠️  Skipping RAG: Match relevance too low ({relevance:.2f})")
+                    return None
+                    
                 market_id = best_market.get("condition_id", "")
                 market_question = best_market.get("question", "")
 
@@ -546,23 +574,25 @@ class OptimizedNewsScalper:
 
                 # 5. Check if tradeable
                 if impact.confidence < self.min_confidence:
-                    logger.debug(f"   ⚠️  Low confidence: {impact.confidence:.1%}")
+                    logger.info(f"   ⚠️  Low confidence: {impact.confidence:.1%}")
                     return None
 
                 if impact.trade_recommendation == "hold":
-                    logger.debug(f"   ⚠️  Recommendation: HOLD")
+                    logger.info(f"   ⚠️  Recommendation: HOLD - {impact.reasoning[:100]}")
                     return None
 
                 # 6. Convert RAG output to trade signal
-                label = impact.trade_recommendation  # "buy" or "sell"
-                score = impact.confidence
-                is_high_impact = score >= self.high_impact_threshold
+                label = impact.trade_recommendation.lower()  # "buy" or "sell"
+                confidence = impact.confidence
+                target_prob = float(impact.suggested_price) # Fair value predicted by AI
+                
+                is_high_impact = confidence >= self.high_impact_threshold
 
                 # Record latency
                 latency_ms = (time.time() - start_time) * 1000
                 self.stats["latencies"].append(latency_ms)
 
-                logger.info(f"   ✅ RAG SIGNAL! {label.upper()} ({score:.1%}) - {latency_ms:.0f}ms")
+                logger.info(f"   ✅ RAG SIGNAL! {label.upper()} (Prob {target_prob:.1%} | Conf {confidence:.1%}) - {latency_ms:.0f}ms")
                 logger.info(f"      Market: {best_market.get('question', '')[:60]}...")
                 logger.info(f"      Reasoning: {impact.reasoning[:100]}...")
 
@@ -581,19 +611,30 @@ class OptimizedNewsScalper:
                         asyncio.create_task(self.signal_bus.update_signal(
                             token_id=token_id,
                             source='NEWS',
-                            score=score if label == 'buy' else -score,
+                            score=target_prob if label == 'buy' else (1.0 - target_prob),
                             label=label
                         ))
 
                 # 7. Execute trade with RAG-enhanced signal
                 sentiment = {
+                    "event_id": event.event_id,
                     "label": label,
-                    "score": score,
+                    "score": target_prob,    # Probability used for Kelly Criterion
+                    "confidence": confidence, # Confidence used for risk scaling
                     "reasoning": impact.reasoning,
                     "model": impact.model_used,
-                    "expected_value": float(impact.expected_value),  # Pre-calculated EV from RAG
-                    "suggested_price": float(impact.suggested_price)  # AI's target price
+                    "expected_value": float(impact.expected_value),
+                    "suggested_price": target_prob,
+                    "ensemble_verified": impact.ensemble_verified,
+                    "validator_reasoning": impact.validator_reasoning,
+                    "validator_model": impact.validator_model
                 }
+
+                # Log Ensemble Verdict
+                if impact.ensemble_verified:
+                    logger.info(f"   🛡️ [ENSEMBLLE APPROVED] Confirmed by {impact.validator_model}")
+                elif impact.validator_model:
+                     logger.warning(f"   ⚠️ [ENSEMBLE REJECTED] {impact.validator_model}: {impact.validator_reasoning[:100]}...")
 
                 await self._execute_trade(
                     article=article,
@@ -618,11 +659,11 @@ class OptimizedNewsScalper:
 
                 # Detailed debug logging for decision process
                 if score < self.min_confidence:
-                    logger.debug(f"   ⏭️  Skipped '{title[:30]}...': Low confidence ({score:.1%} < {self.min_confidence:.0%})")
+                    logger.info(f"   ⏭️  Skipped '{title[:30]}...': Low confidence ({score:.1%} < {self.min_confidence:.0%})")
                     return None
                 
                 if label == "neutral":
-                    logger.debug(f"   ⏭️  Skipped '{title[:30]}...': Neutral sentiment")
+                    logger.info(f"   ⏭️  Skipped '{title[:30]}...': Neutral sentiment")
                     return None
 
                 # 2. Find markets (use cache if available)
@@ -656,6 +697,8 @@ class OptimizedNewsScalper:
                 return {"success": True, "latency_ms": latency_ms, "mode": "FinBERT"}
 
         except Exception as e:
+            # 🚨 CRITICAL: Unmark as processed so we retry
+            await self._unmark_processed(news_id)
             logger.error(f"❌ Error processing article: {e}")
             import traceback
             logger.debug(traceback.format_exc())
@@ -715,6 +758,12 @@ class OptimizedNewsScalper:
         market_expiry = self._parse_market_expiry(market)
         expiry_seconds = seconds_to_expiry(market_expiry)
         
+        # 🛡️ [ENSEMBLE GUARDRAIL] Phase 2
+        # If ensemble is enabled and validator has rejected, we block execution.
+        if self.config.ENABLE_ENSEMBLE_VERIFICATION:
+            if sentiment.get("validator_model") and not sentiment.get("ensemble_verified"):
+                logger.warning(f"✋ [EXECUTION BLOCKED] Ensemble validation failed for '{market_question[:30]}'")
+                return
         # Initialize variables for finally block safety
         allocation_id: Optional[str] = None
         allocation_amount: Optional[Decimal] = None
@@ -803,6 +852,7 @@ class OptimizedNewsScalper:
                         current_price=current_price,
                         category="crypto",
                         volatility_score=0.1,
+                        confidence=sentiment.get("confidence", 1.0)
                     )
                     if position_size <= 0:
                         logger.info(
@@ -903,7 +953,8 @@ class OptimizedNewsScalper:
                     current_price=current_price,
                     portfolio_balance=portfolio_balance, # Dynamic Sizing
                     category="crypto", 
-                    volatility_score=0.1 
+                    volatility_score=0.1,
+                    confidence=sentiment.get("confidence", 1.0)
             )
             
             # Apply Specialist Multiplier
@@ -1310,16 +1361,28 @@ class OptimizedNewsScalper:
             if condition_id:
                 self._set_cooldown(condition_id)
 
-    async def hydrate_position(self, token_id: str, position_data: Dict):
+    async def hydrate_position(self, token_id: str, size: float, entry_price: float):
         """Called by Orchestrator on startup to load existing positions"""
         if token_id not in self.positions:
-            self.positions[token_id] = position_data
-            logger.info(f"💧 Hydrated position for {token_id[:15]}...")
+            self.positions[token_id] = {
+                "size": size,
+                "entry_price": entry_price,
+                "side": "BUY", # Hydration assumes BUY (long) for now
+                "entry_time": datetime.now()
+            }
+            logger.info(f"💧 Hydrated position for {token_id[:15]}... ({size} tokens @ ${entry_price})")
             
             # Start monitoring this position
             if self.delta_tracker:
-                # Ideally we sync with delta tracker too, but for now just local hydration
-                pass
+                try:
+                    # Infer group for delta tracking
+                    group = self._infer_market_group({"clobTokenIds": json.dumps([token_id])})
+                    # Add to delta tracker exposure
+                    # Note: add_exposure usually handles (token_id, delta, market_group)
+                    # We assume delta = size for simplicity in hydration
+                    self.delta_tracker.add_exposure(token_id, size, group)
+                except Exception as e:
+                    logger.debug(f"Failed to add exposure to delta_tracker: {e}")
 
     async def _monitor_positions(self):
         """Monitor positions (same as original)"""
@@ -1546,10 +1609,14 @@ class OptimizedNewsScalper:
     ) -> bool:
         fee_cost = self.fee_model.cost(price=price, size=size, is_taker=True)
         slippage_buffer = slippage_override if slippage_override is not None else self.slippage_buffer
-        min_edge = spread + fee_cost + slippage_buffer
+        
+        # --- NEW: Win Rate Optimization (2x Margin) ---
+        # Ensure profit potential covers twice the execution friction (spread + fees)
+        min_edge = (spread + fee_cost + slippage_buffer) * 2.0
+        
         verdict = expected_edge > min_edge
         logger.debug(
-            "[EV CHECK] edge=%.4f spread=%.4f fee=%.4f slip=%.4f min_required=%.4f -> %s",
+            "[EV CHECK] edge=%.4f spread=%.4f fee=%.4f slip=%.4f min_required(2x)=%.4f -> %s",
             expected_edge,
             spread,
             fee_cost,
@@ -1567,7 +1634,17 @@ class OptimizedNewsScalper:
         1. Stop-Loss (P&L based) - 급격한 손실 방지
         2. Time-based exit - 뉴스 재료 소멸 대응
         """
-        entry_time = position["entry_time"]
+        # Robust key handling for both hydrated and new positions
+        entry_time = position.get("entry_time") or position.get("timestamp")
+        if isinstance(entry_time, str):
+            try:
+                entry_time = datetime.fromisoformat(entry_time)
+            except:
+                entry_time = datetime.now()
+        
+        if not entry_time:
+            entry_time = datetime.now()
+
         entry_price = position["entry_price"]
         side = position["side"].upper()
         condition_id = position.get("condition_id") or position.get("market", {}).get("condition_id")
@@ -1745,6 +1822,23 @@ class OptimizedNewsScalper:
                         amount=position["size"]
                     )
                     logger.info("   ✅ Position closed")
+                
+                # Calculate PnL for recording even in live mode
+                if current_price is None:
+                    current_price = await self._get_current_price(token_id, condition_id=condition_id)
+                
+                if current_price:
+                    entry_price = position["entry_price"]
+                    size = position["size"]
+                    side = position["side"].upper()
+                    if side == "BUY":
+                        pnl = (float(current_price) - entry_price) / entry_price * size
+                    else:
+                        pnl = (entry_price - float(current_price)) / entry_price * size
+                    fee_cost = size * self.trade_fee_rate * 2
+                    pnl -= fee_cost
+                else:
+                    pnl = 0.0
 
             closing_side = "SELL" if position["side"].upper() == "BUY" else "BUY"
             if current_price is not None:
@@ -1794,9 +1888,19 @@ class OptimizedNewsScalper:
                     "exit_price": current_price,
                     "size": position["size"],
                     "pnl": pnl,
-                    "pnl_pct": (pnl_pct * 100) if 'pnl_pct' in locals() else 0.0,
                     "reason": reason
                 })
+
+                # 🧠 SELF-LEARNING (Phase 3): Log to RAG System
+                if self.rag_system and "sentiment" in position:
+                    event_id = position["sentiment"].get("event_id")
+                    if event_id:
+                        asyncio.create_task(self.rag_system.log_trade_outcome(
+                            event_id=event_id,
+                            market_question=position.get("market", {}).get("question", "Unknown"),
+                            pnl=pnl,
+                            exit_reason=reason
+                        ))
 
         except Exception as e:
             logger.error(f"❌ Error closing position: {e}")
@@ -1872,8 +1976,41 @@ class OptimizedNewsScalper:
             with suppress(Exception):
                 await self._shutdown()
 
-        if self.rag_system and hasattr(self.rag_system, "close"):
-            await self.rag_system.close()
+    async def _is_processed(self, news_id: str) -> bool:
+        """Check if news_id has been processed (Redis first, then local)"""
+        # Local Fast Path
+        if news_id in self.processed_cache:
+            return True
+            
+        # Redis Slow Path
+        if self.redis:
+            try:
+                 exists = await self.redis.sismember(self.processed_redis_key, news_id)
+                 if exists:
+                     self.processed_cache.add(news_id) # Backfill local
+                     return True
+            except Exception as e:
+                logger.error(f"Redis dedupe check failed: {e}")
         
-        if hasattr(self.news_aggregator, "close"):
-            await self.news_aggregator.close()
+        return False
+
+    async def _mark_processed(self, news_id: str):
+        """Mark news_id as processed"""
+        self.processed_cache.add(news_id)
+             
+        if self.redis:
+            try:
+                await self.redis.sadd(self.processed_redis_key, news_id)
+            except Exception as e:
+                logger.error(f"Redis dedupe set failed: {e}")
+
+    async def _unmark_processed(self, news_id: str):
+        """Unmark news_id (for retry on error)"""
+        if news_id in self.processed_cache:
+            self.processed_cache.remove(news_id)
+            
+        if self.redis:
+            try:
+                await self.redis.srem(self.processed_redis_key, news_id)
+            except Exception as e:
+                logger.error(f"Redis dedupe remove failed: {e}")

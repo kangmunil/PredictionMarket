@@ -151,6 +151,7 @@ class PolyClient:
         self.callbacks: Dict[str, List[Callable]] = {}
         self.signal_bus = None  # optional: set by SwarmSystem
         self._last_known_balance: Optional[float] = None
+        self.redis = None # Redis caching layer
 
         self._init_rest_client()
         if os.getenv("POLYMARKET_MCP_URL"):
@@ -200,6 +201,10 @@ class PolyClient:
         except Exception as exc:
             self.rest_client = None
             logger.error(f"❌ Failed to init REST client: {exc}")
+
+    def set_redis(self, redis_client):
+        """Inject Redis client for caching"""
+        self.redis = redis_client
 
     # --- WebSocket & Trading Methods (Already defined in previous step, ensuring consistency) ---
     async def start_ws(self):
@@ -472,6 +477,43 @@ class PolyClient:
         except Exception as e:
             logger.error(f"Failed to get market {condition_id}: {e}")
             return None
+
+    async def get_market_cached(self, condition_id: str):
+        """Fetch market details with Redis Caching (24h TTL)"""
+        # 1. Try Redis
+        if self.redis:
+            try:
+                data = await self.redis.get(f"market:{condition_id}")
+                if data:
+                    return json.loads(data)
+            except Exception as e:
+                logger.warning(f"Redis get failed: {e}")
+
+        # 2. Fallback to API (Sync call wrapped)
+        market = self.get_market(condition_id)
+        
+        # 3. Cache result
+        if market and self.redis:
+            try:
+                await self.redis.setex(f"market:{condition_id}", 86400, json.dumps(market))
+            except Exception as e:
+                logger.warning(f"Redis set failed: {e}")
+                
+        return market
+
+    async def get_yes_token_id_cached(self, condition_id: str) -> Optional[str]:
+        """Async Cached Mapper"""
+        market = await self.get_market_cached(condition_id)
+        if not market: return None
+        
+        try:
+             tokens = market.get("tokens", [])
+             if isinstance(tokens, list) and len(tokens) >= 2:
+                 return tokens[0].get("token_id")
+        except:
+             pass
+        # Fallback to sync call if structure is weird (safer)
+        return self.get_yes_token_id(condition_id)
 
     def get_yes_token_id(self, condition_id: str) -> Optional[str]:
         """

@@ -183,18 +183,46 @@ class PolymarketHistoryAPI:
         try:
             # 1. Get Market Snapshot for Token ID
             snapshot = await self._fetch_market_snapshot(condition_id)
-            if not snapshot or 'tokens' not in snapshot:
+            if not snapshot:
                 return []
             
-            # Find YES token or first token
-            yes_token = next((t for t in snapshot.get('tokens', []) if t.get('outcome') == 'Yes'), None)
-            if not yes_token and snapshot['tokens']:
-                 yes_token = snapshot['tokens'][0]
+            token_id = None
             
-            if not yes_token or 'token_id' not in yes_token:
-                return []
+            # Try 'clobTokenIds' first (New Gamma format)
+            if 'clobTokenIds' in snapshot:
+                try:
+                    import json
+                    raw_ids = snapshot['clobTokenIds']
+                    if isinstance(raw_ids, str):
+                        clob_ids = json.loads(raw_ids)
+                    elif isinstance(raw_ids, list):
+                        clob_ids = raw_ids
+                    else:
+                        clob_ids = []
+                        
+                    if clob_ids:
+                        token_id = clob_ids[0] # Assume YES token is first (usually true for 2-outcome)
+                except Exception as e:
+                    logger.warning(f"Failed to parse clobTokenIds: {e}")
+
+            # Fallback to 'tokens' (Old Gamma format)
+            if not token_id and 'tokens' in snapshot:
+                yes_token = next((t for t in snapshot.get('tokens', []) if t.get('outcome') == 'Yes'), None)
+                if not yes_token and snapshot['tokens']:
+                     yes_token = snapshot['tokens'][0]
                 
-            token_id = yes_token['token_id']
+                if yes_token and 'token_id' in yes_token:
+                    token_id = yes_token['token_id']
+
+            if not token_id:
+                return []
+
+            # Smart Interval Selection: Force 1m for 15m markets
+            slug = snapshot.get('slug', '')
+            question = snapshot.get('question', '')
+            if '15m' in slug or '15 min' in question.lower() or '15m' in question.lower():
+                logger.info(f"⚡ Detected 15m market {condition_id}, forcing '1m' history interval")
+                interval = "1m"
 
             # 2. Call CLOB API
             url = "https://clob.polymarket.com/prices-history"
@@ -228,21 +256,34 @@ class PolymarketHistoryAPI:
         return {cid: meta.copy() for cid, meta in self._history_source_cache.items()}
 
     async def _fetch_market_snapshot(self, condition_id: str) -> Optional[Dict]:
+        """Get Token IDs from Gamma API (Required for CLOB history)"""
         await self._ensure_session()
         if not self.session:
             return None
 
-        url = f"{self.gamma_url}/markets/{condition_id}"
+        # Gamma API doesn't support direct condition_id lookup reliably.
+        # We must fetch active markets and find it.
+        url = f"{self.gamma_url}/markets"
+        params = {"active": "true", "limit": "500", "closed": "false"}
         try:
-            async with self.session.get(url, timeout=10) as response:
+            async with self.session.get(url, params=params, timeout=10) as response:
                 if response.status != 200:
-                    logger.error(f"Failed to fetch market {condition_id}: HTTP {response.status}")
+                    logger.error(f"Failed to fetch markets list: HTTP {response.status}")
                     return None
-                return await response.json()
+                data = await response.json()
+                if isinstance(data, list):
+                    # Manual scan for the condition ID
+                    for market in data:
+                        if market.get('conditionId') == condition_id:
+                            return market
+                            
+                    logger.warning(f"Market {condition_id} not found in active list (limit 500)")
+                    return None
+                return None
         except asyncio.TimeoutError:
-            logger.error(f"Timeout fetching market {condition_id}")
+            logger.error(f"Timeout scanning markets for {condition_id}")
         except Exception as exc:
-            logger.error(f"Error fetching market {condition_id}: {exc}")
+            logger.error(f"Error scanning markets for {condition_id}: {exc}")
         return None
 
     async def _fetch_events_from_gamma(

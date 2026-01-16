@@ -54,12 +54,28 @@ class ArbitrageStrategy:
 
     def _is_valid_yesno_market(self, market: dict) -> bool:
         """Check if market has valid Yes/No tokens for arbitrage"""
+        # 1. Check legacy tokens
         tokens = market.get('tokens', [])
-        if len(tokens) != 2:
-            return False
-        
-        outcomes = {t.get('outcome', '').lower() for t in tokens}
-        return 'yes' in outcomes and 'no' in outcomes
+        if len(tokens) == 2:
+            outcomes = {t.get('outcome', '').lower() for t in tokens}
+            return 'yes' in outcomes and 'no' in outcomes
+            
+        # 2. Check clobTokenIds
+        if 'clobTokenIds' in market:
+            try:
+                raw_ids = market['clobTokenIds']
+                if isinstance(raw_ids, str):
+                    import json
+                    c_ids = json.loads(raw_ids)
+                else:
+                    c_ids = raw_ids
+                
+                if isinstance(c_ids, list) and len(c_ids) == 2:
+                    return True
+            except Exception:
+                pass
+                
+        return False
 
     async def _market_update_loop(self):
         """모든 활성 마켓을 1분마다 탐색하여 아비트라지 기회 발굴"""
@@ -78,8 +94,30 @@ class ArbitrageStrategy:
                             continue
 
                         tokens = m.get('tokens', [])
-                        y_id = next((t['token_id'] for t in tokens if t['outcome'].lower() == 'yes'), None)
-                        n_id = next((t['token_id'] for t in tokens if t['outcome'].lower() == 'no'), None)
+                        y_id = None
+                        n_id = None
+
+                        # 1. Try legacy 'tokens' list
+                        if tokens:
+                            y_id = next((t['token_id'] for t in tokens if t.get('outcome', '').lower() == 'yes'), None)
+                            n_id = next((t['token_id'] for t in tokens if t.get('outcome', '').lower() == 'no'), None)
+
+                        # 2. Try modern 'clobTokenIds' (List of strings)
+                        if (not y_id or not n_id) and 'clobTokenIds' in m:
+                            try:
+                                raw_ids = m['clobTokenIds']
+                                if isinstance(raw_ids, str):
+                                    import json
+                                    c_ids = json.loads(raw_ids)
+                                else:
+                                    c_ids = raw_ids
+                                
+                                if isinstance(c_ids, list) and len(c_ids) == 2:
+                                    # Assume 2-outcome market (Binary)
+                                    y_id = c_ids[0]
+                                    n_id = c_ids[1]
+                            except Exception:
+                                pass
                         
                         if not y_id or not n_id:
                             continue
@@ -119,7 +157,7 @@ class ArbitrageStrategy:
             else:
                 self.min_profit_threshold = Decimal("0.005")
 
-    async def on_book_update(self, event):
+    async def on_book_update(self, event, *args):
         """WebSocket 이벤트 발생 시 1ms 이내 실행"""
         for update in event.get("events", []):
             token_id = update.get("asset_id")

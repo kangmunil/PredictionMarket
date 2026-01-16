@@ -10,12 +10,13 @@ class StatusReporter:
     Producer: Periodically writes bot state to a JSON file.
     Aggregates data from different threads safely.
     """
-    def __init__(self, filepath="data/dashboard_state.json"):
+    def __init__(self, filepath="dashboard_state.json"):
         self.filepath = filepath
         self.state = {
             "last_updated": 0,
             "balance_usdc": 0.0,
             "total_pnl": 0.0,
+            "pnl_history": [], # Track history for charting
             "active_positions": [],
             "recent_logs": [],
             "signals": {}
@@ -24,7 +25,9 @@ class StatusReporter:
         self._ensure_dir()
 
     def _ensure_dir(self):
-        os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+        dir_path = os.path.dirname(self.filepath)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
 
     def update_metrics(self, balance: float = None, pnl: float = None):
         with self.lock:
@@ -32,6 +35,12 @@ class StatusReporter:
                 self.state["balance_usdc"] = balance
             if pnl is not None:
                 self.state["total_pnl"] = pnl
+                # Append to history
+                hist = self.state.get("pnl_history", [])
+                hist.append(pnl)
+                if len(hist) > 60: # Keep last 60 updates (approx 2 mins @ 2s interval)
+                   hist = hist[-60:]
+                self.state["pnl_history"] = hist
         self._flush_async()
 
     def update_active_positions(self, positions: List[Dict]):

@@ -26,35 +26,35 @@ Created: 2026-01-02
 CANDIDATE_PAIRS = [
     # ========== CRYPTO MARKETS ==========
     {
-        "name": "BTC_ETH_Weekly_Correlation",
-        "description": "Bitcoin Proxy (MSTR) vs Ethereum Proxy",
+        "name": "BTC_ETH_15m_Scanner",
+        "description": "BTC vs ETH 15m Correlation",
         "token_a": {
-            "condition_id": "0x19ee98e348c0ccb341d1b9566fa14521566e9b2ea7aed34dc407a0ec56be36a2",
-            "search_query": "Bitcoin"
+            "condition_id": "0xb318b53528ed532d3e01ab0dbeb58db586474f44f7a5ad030611d0ecb63c6767", # BTC 15m
+            "search_query": "Bitcoin Up Down"
         },
         "token_b": {
-            "condition_id": "0xe6508d867d153a268bdab732aa8abc8cc57e652d28a23aa042da40895bf031b2",
-            "search_query": "Ethereum"
+            "condition_id": "0x9ab88b3b82221f90d7f22e9b84a972b4cf4db950c5480e86265521aa1d81f041", # ETH 15m
+            "search_query": "Ethereum Up Down"
         },
         "category": "crypto",
-        "reason": "Strong correlation between major crypto assets",
+        "reason": "15m timeframe correlation",
         "expected_correlation": 0.85,
         "priority": "high"
     },
 
     {
-        "name": "BTC_SOL_Correlation",
-        "description": "Bitcoin vs Solana price movement",
+        "name": "SOL_ETH_15m_Scanner",
+        "description": "SOL vs ETH 15m Correlation",
         "token_a": {
-            "condition_id": "",  # Will be dynamically searched
-            "search_query": "Bitcoin 100k"
+            "condition_id": "0xf1723670f957db29fabc368af0cc30f1c62707dbbacf5fc505a54aaae8872ecf", # SOL 15m
+            "search_query": "Solana Up Down"
         },
         "token_b": {
-            "condition_id": "",
-            "search_query": "Solana 500"
+            "condition_id": "0x9ab88b3b82221f90d7f22e9b84a972b4cf4db950c5480e86265521aa1d81f041", # ETH 15m
+            "search_query": "Ethereum Up Down"
         },
         "category": "crypto",
-        "reason": "BTC and SOL highly correlated altcoin",
+        "reason": "Altcoin Liquidity Correlation",
         "expected_correlation": 0.80,
         "priority": "high"
     },

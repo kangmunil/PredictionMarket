@@ -93,6 +93,9 @@ class MarketImpact:
     trade_recommendation: str
     expected_value: Decimal
     model_used: str  # Which AI model was used
+    ensemble_verified: bool = False
+    validator_reasoning: Optional[str] = None
+    validator_model: Optional[str] = None
 
     def to_dict(self):
         return {
@@ -104,7 +107,10 @@ class MarketImpact:
             'similar_events': self.similar_events,
             'trade_recommendation': self.trade_recommendation,
             'expected_value': float(self.expected_value),
-            'model_used': self.model_used
+            'model_used': self.model_used,
+            'ensemble_verified': self.ensemble_verified,
+            'validator_reasoning': self.validator_reasoning,
+            'validator_model': self.validator_model
         }
 
 
@@ -140,7 +146,9 @@ class OpenRouterRAGSystem:
         # Model selection from environment
         self.entity_model = os.getenv("AI_MODEL_ENTITY", "anthropic/claude-3-haiku")
         self.analysis_model = os.getenv("AI_MODEL_ANALYSIS", "anthropic/claude-3.5-sonnet")
+        self.validator_model = os.getenv("AI_MODEL_VALIDATOR", "deepseek/deepseek-v3.2-speciale")
         self.embedding_model = os.getenv("AI_MODEL_EMBEDDING", "openai/text-embedding-3-small")
+        self.enable_ensemble = os.getenv("ENABLE_ENSEMBLE_VERIFICATION", "true").lower() in ("true", "1", "yes", "on")
 
         # Supabase client
         self.supabase: Client = create_client(supabase_url, supabase_key)
@@ -489,12 +497,59 @@ class OpenRouterRAGSystem:
             logger.error(f"Failed to find similar events: {e}")
             return []
 
+    async def find_negative_examples(
+        self,
+        event: NewsEvent,
+        limit: int = 2
+    ) -> List[Dict]:
+        """
+        Find historical cases with similar news that resulted in a LOSS.
+        """
+        try:
+            # 1. Generate embedding for query
+            query_vector = await self.generate_embedding(event.title + " " + event.content)
+            
+            # 2. Search in ChromaDB (self.news_collection)
+            if not self.chroma_available or not self.news_collection:
+                return []
+
+            results = self.news_collection.query(
+                query_embeddings=[query_vector],
+                n_results=10,
+                include=['metadatas', 'distances']
+            )
+            
+            if not results or not results['metadatas'][0]:
+                return []
+            
+            # 3. Filter for events that actually resulted in a trade LOSS in Supabase
+            event_ids = [m['event_id'] for m in results['metadatas'][0] if 'event_id' in m]
+            
+            if not event_ids:
+                return []
+                
+            # Query Supabase for trade outcomes linked to these event_ids
+            # We look for trades that failed (PnL < 0)
+            failed_trades = self.supabase.table('trading_feedback')\
+                .select('*')\
+                .in_('event_id', event_ids)\
+                .lt('pnl', 0)\
+                .limit(limit)\
+                .execute()
+            
+            return failed_trades.data if failed_trades.data else []
+            
+        except Exception as e:
+            logger.error(f"Failed to find negative examples: {e}")
+            return []
+
     def _build_impact_analysis_prompt(
         self,
         event: NewsEvent,
         market_question: str,
         current_price: Decimal,
-        similar_events: List[Dict]
+        similar_events: List[Dict],
+        negative_examples: List[Dict] = None
     ) -> str:
         """Build analysis prompt (Optimized for decisiveness)"""
         similar_context = ""
@@ -502,6 +557,15 @@ class OpenRouterRAGSystem:
             similar_context = "\n\nHistorically similar events:\n"
             for sim in similar_events:
                 similar_context += f"- {sim['title']} (similarity: {sim['similarity']:.0%})\n"
+
+        negative_context = ""
+        if negative_examples:
+            negative_context = "\n\n### ⚠️ LEARNING FROM PAST FAILURES (Negative Examples):\n"
+            for neg in negative_examples:
+                negative_context += f"- **Event**: {neg['market_question']}\n"
+                negative_context += f"  - **Mistake**: AI predicted success but trade resulted in {neg['pnl']:.2f} PnL.\n"
+                negative_context += f"  - **Reason for Failure**: {neg.get('exit_reason', 'Market moved against prediction')}\n"
+                negative_context += f"  - **Lesson**: Be more skeptical if current news resembles this pattern.\n"
 
         return f"""
         Analyze this news impact on the prediction market probability using Bayesian reasoning.
@@ -559,8 +623,14 @@ Determine the new fair probability given this information.
             event.entities = await self.extract_entities(event)
 
         similar_events = await self.find_similar_events(event, top_k=3)
+        
+        # SELF-LEARNING (Phase 3)
+        negative_examples = await self.find_negative_examples(event)
+        if negative_examples:
+            logger.warning(f"🚩 [FEEDBACK LOOP] Injecting {len(negative_examples)} historical failures into prompt.")
+
         prompt = self._build_impact_analysis_prompt(
-            event, market_question, current_price, similar_events
+            event, market_question, current_price, similar_events, negative_examples
         )
 
         try:
@@ -616,6 +686,25 @@ Determine the new fair probability given this information.
                 model_used=self.analysis_model
             )
 
+            # 🧠 ENSEMBLE VERIFICATION (Phase 2)
+            if self.enable_ensemble and trade_rec != 'hold':
+                logger.info(f"🛡️ [ENSEMBLE] Verifying signal with {self.validator_model}...")
+                verified, v_reasoning = await self._verify_with_ensemble(
+                    event=event,
+                    market_question=market_question,
+                    primary_impact=impact
+                )
+                impact.ensemble_verified = verified
+                impact.validator_reasoning = v_reasoning
+                impact.validator_model = self.validator_model
+                
+                if not verified:
+                    logger.warning(f"❌ [ENSEMBLE REJECTED] Validator disagreed: {v_reasoning[:100]}...")
+                    # Optionally downgrade confidence or override recommendation
+                    # For now, we keep the impact as is but flag it as not verified
+                else:
+                    logger.info(f"✅ [ENSEMBLE APPROVED] Validator confirmed signal.")
+
             logger.info(f"\n{'='*60}")
             logger.info(f"📊 MARKET IMPACT ANALYSIS ({self.analysis_model})")
             logger.info(f"{ '='*60}")
@@ -643,6 +732,108 @@ Determine the new fair probability given this information.
                 expected_value=Decimal("0"),
                 model_used="error"
             )
+
+    async def _verify_with_ensemble(
+        self,
+        event: NewsEvent,
+        market_question: str,
+        primary_impact: MarketImpact
+    ) -> Tuple[bool, str]:
+        """
+        Secondary verification using a high-parameter reasoning model.
+        """
+        prompt = f"""
+### MISSION
+You are a Senior Risk Officer at a high-frequency trading firm. Your job is to verify a trade signal generated by an AI analyst.
+
+### MARKET CONTEXT
+- **Market Question**: {market_question}
+- **Current Price**: {primary_impact.current_price}
+- **AI Analyst Recommendation**: {primary_impact.trade_recommendation.upper()}
+- **AI's Target Price**: {primary_impact.suggested_price}
+- **AI's Reasoning**: {primary_impact.reasoning}
+
+### LATEST NEWS
+- **Title**: {event.title}
+- **Content**: {event.content}
+
+### CRITERIA FOR APPROVAL
+1. **Novelty**: Does the news actually contain new, non-public info that justifies a price shift?
+2. **Logic Check**: Is the AI analyst's reasoning sound and logical for this specific market?
+3. **Refutation Search**: Are there any obvious counter-arguments or risks the AI ignored?
+4. **Market Depth**: Is this news high-impact enough to move a prediction market?
+
+### FORMAT
+Return a JSON object:
+{{
+  "verified": true/false,
+  "reasoning": "Brief explanation of why you approve/reject."
+}}
+"""
+        try:
+            response = await self.openrouter_client.chat.completions.create(
+                model=self.validator_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a critical trading validator. Be skeptical. Return JSON only."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0.1,
+                max_tokens=500
+            )
+
+            content = response.choices[0].message.content.strip()
+            
+            # JSON extraction (Highly Robust for Reasoning Models)
+            try:
+                # Pre-process: Remove <thought> blocks if present
+                clean_content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL | re.IGNORECASE).strip()
+                
+                # 1. Try to find JSON block in markdown
+                result = None
+                json_block_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', clean_content, re.DOTALL)
+                if json_block_match:
+                    try:
+                        result = json.loads(json_block_match.group(1))
+                    except: pass
+                
+                # 2. Try simple brace extraction if 1 failed
+                if not result:
+                    brace_match = re.search(r'(\{.*\})', clean_content, re.DOTALL)
+                    if brace_match:
+                        try:
+                            # Try to fix common trailing char issues
+                            potential_json = brace_match.group(1)
+                            result = json.loads(potential_json)
+                        except: pass
+                
+                # 3. Last resort: Direct string search for "verified"
+                if not result:
+                    verified_val = True if '"verified": true' in clean_content.lower() else False
+                    if '"verified"' in clean_content.lower():
+                        # Extract reasoning if possible
+                        reasoning_match = re.search(r'"reasoning":\s*"(.*?)"', clean_content)
+                        reasoning_val = reasoning_match.group(1) if reasoning_match else "Extracted via regex"
+                        result = {"verified": verified_val, "reasoning": reasoning_val}
+
+            except Exception as e:
+                logger.error(f"❌ [ENSEMBLE CRITICAL ERROR] Parsing logic failed: {e}")
+                result = None
+
+            if not result:
+                logger.error(f"❌ [ENSEMBLE PARSE ERROR] Validator output: {content}")
+                return False, f"Failed to parse validator output. Content: {content[:100]}..."
+
+            return bool(result.get('verified', False)), result.get('reasoning', "No reasoning")
+
+        except Exception as e:
+            logger.error(f"Ensemble verification failed: {e}")
+            return False, f"Validator error: {str(e)}"
 
     async def _store_market_analysis(
         self,
@@ -700,6 +891,34 @@ Determine the new fair probability given this information.
 
         logger.info(f"✅ Processed {len(all_events)} news events")
         return all_events
+
+    async def log_trade_outcome(
+        self,
+        event_id: str,
+        market_question: str,
+        pnl: float,
+        exit_reason: str
+    ):
+        """
+        Record trade outcome for future self-learning.
+        """
+        try:
+            payload = {
+                'event_id': event_id,
+                'market_question': market_question,
+                'pnl': float(pnl),
+                'exit_reason': exit_reason,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            def _write_feedback():
+                self.supabase.table('trading_feedback').insert(payload).execute()
+                
+            self._schedule_supabase_write(_write_feedback, "trading_feedback.insert")
+            logger.info(f"🧠 [FEEDBACK LOOP] Logged trade outcome for self-learning (PnL: {pnl:.2f})")
+            
+        except Exception as e:
+            logger.error(f"Failed to log trade outcome: {e}")
 
 
 # Singleton

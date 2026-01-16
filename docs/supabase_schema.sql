@@ -60,4 +60,19 @@ begin
   order by market_memories.embedding <=> query_embedding
   limit match_count;
 end;
-$$;
+
+-- Table to store trade results for self-learning
+create table trading_feedback (
+  id uuid default gen_random_uuid() primary key,
+  timestamp timestamp with time zone default timezone('utc'::text, now()) not null,
+  event_id text not null,       -- Links back to news_events
+  market_question text,
+  pnl float not null,           -- Actual P&L of the trade
+  exit_reason text,             -- e.g., 'Stop-Loss', 'Take-Profit', 'Manual'
+  
+  -- Index for fast lookup by event_id
+  constraint fk_event foreign key (event_id) references news_events(event_id) on delete cascade
+);
+
+create index idx_feedback_event on trading_feedback(event_id);
+create index idx_feedback_pnl on trading_feedback(pnl);

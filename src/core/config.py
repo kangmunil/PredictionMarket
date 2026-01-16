@@ -184,3 +184,12 @@ class Config:
         if neutral <= efficient:
             neutral = efficient * 2.0
         return {"efficient": efficient, "neutral": neutral}
+
+    @property
+    def AI_MODEL_VALIDATOR(self) -> str:
+        return os.getenv("AI_MODEL_VALIDATOR", "deepseek/deepseek-v3.2-speciale")
+
+    @property
+    def ENABLE_ENSEMBLE_VERIFICATION(self) -> bool:
+        val = os.getenv("ENABLE_ENSEMBLE_VERIFICATION", "true").lower()
+        return val in ("true", "1", "yes", "on")

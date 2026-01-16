@@ -62,28 +62,48 @@ def make_layout():
 
 def generate_header(state):
     mode = state.get("mode", "UNKNOWN")
-    status = state.get("status", "UNKNOWN")
-    ts = state.get("timestamp", "")[11:19] # Time only
+    status = "RUNNING" if state.get("last_updated", 0) > time.time() - 10 else "STALLED"
+    ts = datetime.fromtimestamp(state.get("last_updated", 0)).strftime("%H:%M:%S")
     
     style = "bold green" if status == "RUNNING" else "bold red"
     title_text = Text(f"🤖 HIVE MIND SWARM | {status} | {mode} | Last Update: {ts}", justify="center", style=style)
     return Panel(title_text, box=box.DOUBLE)
 
+def generate_sparkline(data, width=30):
+    if not data: return ""
+    chars = " ▂▃▄▅▆▇█"
+    min_val, max_val = min(data), max(data)
+    rng = max_val - min_val
+    if rng == 0: return "█" * min(len(data), width)
+    
+    points = data[-width:]
+    line = ""
+    for v in points:
+        idx = int(((v - min_val) / rng) * (len(chars) - 1))
+        line += chars[idx]
+    return line
+
 def generate_pnl_panel(state):
-    pnl = state.get("pnl", {})
-    total = float(pnl.get("total_net", 0.0))
-    real = float(pnl.get("realized", 0.0))
-    unreal = float(pnl.get("unrealized", 0.0))
-    win_rate = float(pnl.get("win_rate", 0.0))
+    # Match StatusReporter flat structure
+    total = float(state.get("total_pnl", 0.0))
+    balance = float(state.get("balance_usdc", 0.0))
+    history = state.get("pnl_history", [])
+    
+    # Calculate stats from history/logs if not explicitly in state
+    # (Simplified for now)
     
     color = "green" if total >= 0 else "red"
     
     text = Text()
-    text.append(f"💰 Total PnL: ", style="bold")
+    text.append(f"💰 Balance:   ${balance:.2f}\n", style="bold white")
+    text.append(f"📊 Total PnL: ", style="bold")
     text.append(f"${total:+.2f}\n", style=f"bold {color}")
-    text.append(f"💵 Realized:  ${real:+.2f}\n")
-    text.append(f"📉 Floating:  ${unreal:+.2f}\n")
-    text.append(f"🏆 Win Rate:  {win_rate:.1f}%")
+    
+    if history:
+        chart = generate_sparkline(history, width=35)
+        text.append(f"\n📈 Trend (1m):\n{chart}", style=color)
+    else:
+        text.append("\n(No PnL history yet)", style="dim")
     
     return Panel(text, title="Performance", border_style=color)
 
@@ -111,7 +131,7 @@ def generate_positions_table(state):
             Text(f"${pnl:+.2f}", style=color)
         )
         
-    return Panel(table, title=f"Positions ({len(positions)})")
+    return Panel(table, title=f"Active Positions ({len(positions)})")
 
 def generate_log_panel():
     logs = get_log_tail(25)

@@ -64,7 +64,63 @@ class SignalBus:
             "efficient": float(thresholds.get("efficient", 0.01)),
             "neutral": float(thresholds.get("neutral", 0.03)),
         }
+        self.redis = None
         logger.info("🧠 SignalBus (Hive Mind) Initialized")
+
+    def set_redis(self, redis_client):
+        """Inject Redis client for persistence"""
+        self.redis = redis_client
+
+    async def load_state(self):
+        """Restore signals from Redis on startup"""
+        if not self.redis: return
+        try:
+            # Load all signal keys
+            keys = await self.redis.keys("signal:*")
+            count = 0
+            for key in keys:
+                token_id = key.decode().split(":")[1]
+                data = await self.redis.get(key)
+                if data:
+                    try:
+                        import json
+                        sig_dict = json.loads(data)
+                        # Reconstruct MarketSignal
+                        # Handle datetime fields
+                        if 'last_updated' in sig_dict:
+                            if isinstance(sig_dict['last_updated'], str):
+                                sig_dict['last_updated'] = datetime.fromisoformat(sig_dict['last_updated'])
+                        
+                        self._signals[token_id] = MarketSignal(**sig_dict)
+                        count += 1
+                    except Exception as e:
+                        logger.error(f"Failed to deserialze signal {token_id}: {e}")
+            if count > 0:
+                logger.info(f"🧠 SignalBus Restored {count} signals from Redis")
+        except Exception as e:
+            logger.error(f"SignalBus restore error: {e}")
+
+    async def _persist_signal(self, token_id: str):
+        """Save single signal to Redis"""
+        if not self.redis: return
+        try:
+            signal = self._signals.get(token_id)
+            if not signal: return
+            
+            import json
+            from dataclasses import asdict
+            
+            # Helper for datetime serialization
+            def json_serial(obj):
+                if isinstance(obj, (datetime, date)):
+                    return obj.isoformat()
+                raise TypeError(f"Type {type(obj)} not serializable")
+
+            data = json.dumps(asdict(signal), default=json_serial)
+            # Set with 24h expiry (volatile markets)
+            await self.redis.setex(f"signal:{token_id}", 86400, data)
+        except Exception as e:
+            logger.debug(f"Redis save failed for {token_id}: {e}")
 
     async def update_signal(self, token_id: str, source: str, **kwargs):
         """
@@ -88,11 +144,14 @@ class SignalBus:
                 if 'score' in kwargs: signal.whale_activity_score = kwargs['score']
                 if 'side' in kwargs: signal.recent_whale_side = kwargs['side']
                 
-            elif source == 'ARB':
+            if source == 'ARB':
                 if 'volatile' in kwargs: signal.is_volatile = kwargs['volatile']
                 if 'opportunity' in kwargs: signal.arb_opportunity_detected = kwargs['opportunity']
 
             logger.debug(f"🧠 Bus Updated [{source}] for {token_id[:10]}... | Sent:{signal.sentiment_score:.2f} Whale:{signal.whale_activity_score:.2f}")
+            
+            # Persist to Redis
+            asyncio.create_task(self._persist_signal(token_id))
 
     async def update_market_metrics(
         self,
@@ -158,6 +217,9 @@ class SignalBus:
             if expires_at_val:
                 expiry_ctx = self._calculate_expiry_phase(expires_at_val)
                 signal.metadata["expiry"] = expiry_ctx
+            
+            # Persist to Redis
+            asyncio.create_task(self._persist_signal(token_id))
 
     async def get_signal(self, token_id: str) -> MarketSignal:
         """특정 토큰의 종합 상태 조회"""
