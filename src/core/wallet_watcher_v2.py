@@ -22,6 +22,8 @@ from datetime import datetime, timedelta
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 from web3.contract import Contract
+import json
+import os
 
 from src.core.config import Config
 from src.core.whale_intelligence import (
@@ -64,6 +66,17 @@ class EnhancedWalletWatcher:
         self.last_checked_block = self.w3.eth.block_number
         self.tx_cache: Dict[str, datetime] = {}  # tx_hash -> detection_time
         self.whale_tx_timestamps: Dict[str, float] = {}  # tx_hash -> execution_time
+
+        # Load CTF Exchange Contract for decoding
+        try:
+            abi_path = os.path.join(os.path.dirname(__file__), '../contracts/ctf_exchange_abi.json')
+            with open(abi_path, 'r') as f:
+                self.ctf_abi = json.load(f)
+            self.ctf_contract = self.w3.eth.contract(address=CTF_EXCHANGE, abi=self.ctf_abi)
+            logger.info("✅ CTF Exchange Contract ABI loaded")
+        except Exception as e:
+            logger.error(f"❌ Failed to load CTF Exchange ABI: {e}")
+            self.ctf_contract = None
 
         # Performance tracking
         self.trades_executed = 0
@@ -295,29 +308,89 @@ class EnhancedWalletWatcher:
 
     async def _decode_trade_transaction(self, tx: Dict) -> Optional[Dict]:
         """
-        Decode transaction input data to extract trade details.
-
-        In production, this would use the CTF Exchange ABI to decode:
-        - fillOrder() calls
-        - Token ID
-        - Amount
-        - Price
-        - Side (buy/sell)
+        Decode transaction input data to extract trade details using CTF Exchange ABI.
         """
-        # TODO: Implement proper ABI decoding
-        # For now, return simulated data for testing
-
-        # Check if transaction has input data
-        if tx['input'] == '0x':
+        if not self.ctf_contract or tx['input'] == '0x':
             return None
 
-        # Simulated decoding (replace with actual ABI decoding)
-        return {
-            "token_id": "21742633143463906290569050155826241533067272736897614382221909761164580721494",
-            "side": "BUY",
-            "price": 0.60,
-            "amount": 100.0
-        }
+        try:
+            func_obj, func_args = self.ctf_contract.decode_function_input(tx['input'])
+            
+            # We only care about fillOrder(Order order, uint256 takerAmount)
+            if func_obj.fn_name == 'fillOrder':
+                order = func_args.get('order', {})
+                taker_amount = func_args.get('takerAmount', 0)
+                
+                # Order Struct: 
+                # tokenId, makerAmount, takerAmount, side (0=BUY, 1=SELL usually, but check)
+                # In Polymarket CTF:
+                # BUY: side = 0
+                # SELL: side = 1
+                
+                raw_side = order.get('side', 0)
+                side_str = "BUY" if raw_side == 0 else "SELL"
+                
+                token_id = str(order.get('tokenId', ''))
+                
+                # Calculate Price involved
+                # makerAmount / takerAmount ratio defines price
+                m_amt = float(order.get('makerAmount', 0))
+                t_amt = float(order.get('takerAmount', 0))
+                
+                # If buying (taking an ASK), we pay collateral (USDC) to get Outcome Tokens?
+                # Or are we the maker? The whale is the one calling fillOrder, so they are the TAKER.
+                # If whale calls fillOrder, they are filling a MAKER's order.
+                
+                # If Maker is SELLING (side=1), they offer Tokens for USDC.
+                # Whale (Taker) is BUYING.
+                # If Maker is BUYING (side=0), they offer USDC for Tokens.
+                # Whale (Taker) is SELLING.
+                
+                # Wait, order.side is the MAKER's side.
+                # If Maker side = 0 (BUY), Maker wants to BUY. Whale Fills it -> Whale SELLS.
+                # If Maker side = 1 (SELL), Maker wants to SELL. Whale Fills it -> Whale BUYS.
+                
+                whale_side = "SELL" if raw_side == 0 else "BUY"
+                
+                # Calculate Price
+                # Price = USDC / Tokens
+                # We need to know which asset is USDC. Usually collateral.
+                # Assuming standard Binary Market where 1 Outcome + 1 complementary = 1 USDC.
+                
+                # Simplified price calc:
+                # If Maker Sells (side 1): Maker offers Tokens, wants USDC.
+                # Price = takerAmount (USDC) / makerAmount (Tokens)
+                # Whale Buys: Price = takerAmount / makerAmount
+                
+                # If Maker Buys (side 0): Maker offers USDC, wants Tokens.
+                # Price = makerAmount (USDC) / takerAmount (Tokens)
+                # Whale Sells: Price = makerAmount / takerAmount
+                
+                price = 0.0
+                amount = 0.0 # Number of shares/tokens
+                
+                if m_amt > 0 and t_amt > 0:
+                    if raw_side == 1: # Maker Sell -> Whale Buy
+                         # makerAmount = Tokens, takerAmount = USDC
+                         price = t_amt / m_amt
+                         amount = m_amt
+                    else: # Maker Buy -> Whale Sell
+                         # makerAmount = USDC, takerAmount = Tokens
+                         price = m_amt / t_amt
+                         amount = t_amt
+
+                return {
+                    "token_id": token_id,
+                    "side": whale_side,
+                    "price": price,
+                    "amount": amount
+                }
+                
+            return None
+            
+        except Exception as e:
+            # logger.debug(f"Failed to decode tx {tx['hash'].hex()}: {e}")
+            return None
 
     async def _fetch_market_state(self, token_id: str) -> MarketState:
         """
@@ -475,6 +548,13 @@ class EnhancedWalletWatcher:
             # Generate whale intelligence report
             self.whale_intel.report_performance()
 
+    async def shutdown(self):
+        """Clean up active resources"""
+        logger.info("🎬 Shutting down WalletWatcher...")
+        # Currently uses Web3 via HTTPProvider, no session to close explicitly unless using AsyncHTTPProvider
+        # But we may have other internal tasks to stop
+        logger.info("✅ WalletWatcher cleanup complete")
+
 
 # Backward compatibility wrapper
 class WalletWatcher:
@@ -490,3 +570,7 @@ class WalletWatcher:
 
     async def run(self):
         await self.enhanced_watcher.run()
+
+    async def shutdown(self):
+        """Pass through shutdown to enhanced version"""
+        await self.enhanced_watcher.shutdown()

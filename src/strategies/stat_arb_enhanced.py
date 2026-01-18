@@ -1034,8 +1034,44 @@ class EnhancedStatArbStrategy:
         while True:
             try:
                 logger.info("🔍 StatArb: Running Advanced Market Discovery...")
-                # 더 많은 후보군 확보 (100개 -> 200개)
+                # 더 많은 후보군 확보 (200개)
                 markets = await gamma.get_active_markets(limit=200, volume_min=1000, max_hours_to_close=48)
+                
+                # ======= NEW: 15m 크립토 마켓 동적 탐색 =======
+                # 15m 마켓은 매 15분마다 새로운 Condition ID로 생성됨
+                crypto_15m_keywords = [
+                    ("btc", "15m", "BTC_15M"),
+                    ("bitcoin", "15m", "BTC_15M"),
+                    ("eth", "15m", "ETH_15M"),
+                    ("ethereum", "15m", "ETH_15M"),
+                    ("sol", "15m", "SOL_15M"),
+                    ("solana", "15m", "SOL_15M"),
+                ]
+                
+                found_15m = {}
+                for m in markets:
+                    q = (m.get('question') or '').lower()
+                    slug = (m.get('slug') or '').lower()
+                    text = f"{q} {slug}"
+                    
+                    for (kw1, kw2, group) in crypto_15m_keywords:
+                        if kw1 in text and kw2 in text:
+                            cid = m.get('conditionId') or m.get('condition_id')
+                            if cid and group not in found_15m:
+                                found_15m[group] = cid
+                                logger.info(f"🎯 Found 15m market: {group} -> {cid[:20]}...")
+                
+                # Create pairs from found 15m markets
+                if "BTC_15M" in found_15m and "ETH_15M" in found_15m:
+                    pair_name = f"BTC_ETH_15m_Live"
+                    if not any(p[2] == pair_name for p in self.pairs):
+                        self.add_pair(found_15m["BTC_15M"], found_15m["ETH_15M"], pair_name, "crypto_15m")
+                        
+                if "SOL_15M" in found_15m and "ETH_15M" in found_15m:
+                    pair_name = f"SOL_ETH_15m_Live"
+                    if not any(p[2] == pair_name for p in self.pairs):
+                        self.add_pair(found_15m["SOL_15M"], found_15m["ETH_15M"], pair_name, "crypto_15m")
+                # ======= END 15m Discovery =======
                 
                 # 1. 자산-프록시(Proxy Peg) 탐색 로직 확장
                 proxies = {
@@ -1054,11 +1090,11 @@ class EnhancedStatArbStrategy:
                     if len(group) >= 2:
                         # 🚀 안전하게 필드 존재 여부 확인 후 페어 추가
                         m1, m2 = group[0], group[1]
-                        cid1 = m1.get('condition_id') or m1.get('id')
-                        cid2 = m2.get('condition_id') or m2.get('id')
+                        cid1 = m1.get('conditionId') or m1.get('condition_id') or m1.get('id')
+                        cid2 = m2.get('conditionId') or m2.get('condition_id') or m2.get('id')
                         
                         if cid1 and cid2:
-                            pair_name = f"PEG_{base.upper()}_{m1['id'][:4]}"
+                            pair_name = f"PEG_{base.upper()}_{m1.get('id', 'x')[:4]}"
                             if not any(p[2] == pair_name for p in self.pairs):
                                 self.add_pair(cid1, cid2, pair_name, "proxy_peg")
                                 added_count += 1
@@ -1084,7 +1120,9 @@ class EnhancedStatArbStrategy:
             except Exception as e:
                 logger.error(f"Error in strategic discovery: {e}")
             
-            await asyncio.sleep(3600) # 1시간마다 정밀 탐색
+            # Run every 5 minutes for 15m markets (not 1 hour)
+            await asyncio.sleep(300)
+
 
     def align_price_series(self, data_a: List[Dict], data_b: List[Dict]) -> pd.DataFrame:
         """
@@ -1110,3 +1148,13 @@ class EnhancedStatArbStrategy:
         df = df.sort_values('timestamp')
 
         return df
+
+    async def shutdown(self):
+        """Gracefully close internal clients"""
+        logger.info("🎬 Shutting down EnhancedStatArbStrategy...")
+        try:
+            if hasattr(self, 'gamma') and self.gamma:
+                await self.gamma.close()
+            logger.info("✅ EnhancedStatArbStrategy resources closed")
+        except Exception as e:
+            logger.error(f"Error during EnhancedStatArbStrategy shutdown: {e}")

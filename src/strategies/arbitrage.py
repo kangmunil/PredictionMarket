@@ -19,7 +19,7 @@ class ArbitrageStrategy:
         self.budget_manager = budget_manager
         self.notifier = None
         
-        self.min_profit_threshold = Decimal("0.005") # 0.5% min profit (Aggressive for neglected markets)
+        self.min_profit_threshold = Decimal("0.001") # 0.1% min profit (Aggressive for neglected markets)
         self.default_trade_size = 50.0             # USD per leg
         
         self.local_orderbook = {} # token_id -> best_ask
@@ -155,17 +155,38 @@ class ArbitrageStrategy:
             if hot_tokens:
                 self.min_profit_threshold = Decimal("0.002") # 호재 시 0.2%로 공격적 전환
             else:
-                self.min_profit_threshold = Decimal("0.005")
+                self.min_profit_threshold = Decimal("0.001")
 
-    async def on_book_update(self, event, *args):
+    async def on_book_update(self, token_id, book):
         """WebSocket 이벤트 발생 시 1ms 이내 실행"""
-        for update in event.get("events", []):
-            token_id = update.get("asset_id")
-            asks = update.get("asks", [])
-            
-            if asks:
-                self.local_orderbook[token_id] = Decimal(str(asks[0][0]))
+        # book is the full orderbook dict: {'bids': [], 'asks': []}
+        # book might be a dict or LocalOrderBook object
+        # 1. Handle LocalOrderBook Object (Preferred)
+        if hasattr(book, "get_best_ask"):
+            best_price, _ = book.get_best_ask()
+            if best_price > 0:
+                self.local_orderbook[token_id] = Decimal(str(best_price))
                 await self.check_arbitrage(token_id)
+            return
+
+        # 2. Handle Raw Dictionary (Legacy/Fallback)
+        asks = book.get("asks", []) if isinstance(book, dict) else getattr(book, "asks", [])
+        
+        if asks:
+            try:
+                # Handle list of dicts: [{'price': '0.99', ...}]
+                if isinstance(asks[0], dict):
+                     best_ask = Decimal(str(asks[0].get('price')))
+                # Handle list of lists: [['0.99', '100']]
+                elif isinstance(asks[0], list):
+                     best_ask = Decimal(str(asks[0][0]))
+                else:
+                     return # Unknown format
+
+                self.local_orderbook[token_id] = best_ask
+                await self.check_arbitrage(token_id)
+            except (IndexError, AttributeError, ValueError) as e:
+                pass
 
     async def check_arbitrage(self, token_id):
         if getattr(self.client, "ws_connected", True) is False:
@@ -224,3 +245,13 @@ class ArbitrageStrategy:
         finally:
             if self.budget_manager:
                 await self.budget_manager.release_allocation("arbhunter", alloc_id, Decimal("0"))
+
+    async def shutdown(self):
+        """Gracefully close internal clients"""
+        logger.info("🎬 Shutting down ArbitrageStrategy...")
+        try:
+            if hasattr(self, 'gamma_client') and self.gamma_client:
+                await self.gamma_client.close()
+            logger.info("✅ ArbitrageStrategy resources closed")
+        except Exception as e:
+            logger.error(f"Error during ArbitrageStrategy shutdown: {e}")

@@ -5,8 +5,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Config:
+    _dry_run_override = None
+    
     def __init__(self):
-        self._dry_run_override = None
+        pass
 
     @property
     def HOST(self):
@@ -84,15 +86,15 @@ class Config:
         Master switch for trading execution.
         If True, no real transactions are sent.
         """
-        if self._dry_run_override is not None:
-            return self._dry_run_override
+        if Config._dry_run_override is not None:
+            return Config._dry_run_override
             
         val = os.getenv("DRY_RUN", "True").lower()
         return val in ("true", "1", "yes", "on")
 
     @DRY_RUN.setter
     def DRY_RUN(self, value: bool):
-        self._dry_run_override = bool(value)
+        Config._dry_run_override = bool(value)
 
     @property
     def BUDGET_MODE(self) -> str:

@@ -297,3 +297,14 @@ class SignalBus:
             "phase": phase,
             "expires_at": expiry_dt.isoformat(),
         }
+
+    async def close(self):
+        """Close external connections (Redis)"""
+        if self.redis:
+            logger.info("🎬 SignalBus: Closing Redis connection...")
+            try:
+                await self.redis.aclose() # redis.asyncio uses aclose
+                self.redis = None
+                logger.info("✅ SignalBus: Redis connection closed")
+            except Exception as e:
+                logger.error(f"Error closing Redis in SignalBus: {e}")

@@ -213,3 +213,18 @@ class EliteMimicAgent:
         if allocation_id:
             await self.budget_manager.release_allocation("elitemimic", allocation_id, actual_spent)
 
+    async def shutdown(self):
+        """Gracefully close internal components"""
+        logger.info("🎬 Shutting down EliteMimicAgent...")
+        try:
+            if hasattr(self, 'wallet_watcher') and self.wallet_watcher:
+                await self.wallet_watcher.shutdown()
+            
+            # If news_brain exists and has a shutdown, call it
+            if hasattr(self, 'news_brain') and self.news_brain and hasattr(self.news_brain, 'shutdown'):
+                await self.news_brain.shutdown()
+                
+            logger.info("✅ EliteMimicAgent resources closed")
+        except Exception as e:
+            logger.error(f"Error during EliteMimicAgent shutdown: {e}")
+

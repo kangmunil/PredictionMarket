@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import json
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from decimal import Decimal
@@ -51,7 +52,8 @@ class SmartTrendFollower:
         self.max_position = 20.0 # Small aggressive bets
         
         # Position Management
-        self.active_positions: Dict[str, Dict] = {} # token_id -> {entry_price, size, market_question, timestamp}
+        self.state_file = "data/trend_follower_state.json"
+        self.active_positions: Dict[str, Dict] = self._load_state() 
 
         # Cache to avoid re-trading same trend immediately
         self.cooldowns: Dict[str, datetime] = {}
@@ -60,6 +62,9 @@ class SmartTrendFollower:
     async def run(self):
         """Main Strategy Loop"""
         logger.info("🚀 SmartTrendFollower: Activated. Scanning for trends...")
+        
+        # Sync existing positions on startup
+        await self._sync_with_account()
         
         while True:
             try:
@@ -78,7 +83,7 @@ class SmartTrendFollower:
             await asyncio.sleep(self.scan_interval)
 
     async def _manage_positions(self):
-        """Monitor active positions for TP/SL"""
+        """Monitor active positions for TP/SL, Trailing Stop, and Partial Exit"""
         if not self.active_positions:
             return
 
@@ -86,73 +91,185 @@ class SmartTrendFollower:
         
         # Create list of IDs to remove after closing
         closed_ids = []
+        state_changed = False
         
         for token_id, pos in self.active_positions.items():
+            if pos.get('zombie'):
+                continue
             try:
-                current_price_str = await self.client.get_price(token_id)
-                if not current_price_str: continue
-                current_price = float(current_price_str)
+                # Use get_real_market_price with condition_id fallback
+                condition_id = pos.get('condition_id')
+                current_price = await self.client.get_real_market_price(token_id, condition_id)
+                
+                if current_price is None:
+                    # Fallback to orderbook bid/ask if MCP/REST fails
+                    bid_price, _ = self.client.get_best_bid(token_id)
+                    current_price = bid_price
+                    
+                if not current_price or current_price <= 0:
+                    continue
                 
                 entry_price = pos['entry_price']
                 side = pos['side']
                 
-                # Calculate PnL
+                # Update High Water Mark for Trailing Stop
+                # pos['high_water_mark'] might not exist for old legacy positions
+                hwm = pos.get('high_water_mark', entry_price)
                 if side == "BUY":
+                    if current_price > hwm:
+                        pos['high_water_mark'] = current_price
+                        state_changed = True
+                        logger.info(f"📈 HWM Updated: {pos['market_question'][:30]} -> ${current_price:.4f}")
                     pnl_pct = (current_price - entry_price) / entry_price
-                    close_side = "SELL"
                 else: # SELL (Short)
+                    if current_price < hwm:
+                        pos['high_water_mark'] = current_price
+                        state_changed = True
                     pnl_pct = (entry_price - current_price) / entry_price
-                    close_side = "BUY"
                 
                 # Exit Logic
                 should_close = False
+                close_pct = 1.0 # Default: close 100%
                 reason = ""
                 
-                # 1. Take Profit (+20%)
-                if pnl_pct >= 0.20:
+                # 1. Partial Take Profit (10% Gain -> Sell 50%)
+                if pnl_pct >= 0.10 and not pos.get('partial_exit_hit'):
+                    logger.info(f"💰 Partial TP Triggered: {pos['market_question'][:30]} (+{pnl_pct*100:.1f}%)")
                     should_close = True
-                    reason = f"Take Profit (+{pnl_pct*100:.1f}%)"
+                    close_pct = 0.5
+                    reason = "Partial Take Profit (10%)"
+                    pos['partial_exit_hit'] = True
+                    state_changed = True
+
+                # 2. Main Take Profit (25% Gain -> Exit Full)
+                elif pnl_pct >= 0.25:
+                    should_close = True
+                    reason = f"Full Take Profit (+{pnl_pct*100:.1f}%)"
                     
-                # 2. Stop Loss (-10%)
+                # 3. Trailing Stop (5% drop from HWM)
+                elif side == "BUY" and hwm > entry_price:
+                    trail_pct = (hwm - current_price) / hwm
+                    if trail_pct >= 0.05:
+                        should_close = True
+                        reason = f"Trailing Stop Triggered (-{trail_pct*100:.1f}% from HWM)"
+
+                # 4. Traditional Stop Loss (-10%)
                 elif pnl_pct <= -0.10:
                     should_close = True
-                    reason = f"Stop Loss ({pnl_pct*100:.1f}%)"
+                    reason = f"Hard Stop Loss ({pnl_pct*100:.1f}%)"
                     
-                # 3. Time Limit (24h)
-                elif datetime.now() - pos['timestamp'] > timedelta(hours=24):
+                # 5. Time Limit (48h)
+                elif datetime.now() - datetime.fromisoformat(pos['timestamp']) > timedelta(hours=48):
                     should_close = True
-                    reason = "Time Limit (24h)"
+                    reason = "Time Limit (48h)"
                     
                 if should_close:
-                    logger.info(f"🔄 Closing Position: {pos['market_question'][:30]} | Reason: {reason}")
+                    logger.info(f"🔄 Executing Exit: {pos['market_question'][:30]} | Reason: {reason} | Amount: {close_pct*100:.0f}%")
+                    
+                    close_side = "SELL" if side == "BUY" else "BUY"
+                    shares_to_close = pos['size'] * close_pct
                     
                     if not self.config.DRY_RUN:
-                        # Close with limit order at current price (slippage protected)
-                        # Note: We need to sell the SIZE (shares) we have
-                        # But place_limit... takes USD AMOUNT usually. 
-                        # Wait, clob_client.place_limit... takes AMOUNT in USD.
-                        # We need to calculate USD value = shares * current_price
-                        close_amount_usd = pos['size'] * current_price
+                        close_amount_usd = shares_to_close * current_price
                         
+                        # 🛡️ Dust Protection: Skip if value < $5.00 (Polymarket Minimum)
+                        if close_amount_usd < 5.00:
+                            logger.warning(f"      ⚠️ Cannot Close: Value ${close_amount_usd:.2f} < $5.00 min. Marking as 'Zombie' to ignore.")
+                            pos['zombie'] = True
+                            state_changed = True
+                            continue
+
                         resp = await self.client.place_limit_order_with_slippage_protection(
                             token_id=token_id,
                             side=close_side,
                             amount=close_amount_usd,
+                            size=shares_to_close, # Explicitly pass shares
                             target_price=current_price
                         )
                         if resp:
-                            logger.info(f"      ✅ Closed: {reason}")
-                            closed_ids.append(token_id)
+                            logger.info(f"      ✅ Part/Full Closed: {reason}")
+                            if close_pct >= 1.0:
+                                closed_ids.append(token_id)
+                            else:
+                                pos['size'] -= shares_to_close
+                                state_changed = True
                     else:
-                        logger.info(f"      📝 [DRY RUN] Would Close: {reason}")
-                        closed_ids.append(token_id)
-                        
+                        logger.info(f"      📝 [DRY RUN] Would Close {close_pct*100:.0f}%: {reason}")
+                        if close_pct >= 1.0:
+                            closed_ids.append(token_id)
+                        else:
+                            pos['size'] -= shares_to_close
+                            state_changed = True
+                            
             except Exception as e:
                 logger.error(f"Error managing position {token_id}: {e}")
                 
         # Remove closed positions
         for tid in closed_ids:
             self.active_positions.pop(tid, None)
+            state_changed = True
+            
+        if state_changed:
+            self._save_state()
+
+    async def _sync_with_account(self):
+        """Sync local state with actual Polymarket account positions"""
+        logger.info("🔄 Syncing positions with Polymarket account...")
+        try:
+            live_positions = await self.client.get_all_positions()
+            if not live_positions:
+                logger.info("   No active positions found in account.")
+                return
+
+            # live_positions is usually a list of dicts with 'asset', 'conditionId'
+            for lp in live_positions:
+                token_id = lp.get('asset') or lp.get('conditionId') or lp.get('asset_id')
+                size = float(lp.get('size', 0))
+                
+                if size <= 0.01 or not token_id: continue # Dust or invalid
+                
+                if token_id not in self.active_positions:
+                    logger.info(f"   ✨ Found untracked position: {str(token_id)[:15]}... (Size: {size})")
+                    # Try to fetch market info for better tracking
+                    market = await self.client.get_market_cached(token_id)
+                    
+                    self.active_positions[token_id] = {
+                        'entry_price': float(lp.get('avgPrice', 0.5)),
+                        'size': size,
+                        'market_question': market.get('question', 'Existing Position') if market else lp.get('title', 'Untracked Position'),
+                        'condition_id': market.get('condition_id') or lp.get('conditionId') if market else lp.get('conditionId'),
+                        'timestamp': datetime.now().isoformat(),
+                        'side': 'BUY',
+                        'strategy': 'sync',
+                        'high_water_mark': float(lp.get('avgPrice', 0.5))
+                    }
+            
+            self._save_state()
+            logger.info(f"   Sync complete. Tracking {len(self.active_positions)} positions.")
+            
+        except Exception as e:
+            logger.error(f"Failed to sync positions: {e}")
+
+    def _save_state(self):
+        """Save active positions to disk"""
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump(self.active_positions, f, indent=2)
+            logger.debug("💾 Strategy state saved.")
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
+
+    def _load_state(self) -> Dict:
+        """Load active positions from disk"""
+        if not os.path.exists(self.state_file):
+            return {}
+        try:
+            with open(self.state_file, 'r') as f:
+                state = json.load(f)
+                return state
+        except Exception as e:
+            logger.error(f"Failed to load state: {e}")
+            return {}
 
     async def _scan_and_trade(self):
         """Core logic: Scan -> Analyze -> Execute"""
@@ -202,7 +319,10 @@ class SmartTrendFollower:
             if not token_id: continue
             
             try:
-                current_price_str = await self.client.get_price(token_id)
+                # current_price_str = await self.client.get_price(token_id)
+                # Fix: Use get_best_bid (returns (price, size))
+                bid_price, _ = self.client.get_best_bid(token_id)
+                current_price_str = bid_price
                 current_price = Decimal(str(current_price_str)) if current_price_str else Decimal("0.5")
             except:
                 current_price = Decimal("0.5")
@@ -257,22 +377,35 @@ class SmartTrendFollower:
         logger.info(f"   ⚡ Found {len(active_markets)} potential scalp markets")
         
         for market in active_markets:
-            condition_id = market.get('condition_id')
-            if not condition_id or self._is_cooldown(condition_id):
+            logger.debug(f"   👉 Checking candidate: {market.get('question')[:40]}...")
+            condition_id = market.get('condition_id') or market.get('conditionId')
+            logger.debug(f"      🆔 Condition ID: {condition_id}")
+            if not condition_id:
+                logger.warning(f"      ❌ Missing condition_id for {market.get('question')[:20]}")
+                continue
+                
+            if self._is_cooldown(condition_id):
+                logger.info(f"      ❄️ Cooldown active for {market.get('question')[:20]}...")
                 continue
                 
             # Get Yes Token ID
             token_id = self._get_yes_token(market)
-            if not token_id: continue
+            logger.debug(f"      🔑 Token ID: {token_id}")
+            if not token_id: 
+                logger.warning(f"      ⚠️ No 'Yes' token found for {market.get('question')[:30]}")
+                continue
             
             # 2. Check Price Momentum (Last 30 mins)
             try:
                 # Use History API to get recent price points
+                logger.debug(f"      ⏳ Fetching history for {token_id}...")
                 history, source = await self.history_api.get_history_with_source(
                     condition_id=condition_id, days=1, min_points=5
                 )
+                logger.debug(f"      📊 History fetched: {len(history)} points")
                 
                 if len(history) < 5:
+                    logger.info(f"      📉 Insufficient history for {market.get('question')[:20]} ({len(history)} points)")
                     continue
                     
                 # Analyze last few ticks
@@ -289,9 +422,27 @@ class SmartTrendFollower:
                 
                 logger.debug(f"      📈 {market.get('question')[:30]} Mom: {momentum*100:.2f}% (${current_price})")
                 
-                # Scalp Signal: Strong Breakout (>3% move recently)
-                # distinct-baguette buys volatility.
-                if momentum > 0.03 and current_price < 0.85: 
+                # Scalp Signal: Strong Breakout (>1% move recently)
+                if momentum > 0.01 and 0.02 < current_price < 0.85: 
+                     # --- EXPIRY CHECK ---
+                     # Ensure market has at least 2 hours until resolution
+                     end_date_str = market.get('end_date')
+                     if end_date_str:
+                         try:
+                             # end_date is often ISO format or 'YYYY-MM-DD'
+                             # Gamma usually returns ISO
+                             if 'T' in end_date_str:
+                                 end_dt = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+                             else:
+                                 end_dt = datetime.strptime(end_date_str, '%Y-%m-%d')
+                             
+                             time_until_expiry = end_dt.replace(tzinfo=None) - datetime.now()
+                             if time_until_expiry.total_seconds() < 2 * 3600:
+                                 logger.info(f"      ⚠️ Skipping {market.get('question')[:30]}: Too close to expiry ({time_until_expiry})")
+                                 continue
+                         except Exception as ex:
+                             logger.warning(f"      ⚠️ Could not parse end_date {end_date_str}: {ex}")
+                     
                      logger.info(f"   🚀 SCALP SIGNAL: {market.get('question')} | Mom: {momentum*100:.1f}%")
                      
                      # Check Budget
@@ -306,7 +457,7 @@ class SmartTrendFollower:
                      await self.client.place_limit_order_with_slippage_protection(
                          token_id=token_id,
                          side="BUY",
-                         amount=10.0, # Fixed scalp size
+                         amount=5.0, # Reduced to $5.0 to fit wallet ($9.89)
                          priority="high",
                          max_slippage_pct=3.0, # Low liquidity tolerance
                          target_price=target_price
@@ -315,15 +466,20 @@ class SmartTrendFollower:
                      # Record position with aggressive take profit
                      self.active_positions[token_id] = {
                         'entry_price': current_price,
-                        'size': 10.0 / current_price, # shares estimated
+                        'size': 5.0 / current_price, # shares estimated
                         'market_question': market.get('question'),
-                        'timestamp': datetime.now(),
+                        'condition_id': condition_id,
+                        'timestamp': datetime.now().isoformat(),
                         'side': 'BUY',
-                        'strategy': 'scalp'
+                        'strategy': 'scalp',
+                        'high_water_mark': current_price
                     }
-                    
+                     self._save_state()
+                     
                      # Cooldown
                      self.cooldowns[condition_id] = datetime.now()
+                else:
+                    logger.info(f"      🚫 Rejected scalp: {market.get('question')[:30]} | Mom: {momentum*100:.2f}% (req >1.0%), Price: {current_price} (req <0.85)")
                      
             except Exception as e:
                 logger.error(f"Error scanning scalp candidate {token_id}: {e}")
@@ -360,9 +516,11 @@ class SmartTrendFollower:
                         "size": float(resp.get('filled')),
                         "side": side.upper(),
                         "market_question": market.get('question'),
-                        "timestamp": datetime.now(),
-                        "target_price": float(impact.suggested_price)
+                        "timestamp": datetime.now().isoformat(),
+                        "target_price": float(impact.suggested_price),
+                        "high_water_mark": float(resp.get('price'))
                     }
+                    self._save_state()
                 else:
                     logger.warning("      ❌ Trade failed (no fill)")
                     # Release budget if failed
@@ -381,9 +539,11 @@ class SmartTrendFollower:
                 "size": amount / float(impact.current_price or 0.5),
                 "side": side.upper(),
                 "market_question": market.get('question'),
-                "timestamp": datetime.now(),
-                "target_price": float(impact.suggested_price)
+                "timestamp": datetime.now().isoformat(),
+                "target_price": float(impact.suggested_price),
+                "high_water_mark": float(impact.current_price)
             }
+            self._save_state()
 
     def _extract_keywords(self, question: str) -> List[str]:
         """Simple keyword extractor"""
@@ -395,29 +555,33 @@ class SmartTrendFollower:
         """
         Robustly identify the 'Yes' token ID.
         """
-        # 1. Check if we have both definitions
         clob_ids = market.get('clobTokenIds')
         tokens = market.get('tokens')
         
-        if not clob_ids or not tokens:
-            return None
-            
-        if len(clob_ids) != len(tokens):
-            logger.warning(f"⚠️ Token mismatch for {market.get('question')}: {len(clob_ids)} IDs vs {len(tokens)} tokens")
-            return None
-            
-        # 2. Iterate and find 'Yes'
-        for i, token in enumerate(tokens):
-            outcome = token.get('outcome', '').upper()
-            if outcome == 'YES':
-                return clob_ids[i]
-                
-        # 3. Fallback: If binary [Yes, No], usually 0 is Yes? 
-        # But safest is to return None if explicit 'Yes' not found 
-        # (could be A vs B market)
+        if clob_ids and tokens and len(clob_ids) == len(tokens):
+             for i, token in enumerate(tokens):
+                outcome = token.get('outcome', '').strip().upper()
+                if outcome == 'YES':
+                    return clob_ids[i]
         
-        # Check for "Long" or other positives?
+        # 2. Fallback: Binary Market Assumption (Index 0 = YES)
+        # Gamma markets sometimes lack 'tokens' but have 'clobTokenIds'
+        if clob_ids:
+             # Handle if it came as string
+             if isinstance(clob_ids, str):
+                 try:
+                     import json
+                     c_ids = json.loads(clob_ids)
+                 except: c_ids = []
+             else:
+                 c_ids = clob_ids
+                 
+             if isinstance(c_ids, list) and len(c_ids) == 2:
+                 # Heuristic: For binary markets, Yes/Long is usually index 0
+                 return c_ids[0]
+                 
         return None
+
 
     def _is_cooldown(self, condition_id: str) -> bool:
         if condition_id in self.cooldowns:
@@ -427,3 +591,19 @@ class SmartTrendFollower:
         
     def _set_cooldown(self, condition_id: str):
         self.cooldowns[condition_id] = datetime.now() + self.cooldown_duration
+
+    async def shutdown(self):
+        """Gracefully close all internal client sessions"""
+        logger.info("🎬 Shutting down SmartTrendFollower...")
+        try:
+            if hasattr(self, 'gamma') and self.gamma:
+                await self.gamma.close()
+            if hasattr(self, 'news_aggregator') and self.news_aggregator:
+                await self.news_aggregator.close()
+            if hasattr(self, 'rag') and self.rag:
+                await self.rag.close()
+            if hasattr(self, 'history_api') and self.history_api:
+                await self.history_api.close()
+            logger.info("✅ SmartTrendFollower resources closed")
+        except Exception as e:
+            logger.error(f"Error during SmartTrendFollower shutdown: {e}")

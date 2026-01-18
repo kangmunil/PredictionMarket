@@ -640,3 +640,13 @@ async def get_rag_system(
         )
 
     return _rag_system_instance
+
+    async def close(self):
+        """Close external connections"""
+        if hasattr(self, 'openai_client') and self.openai_client:
+            logger.info("🎬 RAGSystem: Closing OpenAI client...")
+            try:
+                await self.openai_client.close()
+                logger.info("✅ RAGSystem: OpenAI client closed")
+            except Exception as e:
+                logger.error(f"Error closing OpenAI in RAGSystem: {e}")

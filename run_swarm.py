@@ -96,6 +96,9 @@ class SwarmSystem:
         # Dashboard Logging Hook
         from src.core.structured_logger import attach_dashboard_handler
         attach_dashboard_handler(self.status_reporter)
+        
+        # Set system mode in reporter
+        self.status_reporter.update_state({"mode": "DRY RUN" if dry_run else "LIVE"})
 
         self.s_logger = StructuredLogger("SwarmOrchestrator")
         self.s_logger.info(f"🐝 Initializing Swarm Intelligence System... (Mode: {'DRY RUN' if dry_run else 'LIVE'})")
@@ -733,7 +736,7 @@ class SwarmSystem:
             self.tasks = [
                 asyncio.create_task(self.news_agent.run(keywords=keywords, check_interval=300), name="NewsScalper"),
                 asyncio.create_task(self.stat_arb_agent.run(), name="StatArb"),
-                asyncio.create_task(self.mimic_agent.run(), name="EliteMimic"),
+                asyncio.create_task(self.mimic_agent.run(), name="EliteMimic"), # ✅ Re-enabled (Bug Fixed)
                 asyncio.create_task(self.arb_agent.run(), name="PureArb"),
                 asyncio.create_task(self.trend_agent.run(), name="TrendFollower"),
                 asyncio.create_task(self.health_monitor.run(), name="HealthMonitor"),
@@ -780,7 +783,7 @@ class SwarmSystem:
                 
                 # 2. Update Metrics in Reporter
                 self.status_reporter.update_metrics(
-                    balance=float(balances.get('total_equity', 0.0)),
+                    balance=float(status.get('total_capital', 0.0)),
                     pnl=float(pnl_summary['total_pnl'])
                 )
                 
@@ -795,6 +798,7 @@ class SwarmSystem:
                     
                     active_trades.append({
                         "symbol": trade.asset_name or trade.token_id[:10],
+                        "side": trade.side,
                         "size": trade.size * entry_price, # Approximate USD size
                         "entry": entry_price,
                         "current": current_price,
@@ -807,55 +811,14 @@ class SwarmSystem:
                 for tid, sig in hot_tokens.items():
                     self.status_reporter.update_signal(tid[:10], sig.sentiment_score)
                 
-                # 5. Dump State for TUI
-                self._dump_dashboard_state()
+                # 5. Heartbeat for dashboard
+                self.status_reporter.update_state({"last_updated": time.time()})
                     
             except Exception as e:
                 logger.debug(f"Dashboard ticker error: {e}")
                 
             await asyncio.sleep(2)
             
-    def _dump_dashboard_state(self):
-        """Dump current state to JSON for external dashboard"""
-        try:
-            import json
-            pnl = self.pnl_tracker.get_summary()
-            
-            # Active positions
-            positions = []
-            for tid, t in self.pnl_tracker.active_trades.items():
-                current_price = self.client.get_best_ask_price(t.token_id) or t.entry_price
-                pnl_amt = (current_price - t.entry_price) * t.size if t.side == "BUY" else (t.entry_price - current_price) * t.size
-                
-                positions.append({
-                    "symbol": t.asset_name or t.token_id[:10],
-                    "side": t.side,
-                    "size": t.size,
-                    "entry_price": t.entry_price,
-                    "current_price": current_price,
-                    "pnl": pnl_amt
-                })
-            
-            state = {
-                "timestamp": datetime.now().isoformat(),
-                "status": "RUNNING" if self.running else "STOPPED",
-                "mode": "DRY RUN" if getattr(self.client.config, 'DRY_RUN', True) else "LIVE",
-                "pnl": {
-                    "total_net": pnl.get('total_pnl', 0.0),
-                    "realized": pnl.get('realized_pnl', 0.0),
-                    "unrealized": pnl.get('unrealized_pnl', 0.0),
-                    "win_rate": pnl.get('win_rate', 0.0)*100
-                },
-                "positions": positions,
-                "active_signals": len(hot_tokens) if 'hot_tokens' in locals() else 0
-            }
-            
-            with open("dashboard_state.json", "w") as f:
-                json.dump(state, f, indent=2)
-                
-        except Exception as e:
-            # logger.debug(f"Failed to dump dashboard state: {e}")
-            pass
 
     async def _swarm_heartbeat_task(self):
         """Send heartbeats for all active agents to Redis"""
@@ -939,49 +902,68 @@ class SwarmSystem:
                 logger.error(f"Failed to send status heartbeat: {exc}")
 
     async def shutdown(self):
-        if not self.running:
+        """Gracefully stop all tasks and close resources"""
+        if not self.running and not self.tasks:
             return
+            
+        logger.info("🎬 SwarmSystem: Initiating graceful shutdown...")
         self.running = False
+        
+        # 1. Cancel all background tasks
         for task in self.tasks:
-            task.cancel()
-        if self.notifier_task:
+            if not task.done():
+                task.cancel()
+        if self.notifier_task and not self.notifier_task.done():
             self.notifier_task.cancel()
-        await asyncio.gather(*self.tasks, return_exceptions=True)
-        self.tasks.clear()
+
+        # 2. Wait for tasks to acknowledge cancellation
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+            self.tasks.clear()
+        
         if self.notifier_task:
             with suppress(asyncio.CancelledError):
                 await self.notifier_task
             self.notifier_task = None
 
+        # 3. Clean up agents and clients
         await self._shutdown_agents()
         logger.info("👋 Swarm Disconnected")
 
     async def _shutdown_agents(self):
-        async def _close_agent(agent):
-            if agent and hasattr(agent, "shutdown"):
+        """Invoke shutdown/close on all sub-components"""
+        async def _close_component(comp, name):
+            if comp:
+                logger.debug(f"Closing {name}...")
                 try:
-                    await agent.shutdown()
+                    if hasattr(comp, "shutdown"):
+                        await comp.shutdown()
+                    elif hasattr(comp, "close"):
+                        await comp.close()
                 except Exception as exc:
-                    logger.error(f"Agent shutdown error ({agent.__class__.__name__}): {exc}")
+                    logger.error(f"Error closing {name} ({comp.__class__.__name__}): {exc}")
 
-        await _close_agent(self.news_agent)
-        await _close_agent(self.stat_arb_agent)
-        await _close_agent(self.mimic_agent)
-        await _close_agent(self.arb_agent)
-        await _close_agent(self.trend_agent)
-        await _close_agent(self.health_monitor)
+        await _close_component(self.news_agent, "NewsScalper")
+        await _close_component(self.stat_arb_agent, "StatArb")
+        await _close_component(self.mimic_agent, "EliteMimic")
+        await _close_component(self.arb_agent, "PureArb")
+        await _close_component(self.trend_agent, "TrendFollower")
+        await _close_component(self.liquidity_sniper, "LiquiditySniper")
+        await _close_component(self.health_monitor, "HealthMonitor")
 
-        if self.client:
+        # 🧠 Close Hive Mind / SignalBus
+        await _close_component(self.bus, "SignalBus")
+
+        # Core Clients
+        await _close_component(self.client, "PolyClient")
+        await _close_component(self.gamma_client, "GammaClient")
+
+        if hasattr(self, 'redis') and self.redis:
             try:
-                await self.client.close()
+                await self.redis.aclose()
+                logger.info("✅ SwarmSystem: Redis connection closed")
             except Exception as exc:
-                logger.error(f"PolyClient close error: {exc}")
-
-        if self.gamma_client and hasattr(self.gamma_client, "close"):
-            try:
-                await self.gamma_client.close()
-            except Exception as exc:
-                logger.error(f"GammaClient close error: {exc}")
+                logger.error(f"SwarmSystem: Redis close error: {exc}")
 
 
 async def main(args):
@@ -991,8 +973,15 @@ async def main(args):
     loop = asyncio.get_running_loop()
 
     def _handle_signal():
+        # Schedule shutdown on the loop
         logger.info("🛑 Shutdown signal received...")
-        asyncio.create_task(system.shutdown())
+        # Instead of creating a task that might be orphaned, 
+        # we can just cancel the running tasks which will trigger 'finally' in run()
+        for task in system.tasks:
+            if not task.done():
+                task.cancel()
+        if system.notifier_task and not system.notifier_task.done():
+            system.notifier_task.cancel()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:

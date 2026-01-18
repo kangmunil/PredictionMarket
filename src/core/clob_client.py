@@ -217,9 +217,9 @@ class PolyClient:
                 # Add keep-alive settings to prevent idle disconnections
                 async with websockets.connect(
                     self.ws_url,
-                    ping_interval=20,  # Send ping every 20 seconds
-                    ping_timeout=10,   # Wait 10s for pong response
-                    close_timeout=10,  # Wait 10s for close frame
+                    ping_interval=None,  # Disable client-side ping to avoid 1011 errors on heavy load
+                    ping_timeout=None,   # Trust TCP keepalive
+                    close_timeout=10,
                     max_size=2**23,    # 8MB message size limit
                 ) as ws:
                     self.ws_connection = ws
@@ -245,7 +245,7 @@ class PolyClient:
                             batch = token_list[i:i+batch_size]
                             await self._send_subscribe(batch)
                             logger.info(f"📡 Subscribed to batch {i//batch_size + 1}: {len(batch)} tokens")
-                            await asyncio.sleep(0.5)  # Small delay between batches
+                            await asyncio.sleep(2.0)  # Throttled delay between batches to prevent ping timeout
                         logger.info(f"✅ Total subscribed: {len(token_list)} tokens")
 
                     async for msg in ws:
@@ -293,6 +293,7 @@ class PolyClient:
 
     async def _handle_ws_message(self, message: str):
         try:
+            # logger.debug(f"🔍 DEBUG: Handling message type {type(message)}")
             data = json.loads(message)
             events = data if isinstance(data, list) else [data]
 
@@ -304,6 +305,10 @@ class PolyClient:
                 logger.info(f"📨 WebSocket message #{self._ws_msg_count}: {json.dumps(data)[:200]}...")
 
             for event in events:
+                if not isinstance(event, dict):
+                     # logger.debug(f"⚠️ Ignored non-dict WS event: {event}")
+                     continue
+
                 # Check for error messages from server
                 if 'error' in event or event.get('type') == 'error':
                     logger.error(f"❌ Server error: {event}")
@@ -351,7 +356,7 @@ class PolyClient:
             else:
                 logger.warning(f"⚠️ WebSocket JSON Decode Error: {e} | Msg: {message[:100]}...")
         except Exception as e:
-            logger.error(f"❌ WebSocket Handler Error: {e}")
+            logger.exception(f"❌ WebSocket Handler Error: {e} | MsgType: {type(message)} | Msg: {message[:1000]}")
 
     # --- NEW: Atomic Batch Execution ---
 
@@ -577,7 +582,7 @@ class PolyClient:
              return self.orderbooks[token_id].get_best_bid()
         return (0.0, 0.0) # Or fallback to REST if needed
 
-    async def place_market_order(self, token_id: str, side: str, amount: float):
+    async def place_market_order(self, token_id: str, side: str, amount: float = 0.0, size: float = 0.0):
         """
         Execute a market order by placing an aggressive limit order 
         with slippage protection to ensure immediate fill.
@@ -587,6 +592,7 @@ class PolyClient:
             token_id=token_id,
             side=side,
             amount=amount,
+            size=size,
             max_slippage_pct=2.0,
             priority="normal"
         )
@@ -698,7 +704,7 @@ class PolyClient:
             logger.error(f"❌ Limit order exception: {e}")
             return None
 
-    async def place_limit_order_with_slippage_protection(self, token_id: str, side: str, amount: float, max_slippage_pct: float = 1.0, priority: str = "normal", target_price: Optional[float] = None) -> Optional[Dict]:
+    async def place_limit_order_with_slippage_protection(self, token_id: str, side: str, amount: float = 0.0, size: float = 0.0, max_slippage_pct: float = 1.0, priority: str = "normal", target_price: Optional[float] = None) -> Optional[Dict]:
         """
         Place a limit order with aggressive pricing to ensure fill within slippage limits.
         
@@ -762,20 +768,25 @@ class PolyClient:
         limit_price = float(f"{limit_price:.3f}")
         
         # 3. Calculate Shares
-        # Initial calculation based on market price
-        shares = float(amount) / best_price
-        
-        # Recalculate if SELLING (limit < market) brings value below minimum
-        limit_val = shares * limit_price
-        if limit_val < 5.0 and amount >= 5.0:
-            logger.info(f"   ⚖️ Limit val ${limit_val:.2f} < $5.00. Adjusting shares using Limit Price ${limit_price:.3f}")
-            shares = 5.0 / limit_price
-            shares *= 1.01 # 1% safety buffer
+        if size > 0:
+            shares = size
+            logger.info(f"🛡️ Slippage Protection: Market ${best_price:.3f} → Limit ${limit_price:.3f} ({max_slippage_pct}%)")
+            logger.info(f"   📊 Using explicit size: {shares:.2f} shares")
+        else:
+            # Initial calculation based on market price
+            shares = float(amount) / best_price if best_price > 0 else 0
+            
+            # Recalculate if SELLING (limit < market) brings value below minimum
+            limit_val = shares * limit_price
+            if limit_val < 5.0 and amount >= 5.0:
+                logger.info(f"   ⚖️ Limit val ${limit_val:.2f} < $5.00. Adjusting shares using Limit Price ${limit_price:.3f}")
+                shares = 5.0 / limit_price if limit_price > 0 else shares
+                shares *= 1.01 # 1% safety buffer
 
-        shares = float(f"{shares:.2f}")
-        
-        logger.info(f"🛡️ Slippage Protection: Market ${best_price:.3f} → Limit ${limit_price:.3f} ({max_slippage_pct}%)")
-        logger.info(f"   📊 Converting ${amount:.2f} USD → {shares:.2f} shares")
+            shares = float(f"{shares:.2f}")
+            
+            logger.info(f"🛡️ Slippage Protection: Market ${best_price:.3f} → Limit ${limit_price:.3f} ({max_slippage_pct}%)")
+            logger.info(f"   📊 Converting ${amount:.2f} USD → {shares:.2f} shares")
         
         # 4. Place Order
         order_id = await self.place_limit_order(token_id, side, limit_price, shares)

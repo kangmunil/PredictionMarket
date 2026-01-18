@@ -19,7 +19,8 @@ class StatusReporter:
             "pnl_history": [], # Track history for charting
             "active_positions": [],
             "recent_logs": [],
-            "signals": {}
+            "signals": {},
+            "mode": "UNKNOWN"
         }
         self.lock = threading.Lock()
         self._ensure_dir()
@@ -68,6 +69,11 @@ class StatusReporter:
     def update_signal(self, token_id: str, score: float):
         with self.lock:
             self.state["signals"][token_id] = score
+        self._flush_async()
+
+    def update_state(self, updates: Dict[str, Any]):
+        with self.lock:
+            self.state.update(updates)
         self._flush_async()
 
     def _flush_async(self):

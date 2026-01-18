@@ -10,7 +10,6 @@ from rich.text import Text
 from rich.console import Console
 from rich import box
 
-LOG_FILE = "logs/latest_swarm.log"
 STATE_FILE = "dashboard_state.json"
 
 def load_state():
@@ -20,28 +19,6 @@ def load_state():
     except:
         return {}
 
-def get_log_tail(n=20):
-    try:
-        if not os.path.exists(LOG_FILE):
-             return ["Waiting for logs..."]
-        # Simple reliable tail (inefficient for huge files but fine for now)
-        # For production, seeking to end is better.
-        with open(LOG_FILE, "r") as f:
-             # Fast read last N lines
-             f.seek(0, os.SEEK_END)
-             size = f.tell()
-             block = 1024
-             lines = []
-             
-             # Read backwards roughly
-             params_to_read = min(size, block * 10) # 10KB
-             f.seek(max(size - params_to_read, 0))
-             
-             data = f.read()
-             lines = data.splitlines()
-             return lines[-n:]
-    except Exception as e:
-        return [f"Error reading logs: {e}"]
 
 def make_layout():
     layout = Layout()
@@ -133,25 +110,25 @@ def generate_positions_table(state):
         
     return Panel(table, title=f"Active Positions ({len(positions)})")
 
-def generate_log_panel():
-    logs = get_log_tail(25)
+def generate_log_panel(state):
+    logs = state.get("recent_logs", [])
     text = Text()
-    for line in logs:
-        line_clean = line
-        if "INFO]" in line:
-            line_clean = line.split("INFO]")[-1].strip()
-            style = "white"
-            if "BUY" in line or "SELL" in line: style = "bold green"
-        elif "WARNING]" in line:
-             line_clean = line.split("WARNING]")[-1].strip()
-             style = "yellow"
-        elif "ERROR]" in line:
-             line_clean = line.split("ERROR]")[-1].strip()
-             style = "bold red"
+    for entry in logs:
+        time_str = entry.get("time", "")
+        msg = entry.get("msg", "")
+        level = entry.get("level", "INFO")
+        
+        style = "white"
+        if level == "INFO":
+            if "BUY" in msg or "SELL" in msg: style = "bold green"
+        elif level == "WARNING":
+            style = "yellow"
+        elif level == "ERROR":
+            style = "bold red"
         else:
-             style = "dim white"
+            style = "dim white"
              
-        text.append(f"{line_clean}\n", style=style)
+        text.append(f"[{time_str}] {msg}\n", style=style)
             
     return Panel(text, title="Live Logs", box=box.ROUNDED)
 
@@ -170,7 +147,7 @@ def run_dashboard():
             layout["header"].update(generate_header(state))
             layout["pnl"].update(generate_pnl_panel(state))
             layout["positions"].update(generate_positions_table(state))
-            layout["right"].update(generate_log_panel())
+            layout["right"].update(generate_log_panel(state))
             
             # Signals
             sigs = state.get("active_signals", 0)

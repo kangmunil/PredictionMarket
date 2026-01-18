@@ -25,39 +25,44 @@ Created: 2026-01-02
 
 CANDIDATE_PAIRS = [
     # ========== CRYPTO MARKETS ==========
-    {
-        "name": "BTC_ETH_15m_Scanner",
-        "description": "BTC vs ETH 15m Correlation",
-        "token_a": {
-            "condition_id": "0xb318b53528ed532d3e01ab0dbeb58db586474f44f7a5ad030611d0ecb63c6767", # BTC 15m
-            "search_query": "Bitcoin Up Down"
-        },
-        "token_b": {
-            "condition_id": "0x9ab88b3b82221f90d7f22e9b84a972b4cf4db950c5480e86265521aa1d81f041", # ETH 15m
-            "search_query": "Ethereum Up Down"
-        },
-        "category": "crypto",
-        "reason": "15m timeframe correlation",
-        "expected_correlation": 0.85,
-        "priority": "high"
-    },
+    # NOTE: 15m markets are dynamically discovered by auto_discover_pairs_loop
+    # The following hardcoded IDs are STALE and cause synthetic history fallback.
+    # They are commented out to rely on dynamic discovery instead.
+    #
+    # {
+    #     "name": "BTC_ETH_15m_Scanner",
+    #     "description": "BTC vs ETH 15m Correlation",
+    #     "token_a": {
+    #         "condition_id": "0xb318b53528ed532d3e01ab0dbeb58db586474f44f7a5ad030611d0ecb63c6767", # BTC 15m
+    #         "search_query": "Bitcoin Up Down"
+    #     },
+    #     "token_b": {
+    #         "condition_id": "0x9ab88b3b82221f90d7f22e9b84a972b4cf4db950c5480e86265521aa1d81f041", # ETH 15m
+    #         "search_query": "Ethereum Up Down"
+    #     },
+    #     "category": "crypto",
+    #     "reason": "15m timeframe correlation",
+    #     "expected_correlation": 0.85,
+    #     "priority": "high"
+    # },
 
-    {
-        "name": "SOL_ETH_15m_Scanner",
-        "description": "SOL vs ETH 15m Correlation",
-        "token_a": {
-            "condition_id": "0xf1723670f957db29fabc368af0cc30f1c62707dbbacf5fc505a54aaae8872ecf", # SOL 15m
-            "search_query": "Solana Up Down"
-        },
-        "token_b": {
-            "condition_id": "0x9ab88b3b82221f90d7f22e9b84a972b4cf4db950c5480e86265521aa1d81f041", # ETH 15m
-            "search_query": "Ethereum Up Down"
-        },
-        "category": "crypto",
-        "reason": "Altcoin Liquidity Correlation",
-        "expected_correlation": 0.80,
-        "priority": "high"
-    },
+
+    # {
+    #     "name": "SOL_ETH_15m_Scanner",
+    #     "description": "SOL vs ETH 15m Correlation",
+    #     "token_a": {
+    #         "condition_id": "0xf1723670f957db29fabc368af0cc30f1c62707dbbacf5fc505a54aaae8872ecf", # SOL 15m
+    #         "search_query": "Solana Up Down"
+    #     },
+    #     "token_b": {
+    #         "condition_id": "0x9ab88b3b82221f90d7f22e9b84a972b4cf4db950c5480e86265521aa1d81f041", # ETH 15m
+    #         "search_query": "Ethereum Up Down"
+    #     },
+    #     "category": "crypto",
+    #     "reason": "Altcoin Liquidity Correlation",
+    #     "expected_correlation": 0.80,
+    #     "priority": "high"
+    # },
 
     {
         "name": "ETH_SOL_Altcoin_Pair",
@@ -207,9 +212,9 @@ CANDIDATE_PAIRS = [
 CATEGORY_THRESHOLDS = {
     "crypto": {
         "min_correlation": 0.75,
-        "max_cointegration_pvalue": 0.05,
-        "min_data_points": 100,
-        "entry_z_threshold": 2.0
+        "max_cointegration_pvalue": 0.10,
+        "min_data_points": 10,
+        "entry_z_threshold": 1.5
     },
     "politics": {
         "min_correlation": 0.60,

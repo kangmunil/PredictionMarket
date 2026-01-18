@@ -41,6 +41,10 @@ class RiskManager:
         self.max_daily_loss_pct = 0.03 
         self.max_bet_usd = float(max_bet_usd) if max_bet_usd is not None else None
         
+        # Fixed Sizing Mode (User Request: Minimum Size Only)
+        self.fixed_size_mode = True
+        self.fixed_size_amount = 5.0 # $5.00 USD
+        
         # State tracking
         self.daily_start_capital = self.total_capital
         self.daily_pnl = 0.0
@@ -101,6 +105,24 @@ class RiskManager:
             return 0.0
 
         # 3. Kelly Criterion Calculation
+        # --- FIXED SIZE MODE OVERRIDE ---
+        if self.fixed_size_mode:
+            # Check if we have enough capital
+            capital_base = portfolio_balance if portfolio_balance is not None else self.total_capital
+            
+            # Simple Confidence Gate (Must be > 60% confident to bet even $5)
+            if prob_win < 0.6:
+                 logger.info(f"   🛑 RiskManager: Fixed Mode - Skipping low confidence ({prob_win:.2f} < 0.6)")
+                 return 0.0
+
+            if capital_base < self.fixed_size_amount:
+                logger.info(f"   🛑 RiskManager: Insufficient capital for fixed bet (${capital_base:.2f} < ${self.fixed_size_amount:.2f})")
+                return 0.0
+
+            logger.info(f"   🎯 RiskManager: Using Fixed Minimum Size ${self.fixed_size_amount:.2f} (Unified Mode)")
+            return self.fixed_size_amount
+        # --------------------------------
+
         b = (1.0 - current_price) / current_price
         q = 1.0 - prob_win
         kelly_fraction = (b * prob_win - q) / b
@@ -186,7 +208,6 @@ class RiskManager:
             logger.info("🔄 RiskManager: Resetting daily P&L stats")
             self.daily_pnl = 0.0
             self.daily_start_capital = self.total_capital
-            self.last_reset_date = today
             self.last_reset_date = today
             self.circuit_breaker_active = False
 

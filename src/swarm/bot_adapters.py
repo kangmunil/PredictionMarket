@@ -161,7 +161,7 @@ class NewsScalperAdapter(BaseBotAdapter):
 
         try:
             # Import here to avoid circular dependencies
-            from news.news_scalper_optimized import OptimizedNewsScalper
+            from src.news.news_scalper_optimized import OptimizedNewsScalper
 
             # Initialize news scalper
             scalper = OptimizedNewsScalper(
@@ -288,9 +288,9 @@ class ArbHunterAdapter(BaseBotAdapter):
         await self.start()
 
         try:
-            from core.clob_client import PolyClient
-            from core.gamma_client import GammaClient
-            from strategies.arbitrage import ArbitrageStrategy
+            from src.core.clob_client import PolyClient
+            from src.core.gamma_client import GammaClient
+            from src.strategies.arbitrage import ArbitrageStrategy
 
             # Initialize clients
             client = PolyClient(strategy_name="arbhunter", budget_manager=self.budget_manager)
@@ -394,9 +394,9 @@ class StatArbAdapter(BaseBotAdapter):
         await self.start()
 
         try:
-            from core.clob_client import PolyClient
-            from core.history_fetcher import get_history_fetcher
-            from strategies.stat_arb_enhanced import EnhancedStatArbStrategy
+            from src.core.clob_client import PolyClient
+            from src.core.history_fetcher import get_history_fetcher
+            from src.strategies.stat_arb_enhanced import EnhancedStatArbStrategy
 
             # Initialize
             client = PolyClient(strategy_name="stat_arb", budget_manager=self.budget_manager)
@@ -455,10 +455,10 @@ class EliteMimicAdapter(BaseBotAdapter):
         await self.start()
 
         try:
-            from core.clob_client import PolyClient
-            from core.wallet_watcher import WalletWatcher
-            from strategies.ai_model_v2 import AIModelStrategyV2
-            from core.config import Config
+            from src.core.clob_client import PolyClient
+            from src.core.wallet_watcher_v2 import EnhancedWalletWatcher as WalletWatcher
+            from src.strategies.ai_model_v2 import AIModelStrategyV2
+            from src.core.config import Config
 
             # Initialize
             config = Config()
@@ -594,8 +594,8 @@ class PureArbitrageAdapter(BaseBotAdapter):
         await self.start()
 
         try:
-            from core.clob_client import PolyClient
-            from strategies.arbitrage_v2 import PureArbitrageV2
+            from src.core.clob_client import PolyClient
+            from src.strategies.arbitrage_v2 import PureArbitrageV2
 
             # Initialize
             client = PolyClient(strategy_name="pure_arb", budget_manager=self.budget_manager)

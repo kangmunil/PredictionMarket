@@ -41,14 +41,8 @@ from src.core.aggression import seconds_to_expiry, aggression_profile
 from src.core.trade_recorder import TradeRecorder
 
 # RAG System (Advanced AI Analysis)
-try:
-    import sys
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-    from core.rag_system_openrouter import OpenRouterRAGSystem, NewsEvent
-    RAG_AVAILABLE = True
-except ImportError as e:
-    logging.warning(f"⚠️  RAG System not available: {e}")
-    RAG_AVAILABLE = False
+from src.core.rag_system_openrouter import OpenRouterRAGSystem, NewsEvent
+RAG_AVAILABLE = True
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +151,7 @@ class OptimizedNewsScalper:
             minutes=float(os.getenv("NEWS_SIGNAL_COOLDOWN_MINUTES", "15"))
         )
         self.max_hold_hours = float(os.getenv("NEWS_MAX_HOLD_HOURS", default_hold))
+        self.max_market_duration_days = float(os.getenv("NEWS_MAX_MARKET_DURATION_DAYS", "7.0"))
 
         # Bridge: Connects News to Stat Arb
         try:
@@ -721,28 +716,36 @@ class OptimizedNewsScalper:
             for kw_list in entities.values():
                 search_keywords.extend(kw_list)
 
+        # Helper to filter valid markets
+        def _filter(mkts):
+            valid = [m for m in mkts if self._is_valid_duration(m)]
+            if len(mkts) != len(valid):
+                logger.debug(f"   ⏳ Duration filter removed {len(mkts)-len(valid)} long-term markets")
+            return valid
+
         # Check pre-loaded cache first
         for kw in search_keywords:
              if kw in self.preloaded_markets:
                  logger.debug(f"   💨 Cache hit for '{kw}'")
-                 return self.preloaded_markets[kw]
+                 return _filter(self.preloaded_markets[kw])
 
         # Fallback to API search
         markets = await self.market_matcher.find_matching_markets(
             news_text,
             min_volume=self.min_market_volume,
-            max_results=3,
+            max_results=10, # Request more to allow for filtering
             override_keywords=override_keywords
         )
+
+        # Apply duration filter
+        markets = _filter(markets)
 
         # Cache result
         if markets and search_keywords:
             for kw in search_keywords:
                 self.preloaded_markets[kw] = markets
-                # Cache only under first keyword to avoid duplication overhead, or all?
-                # All is safer for hits.
                 
-        return markets
+        return markets[:3] # Return top 3 after filtering
 
     async def _execute_trade(
         self,
@@ -1300,12 +1303,14 @@ class OptimizedNewsScalper:
                             (slippage_cost / max(intended_price, 1e-6)) * 10000,
                         )
 
-                    # Track position
+                    shares_filled = float(order_result.get('filled', position_size / entry_price if entry_price > 0 else 0))
+                    
+                    # Track position (Store SHARES not USD)
                     self.positions[token_id] = {
                         "token_id": token_id,
                         "market": market,
                         "side": side,
-                        "size": position_size,
+                        "size": shares_filled, # Storing SHARES now
                         "entry_price": entry_price,
                         "entry_time": datetime.now(),
                         "sentiment": sentiment,
@@ -1412,6 +1417,24 @@ class OptimizedNewsScalper:
             return date_parser.parse(end_raw)
         except Exception:
             return None
+
+    def _is_valid_duration(self, market: Dict) -> bool:
+        """Check if market duration is within limits (e.g. < 24h)"""
+        expiry = self._parse_market_expiry(market)
+        if not expiry:
+            # If no expiry found, assume safe? No, safer to reject if strict.
+            # But let's allow it for now to avoid blocking everything.
+            return True
+        
+        # Calculate duration from now
+        now = datetime.now(expiry.tzinfo)
+        remaining = expiry - now
+        
+        # Check against constraint
+        if remaining.total_seconds() > (self.max_market_duration_days * 86400):
+            return False
+            
+        return True
 
     def _infer_market_group(self, market: Optional[Dict]) -> str:
         """Rudimentary classifier for delta guardrails."""
@@ -1819,7 +1842,7 @@ class OptimizedNewsScalper:
                     await self.clob_client.place_market_order(
                         token_id=token_id,
                         side=opposite_side,
-                        amount=position["size"]
+                        size=position["size"] # Pass SHARES
                     )
                     logger.info("   ✅ Position closed")
                 
@@ -1933,6 +1956,21 @@ class OptimizedNewsScalper:
         if self.positions:
             for token_id, position in list(self.positions.items()):
                 await self._close_position(token_id, position, "Shutdown")
+
+        # [NEW] Cleanup internal systems
+        if self.news_aggregator and hasattr(self.news_aggregator, "close"):
+            try:
+                await self.news_aggregator.close()
+                logger.info("✅ NewsAggregator closed")
+            except Exception as e:
+                logger.error(f"Error closing NewsAggregator: {e}")
+
+        if self.rag_system and hasattr(self.rag_system, "close"):
+            try:
+                await self.rag_system.close()
+                logger.info("✅ RAG System closed")
+            except Exception as e:
+                logger.error(f"Error closing RAG System: {e}")
 
         # Final stats
         runtime = (datetime.now() - self.start_time).total_seconds() / 60
