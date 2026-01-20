@@ -34,7 +34,8 @@ class BudgetManager:
     def __init__(self, total_capital: float = 1000.0):
         # State
         self.total_capital = Decimal(str(total_capital))
-        self.allocations: Dict[str, Decimal] = {} # active allocations (ID -> Amount)
+        # Allocations: ID -> (Amount, Strategy)
+        self.allocations: Dict[str, Tuple[Decimal, str]] = {} 
         self.locked_funds = Decimal("0") # Total currently allocated
         self._lock = asyncio.Lock()
         
@@ -72,7 +73,8 @@ class BudgetManager:
             self.locked_funds += amount
             
             allocation_id = f"{strategy}:{time.time()}"
-            self.allocations[allocation_id] = amount
+            # Store tuple (Amount, Owner) for validation
+            self.allocations[allocation_id] = (amount, strategy)
             
             logger.info(f"✅ Allocation Approved ({strategy}): ${amount:.2f} | Remaining Pool: ${available_funds - amount:.2f}")
             return allocation_id
@@ -85,34 +87,22 @@ class BudgetManager:
     ):
         """
         Return unused funds to the pool.
+        Includes security check to ensure strategy owns the allocation.
         """
         async with self._lock:
             if allocation_id not in self.allocations:
+                logger.debug(f"⚠️ Release ignored: Allocation {allocation_id} not found.")
                 return
 
-            allocated_amount = self.allocations.pop(allocation_id)
+            allocated_amount, owner_strategy = self.allocations[allocation_id]
             
-            # Since we just track "locked" vs "free", we verify what happened
-            # If we allocated $10 and spent $5:
-            # Locked decreases by $10 (the reservation is gone)
-            # Total Capital decreases by $5 (the money is gone/converted to asset)
-            # Wait, BudgetManager tracks "Cash". 
-            # If I spent $5, I have $5 less cash.
-            # So Total Capital should be updated? 
-            # Usually BudgetManager tracks 'Allowable Spend'. 
-            # Let's keep it simple: We just unlock the amount. 
-            # The 'actual_spent' argument implies the caller used some.
-            # If we used it, it's no longer 'free cash'.
-            # BUT, the PnL/Balance sync (hydrate) updates self.total_capital separately usually.
-            
-            # For this simple manager:
-            # We treat 'allocations' as temporary reservations.
-            # When released, we assume the transaction is done.
-            # We decrement locked_funds by the original allocated amount.
-            # We update total_capital based on "unused" part? No.
-            # The calling agents (clob_client) don't update budget manager with PnL.
-            # run_swarm.py updates total_capital via _hydrate or fetching balance.
-            # So here, we simply release the lock.
+            # Security Check: Prevent Strategy A from releasing Strategy B's lock
+            if owner_strategy != strategy:
+                logger.error(f"🚨 Security Violation: {strategy} tried to release {owner_strategy}'s allocation {allocation_id}!")
+                return
+
+            # Clean up
+            del self.allocations[allocation_id]
             
             self.locked_funds -= allocated_amount
             

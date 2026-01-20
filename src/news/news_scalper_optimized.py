@@ -70,7 +70,8 @@ class OptimizedNewsScalper:
         swarm_system = None,
         delta_tracker = None,
         market_specialist = None, # Added for feedback loop
-        redis_client = None
+        redis_client = None,
+        risk_manager = None
     ):
         self.config = Config()
         self.news_api_key = news_api_key
@@ -106,20 +107,24 @@ class OptimizedNewsScalper:
         self.fee_model = FeeModel(taker_fee=self.config.TAKER_FEE)
         self.slippage_buffer = self.config.SLIPPAGE_BUFFER
 
-        # Initialize Risk Manager (cap dry-run trades at $2, live at $50)
-        max_bet = 2.0 if dry_run else 50.0
-        risk_pct = getattr(self.config, "RISK_PER_TRADE_PERCENT", 0.02)
-        self.risk_manager = RiskManager(
-            max_bet_usd=max_bet,
-            max_bet_cap_pct=risk_pct
-        )
-        
+        # Initialize Risk Manager
+        if risk_manager:
+            self.risk_manager = risk_manager
+            logger.info("🛡️ Global Risk Manager connected to NewsScalper")
+        else:
+            # Fallback to local Risk Manager (Legacy/Standalone)
+            max_bet = 2.0 if dry_run else 50.0
+            risk_pct = getattr(self.config, "RISK_PER_TRADE_PERCENT", 0.02)
+            self.risk_manager = RiskManager(
+                max_bet_usd=max_bet,
+                max_bet_cap_pct=risk_pct
+            )
+            logger.info("🛡️ Local Risk Manager Initialized (Dynamic Kelly Sizing)")
+            
         # Initialize Decision Logger
         notifier = self.swarm_system.notifier if self.swarm_system else None
         self.decision_logger = DecisionLogger("NewsScalper", notifier=notifier)
         self.trade_recorder = TradeRecorder(filename="data/trades_log.csv")
-        
-        logger.info("🛡️ Risk Manager Initialized (Dynamic Kelly Sizing)")
 
         if self.use_rag:
             logger.info("🤖 Initializing RAG System (Advanced AI Analysis)...")
@@ -165,7 +170,7 @@ class OptimizedNewsScalper:
             self.bridge = None
 
         # Trading config (OPTIMIZED FOR 50% PROBABILITY)
-        self.min_confidence = 0.50       # 50% 확률이면 진입
+        self.min_confidence = 0.45       # 45% 확률이면 진입 (Relaxed from 50%)
         self.high_impact_threshold = 0.70 # 70% 이상이면 고영향 뉴스로 판단
         self.min_market_volume = 0.3     # 거래량 문턱 완화 (1.0 -> 0.3) - 더 많은 시장 매칭
         self.position_size = 6.0        # 기본 진입 금액 $6 (Polymarket 최소 주문 금액 $5 이상)
@@ -534,8 +539,14 @@ class OptimizedNewsScalper:
                 # 3. Find relevant markets using AI-extracted keywords
                 markets = await self._find_markets_cached(title, override_keywords=llm_entities)
                 
+                # --- PROXY TRADING FALLBACK ---
                 if not markets:
-                    logger.debug(f"   ⚠️  No matching markets found for entities: {llm_entities}")
+                    markets = await self._find_proxy_markets(llm_entities)
+                    if markets:
+                        logger.info(f"   🎯 Proxy Markets Found: {len(markets)} (Proxy Trading Active)")
+
+                if not markets:
+                    logger.debug(f"   ⚠️  No matching markets or proxies found for entities: {llm_entities}")
                     return None
 
                 # 4. Analyze market impact with RAG System
@@ -746,6 +757,62 @@ class OptimizedNewsScalper:
                 self.preloaded_markets[kw] = markets
                 
         return markets[:3] # Return top 3 after filtering
+
+    async def _find_proxy_markets(self, entities: List[str]) -> List[Dict]:
+        """
+        If no direct event markets found, look for 15-min price markets
+        for major assets (BTC, ETH, SOL) involved in the news.
+        """
+        proxy_markets = []
+        
+        # Map entity to asset keywords
+        asset_map = {
+            'bitcoin': ['bitcoin', 'btc'],
+            'btc': ['bitcoin', 'btc'],
+            'ethereum': ['ethereum', 'eth'],
+            'eth': ['ethereum', 'eth'],
+            'solana': ['solana', 'sol'],
+            'sol': ['solana', 'sol'],
+            'xrp': ['xrp', 'ripple'],
+            'ripple': ['xrp', 'ripple'],
+        }
+        
+        target_assets = set()
+        for entity in entities:
+             key = entity.lower()
+             if key in asset_map:
+                 target_assets.add(asset_map[key][0]) # Use primary name
+             else:
+                 # Fuzzy check
+                 for asset, keywords in asset_map.items():
+                     if any(k in key for k in keywords):
+                         target_assets.add(asset_map[asset][0])
+        
+        if not target_assets:
+            return []
+            
+        logger.info(f"   🔍 News involves {list(target_assets)}. Checking proxy markets...")
+        
+        for asset in target_assets:
+            # Query for "Price of [Asset]" to find frequency markets
+            query = f"Price of {asset}"
+            try:
+                # Use broader search than exact match
+                markets = await self.market_matcher.find_matching_markets(
+                    query, 
+                    min_volume=1000, 
+                    max_results=5
+                )
+                if markets:
+                     # Filter for currently relevant (active)
+                     # We prioritize high volume 15-min or hourly markets
+                     valid_proxies = [m for m in markets if self._is_valid_duration(m)]
+                     proxy_markets.extend(valid_proxies)
+            except Exception as e:
+                logger.debug(f"Proxy search failed for {asset}: {e}")
+            
+        return proxy_markets[:3]
+
 
     async def _execute_trade(
         self,

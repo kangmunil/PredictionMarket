@@ -98,7 +98,8 @@ class EnhancedStatArbStrategy:
         min_data_points: int = 10,
         signal_bus = None,
         pnl_tracker = None,
-        delta_tracker=None,
+        delta_tracker = None,
+        risk_manager = None,
     ):
         self.client = client
         self.gamma = GammaClient()
@@ -106,6 +107,7 @@ class EnhancedStatArbStrategy:
         self.signal_bus = signal_bus # Hive Mind Connection
         self.pnl_tracker = pnl_tracker # Unified P&L Logger
         self.delta_tracker = delta_tracker
+        self.risk_manager = risk_manager
         self.decision_logger = DecisionLogger("StatArb") # Centralized Logger
         
         if self.signal_bus:
@@ -121,7 +123,7 @@ class EnhancedStatArbStrategy:
         self.stop_loss_z = 3.0        # Stop loss at |Z| > 3.0
 
         # Cointegration requirements
-        self.max_cointegration_pvalue = 0.05  # p < 0.05 required
+        self.max_cointegration_pvalue = 0.10  # Relaxed from 0.05 to 0.10 for better signaling
         self.min_correlation = 0.6            # Correlation > 0.6
         self.max_half_life_days = 14          # Reject if half-life > 2 weeks
 
@@ -153,7 +155,13 @@ class EnhancedStatArbStrategy:
             return
         self.pairs.append((condition_id_a, condition_id_b, pair_name, category))
         self.pair_groups[pair_name] = (category or "DEFAULT").upper()
-        logger.info(f"📊 Added pair: {pair_name} ({category})")
+        
+        # Load category thresholds
+        from src.strategies.stat_arb_config import get_thresholds
+        thresholds = get_thresholds(category or "crypto")
+        self.min_data_points = max(self.min_data_points, thresholds.get("min_data_points", 30))
+        
+        logger.info(f"📊 Added pair: {pair_name} ({category}) | Min Points: {self.min_data_points}")
 
     def _resolve_pair_group(self, pair_name: str) -> str:
         return self.pair_groups.get(pair_name, "DEFAULT")
@@ -604,7 +612,13 @@ class EnhancedStatArbStrategy:
         # Base size: $50, Max size: $100
         base_size = 50
         size_multiplier = 1 + confidence  # 1.0 to 2.0
-        position_size = Decimal(str(min(base_size * size_multiplier, 100)))
+        final_size = base_size * size_multiplier
+        
+        # Apply Global Risk Manager
+        if hasattr(self, 'risk_manager') and self.risk_manager:
+            final_size = self.risk_manager.calculate_trade_size(final_size, confidence=confidence)
+            
+        position_size = Decimal(str(min(final_size, 100)))
 
         return TradingSignal(
             pair_name=pair_name,

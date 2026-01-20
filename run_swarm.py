@@ -27,12 +27,15 @@ from src.core.structured_logger import setup_logging, StructuredLogger
 from src.core.health_monitor import get_health_monitor, record_heartbeat
 from src.core.status_reporter import StatusReporter # Added Producer
 from src.core.market_specialist import MarketSpecialist
+from src.core.global_risk_manager import GlobalRiskManager
+from src.core.trade_repository import TradeRepository
+from src.core.dashboard_api import start_dashboard_api, set_swarm_system
 
 # Strategies & Agents
 from src.news.news_scalper_optimized import OptimizedNewsScalper
 from src.strategies.stat_arb_enhanced import EnhancedStatArbStrategy
 from src.strategies.elite_mimic import EliteMimicAgent
-from src.strategies.arbitrage import ArbitrageStrategy
+from src.strategies.arbitrage_v2 import PureArbitrageV2
 from src.strategies.trend_follower import SmartTrendFollower
 from src.strategies.liquidity_sniper import LiquiditySniper
 
@@ -49,7 +52,11 @@ class SwarmSystem:
         self.client = PolyClient()
         self.client.signal_bus = self.bus
         self.client.swarm_system = self # Link back for reporting (Fix for dashboard trade counts)
-        self.pnl_tracker = PnLTracker()
+        
+        # Trade Persistence (Phase 4.3)
+        self.trade_repository = TradeRepository()
+        self.pnl_tracker = PnLTracker(trade_repository=self.trade_repository)
+        
         self.delta_tracker = DeltaTracker(self.bus, delta_limits=self.config.DELTA_LIMITS)
         self.budget_manager = None
         self.notifier = None
@@ -58,6 +65,9 @@ class SwarmSystem:
         
         # Dashboard Reporter
         self.status_reporter = StatusReporter()
+        
+        # New: Global Risk Manager
+        self.risk_manager = GlobalRiskManager()
         
         # Market Specialist (The "Brain" that learns from backtests)
         self.market_specialist = MarketSpecialist()
@@ -124,6 +134,16 @@ class SwarmSystem:
              logger.error(f"❌ Redis Connection Failed: {e}")
              self.redis = None
 
+        # 0.2 PostgreSQL Trade Repository Connection (Phase 4.3)
+        try:
+            pg_connected = await self.trade_repository.connect()
+            if pg_connected:
+                logger.info("✅ PostgreSQL Trade Repository connected")
+            else:
+                logger.warning("⚠️ PostgreSQL not available - using CSV fallback for trade persistence")
+        except Exception as e:
+            logger.warning(f"⚠️ PostgreSQL connection failed: {e}")
+
         # Start notifier polling in background (non-blocking)
         if self.notifier.enabled:
             self.notifier_task = asyncio.create_task(self.notifier.start_polling())
@@ -152,6 +172,10 @@ class SwarmSystem:
 
         self.budget_manager = BudgetManager(total_capital=initial_capital)
         
+        # Inject dependencies into Risk Manager
+        self.risk_manager.set_dependencies(self.pnl_tracker, self.delta_tracker, self.bus)
+        self.risk_manager.start_of_day_equity = initial_capital
+        
         # 1. News Scalper
         self.news_agent = OptimizedNewsScalper(
             news_api_key=os.getenv("NEWS_API_KEY"),
@@ -167,7 +191,8 @@ class SwarmSystem:
             swarm_system=self,
             delta_tracker=self.delta_tracker,
             market_specialist=self.market_specialist,
-            redis_client=self.redis # Inject Redis
+            redis_client=self.redis,
+            risk_manager=self.risk_manager
         )
         
         # 1.1 Liquidity Sniper (Helper for News)
@@ -177,8 +202,10 @@ class SwarmSystem:
         self.stat_arb_agent = EnhancedStatArbStrategy(
             client=self.client,
             budget_manager=self.budget_manager,
+            signal_bus=self.bus,
             pnl_tracker=self.pnl_tracker,
-            delta_tracker=self.delta_tracker
+            delta_tracker=self.delta_tracker,
+            risk_manager=self.risk_manager
         )
 
         # Load pairs from config
@@ -202,12 +229,16 @@ class SwarmSystem:
             swarm_system=self
         )
 
-        # 4. Pure Arb
-        self.arb_agent = ArbitrageStrategy(
+        # 4. Pure Arb V2 (Crypto 15min Optimized)
+        self.arb_agent = PureArbitrageV2(
             client=self.client, 
-            gamma_client=self.gamma_client, # 🎯 Inject Gamma Client
+            gamma_client=self.gamma_client, 
             signal_bus=self.bus, 
-            budget_manager=self.budget_manager
+            budget_manager=self.budget_manager,
+            min_profit=0.010, # 1.0% Threshold
+            default_trade_size=50.0,
+            risk_manager=self.risk_manager,
+            pnl_tracker=self.pnl_tracker # Phase 4.3
         )
         self.arb_agent.notifier = self.notifier
 
@@ -237,6 +268,25 @@ class SwarmSystem:
         self.notifier.register_command("/pnl", self.handle_pnl)
         self.notifier.register_command("/risk", self.handle_risk)
         self.notifier.register_command("/liquidate", self.handle_liquidate)
+        self.notifier.register_command("/panic", self.handle_panic)
+        self.notifier.register_command("/unpanic", self.handle_unpanic)
+        
+        # Register Command Menu with Telegram
+        menu_commands = [
+            {"command": "status", "description": "전체 시스템 상태 및 에이전트 활성 수 확인"},
+            {"command": "pnl", "description": "금일 수익 현황 요약"},
+            {"command": "risk", "description": "글로벌 리스크 배수(Multiplier) 조정"},
+            {"command": "panic", "description": "비상 정지 (회로 차단기 활성화)"},
+            {"command": "unpanic", "description": "비상 정지 해제"},
+            {"command": "stop", "description": "자동 거래 일시 정지 (Dry Run)"},
+            {"command": "resume", "description": "자동 거래 재개"},
+            {"command": "history", "description": "최근 거래 내역 확인"},
+            {"command": "liquidate", "description": "포지션 청산"},
+            {"command": "help", "description": "도움말 보기"}
+        ]
+        asyncio.create_task(self.notifier.set_my_commands(menu_commands))
+
+        logger.info("✅ Telegram Commands Registered: /help, /status, /stop, /resume, /history, /top, /pnl, /risk, /liquidate, /panic, /unpanic")
 
     async def handle_help(self, text):
         msg = (
@@ -249,6 +299,11 @@ class SwarmSystem:
             "• /stop - Pause all automated trading\n"
             "• /resume - Re-enable automated trading\n"
             "• /pnl - Check daily profit/loss\n\n"
+            "*Risk Management:*\n"
+            "• /risk <low|mid|high|yolo> - Adjust global risk multiplier\n"
+            "• /panic - Activate global circuit breaker (stop all trading)\n"
+            "• /unpanic - Deactivate global circuit breaker\n"
+            "• /liquidate <token_id|all> - Close positions\n\n"
             "*Info:*\n"
             "• /help - Show this manual\n\n"
             "Keep hunting for that alpha! 🚀"
@@ -530,7 +585,7 @@ class SwarmSystem:
         msg = "📜 *Recent Trade History*\n\n"
         for t in self.trade_history[-5:]:
             pnl = f"({t['pnl']:+.2f}%)" if t.get('pnl') is not None else ""
-            msg += f"• {t['time']} | {t['side']} {t['token'][:10]}... | ${t['price']:.3f} {pnl}\n"
+            msg += f"• {t['time']} | {t['side']} {t['asset'][:10]}... | ${t['price']:.3f} {pnl}\n"
         
         await self.notifier.send_message(msg)
 
@@ -745,6 +800,8 @@ class SwarmSystem:
                 asyncio.create_task(self._swarm_heartbeat_task(), name="Heartbeat"),
                 asyncio.create_task(self._dashboard_ticker_task(), name="DashboardTicker"),
                 asyncio.create_task(self.liquidity_sniper.run(), name="LiquiditySniper"),
+                asyncio.create_task(self._global_risk_monitor(), name="GlobalRiskMonitor"),
+                asyncio.create_task(self._dashboard_api_task(), name="DashboardAPI"),
             ]
 
             # Add WebSocket task only if enabled
@@ -762,6 +819,57 @@ class SwarmSystem:
             raise
         finally:
             await self.shutdown()
+
+    async def _global_risk_monitor(self):
+        """Global safety watchdog (Phase 4.1)"""
+        logger.info("🛡️ Global Risk Watchdog standing by...")
+        while self.running:
+            try:
+                # 1. Check Global Drawdown and Exposure
+                is_safe = await self.risk_manager.check_global_safety()
+                
+                if not is_safe:
+                    logger.critical("🚨 SYSTEM ALERT: Global Risk Manager triggered Safety Halt!")
+                    if self.notifier and self.notifier.enabled:
+                        await self.notifier.send_message(
+                            "🚨 *CRITICAL: Circuit Breaker Activated*\nTrading halted due to excessive drawdown."
+                        )
+                
+                # 2. Dynamic Risk Adjustment based on Hive Mind
+                hot_tokens = await self.bus.get_hot_tokens(min_sentiment=0.8)
+                if len(hot_tokens) > 5:
+                    # Too much noise/frenzy, lower the risk multiplier
+                    if self.risk_manager.risk_multiplier > 0.15:
+                        await self.risk_manager.update_risk_level(0.15)
+                        logger.warning("📉 Market Frenzy detected: Lowering global risk multiplier to 0.15x")
+                elif len(hot_tokens) < 1:
+                    # Calm market, possible to restore risk level
+                    if self.risk_manager.risk_multiplier < 0.25:
+                        await self.risk_manager.update_risk_level(0.25)
+                        logger.info("📈 Market stabilized: Restoring global risk multiplier to 0.25x")
+
+            except Exception as e:
+                logger.error(f"Error in risk monitor loop: {e}")
+            
+            await asyncio.sleep(30) # Check every 30 seconds
+
+    async def _dashboard_api_task(self):
+        """Run Dashboard API server (Phase 4.4)"""
+        enable_dashboard = os.getenv("ENABLE_DASHBOARD_API", "true").lower() in ("true", "1", "yes")
+        if not enable_dashboard:
+            logger.info("📊 Dashboard API disabled (set ENABLE_DASHBOARD_API=true to enable)")
+            return
+        
+        try:
+            # Inject swarm system reference for data access
+            set_swarm_system(self)
+            self.start_time = datetime.now()  # Track uptime
+            
+            dashboard_port = int(os.getenv("DASHBOARD_API_PORT", "8080"))
+            logger.info(f"📊 Starting Dashboard API on port {dashboard_port}")
+            await start_dashboard_api(self, port=dashboard_port)
+        except Exception as e:
+            logger.error(f"❌ Dashboard API failed: {e}")
 
     async def _daily_report_task(self):
         while self.running:
@@ -922,6 +1030,8 @@ class SwarmSystem:
             self.tasks.clear()
         
         if self.notifier_task:
+            if self.notifier:
+                await self.notifier.stop()
             with suppress(asyncio.CancelledError):
                 await self.notifier_task
             self.notifier_task = None

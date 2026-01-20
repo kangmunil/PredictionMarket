@@ -2,7 +2,7 @@ import asyncio
 import logging
 from typing import Dict, Any, Optional
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from src.core.config import Config
 
@@ -65,6 +65,7 @@ class SignalBus:
             "neutral": float(thresholds.get("neutral", 0.03)),
         }
         self.redis = None
+        self._panic_until = None  # datetime when panic mode expires
         logger.info("🧠 SignalBus (Hive Mind) Initialized")
 
     def set_redis(self, redis_client):
@@ -150,6 +151,10 @@ class SignalBus:
 
             logger.debug(f"🧠 Bus Updated [{source}] for {token_id[:10]}... | Sent:{signal.sentiment_score:.2f} Whale:{signal.whale_activity_score:.2f}")
             
+            # Check for global mode update
+            if source == 'RISK' and 'mode' in kwargs:
+                await self._set_global_mode(kwargs['mode'])
+            
             # Persist to Redis
             asyncio.create_task(self._persist_signal(token_id))
 
@@ -233,6 +238,30 @@ class SignalBus:
             k: v for k, v in self._signals.items() 
             if abs(v.sentiment_score) >= min_sentiment or v.whale_activity_score >= min_whale
         }
+
+    async def _set_global_mode(self, mode: str):
+        """Set the global market mode (NORMAL, BULL_FRENZY, PANIC_SELL)"""
+        async with self._lock:
+            old_mode = self._global_mode
+            self._global_mode = mode.upper()
+            if mode.upper() == "PANIC_SELL":
+                self._panic_until = datetime.now() + timedelta(minutes=30)
+            logger.warning(f"🌐 Global Mode Changed: {old_mode} → {self._global_mode}")
+
+    async def get_global_mode(self) -> str:
+        """Get current global mode"""
+        # Auto-expire panic mode
+        if self._panic_until and datetime.now() > self._panic_until:
+            self._global_mode = "NORMAL"
+            self._panic_until = None
+        return self._global_mode
+
+    def is_panic_mode(self) -> bool:
+        """Quick check for panic mode (sync for performance)"""
+        if self._panic_until and datetime.now() > self._panic_until:
+            self._global_mode = "NORMAL"
+            self._panic_until = None
+        return self._global_mode == "PANIC_SELL"
 
     async def get_spread_snapshot(
         self,

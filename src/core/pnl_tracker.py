@@ -38,7 +38,7 @@ class TradeExit:
     reason: str
 
 class PnLTracker:
-    def __init__(self):
+    def __init__(self, trade_repository=None):
         self.active_trades: Dict[str, TradeEntry] = {}
         self.history: List[Dict] = []
         self.total_realized_pnl = 0.0
@@ -48,6 +48,7 @@ class PnLTracker:
             "elitemimic": 0.0,
             "news_scalper": 0.0
         }
+        self.trade_repository = trade_repository  # PostgreSQL persistence (optional)
 
     def record_entry(self, strategy: str, token_id: str, side: str, price: float, size: float) -> str:
         """
@@ -144,6 +145,12 @@ class PnLTracker:
             f"Exit: ${exit_price:.3f} | Net P&L: ${net_pnl:+.4f} ({pnl_percent:+.2f}%) "
             f"| Reason: {reason} | Total: ${self.total_realized_pnl:+.2f}"
         )
+        
+        # Persist to PostgreSQL (Phase 4.3)
+        if self.trade_repository:
+            import asyncio
+            asyncio.create_task(self.trade_repository.save_trade(record))
+        
         return net_pnl
 
     def calculate_unrealized_pnl(self, current_prices: Dict[str, float]) -> float:

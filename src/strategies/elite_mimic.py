@@ -23,12 +23,14 @@ class EliteMimicAgent:
         self.signal_bus = signal_bus
         self.budget_manager = budget_manager
         self.swarm_system = swarm_system  # Link to central system for notifications
+        self.pnl_tracker = getattr(swarm_system, 'pnl_tracker', None)
+        self.positions = {} # token_id -> {entry_price, size, tid}
 
         self._signal_history: Dict[str, datetime] = {}
         self._signal_cooldown = timedelta(
             minutes=float(getattr(self.config, "MIMIC_SIGNAL_COOLDOWN_MINUTES", 10) or 10)
         )
-        self._min_signal_score = float(getattr(self.config, "MIMIC_MIN_SIGNAL_SCORE", 0.50) or 0.50)
+        self._min_signal_score = float(getattr(self.config, "MIMIC_MIN_SIGNAL_SCORE", 0.40) or 0.40)
         self._max_position_usd = getattr(self.config, "MAX_POSITION_SIZE", 10.0)
         self._signal_poll_interval = int(getattr(self.config, "MIMIC_SIGNAL_POLL_SECONDS", 30) or 30)
 
@@ -209,6 +211,15 @@ class EliteMimicAgent:
                 condition_id="",
                 brain_score=intensity
             )
+
+        # 🚀 PnL Tracker Logic (Mirror trades as Entries/Exits)
+        if self.pnl_tracker:
+            if side == "BUY":
+                tid = self.pnl_tracker.record_entry("elitemimic", token_id, "BUY", 0.5, size) # Dry price 0.5
+                self.positions[token_id] = {"tid": tid, "size": size}
+            elif side == "SELL" and token_id in self.positions:
+                pos = self.positions.pop(token_id)
+                self.pnl_tracker.record_exit(pos["tid"], 0.52, reason="Mimic Match Sell")
 
         if allocation_id:
             await self.budget_manager.release_allocation("elitemimic", allocation_id, actual_spent)

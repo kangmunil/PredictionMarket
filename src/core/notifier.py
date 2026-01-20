@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime
 from typing import Optional, Dict, List, Callable, Any
 from decimal import Decimal
+from contextlib import suppress
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,8 @@ class TelegramNotifier:
         # Rate Limiting
         self._msg_queue = asyncio.Queue()
         self._worker_task = None
+        self._polling_task = None
+        self._stop_event = asyncio.Event()
         
         if self.enabled:
             logger.info("📱 Telegram Notifier V2 Enabled (HTML Mode + Rate Limiting)")
@@ -34,6 +37,24 @@ class TelegramNotifier:
         """Register a command handler (e.g. /status)"""
         self.commands[command] = handler
         logger.info(f"⌨️ Registered Telegram command: {command}")
+
+    async def set_my_commands(self, commands: List[Dict[str, str]]):
+        """
+        Register commands with Telegram Bot API for auto-completion menu.
+        commands = [{"command": "status", "description": "Check system status"}, ...]
+        """
+        if not self.enabled: return
+
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"{self.base_url}/setMyCommands",
+                    json={"commands": commands},
+                    timeout=10
+                )
+            logger.info("✅ Telegram Command Menu updated")
+        except Exception as e:
+            logger.error(f"Failed to set Telegram commands: {e}")
 
     async def start_polling(self):
         """Message polling loop + Queue Worker"""
@@ -46,7 +67,8 @@ class TelegramNotifier:
         logger.info("👂 Telegram Listener Active...")
         # startup message moved to orchestrator to avoid duplication
         
-        while True:
+        self._polling_task = asyncio.current_task()
+        while not self._stop_event.is_set():
             try:
                 async with httpx.AsyncClient() as client:
                     resp = await client.get(
@@ -54,6 +76,8 @@ class TelegramNotifier:
                         params={"offset": self.last_update_id + 1, "timeout": 30},
                         timeout=35
                     )
+                
+                if self._stop_event.is_set(): break
                 if resp.status_code != 200:
                     self._poll_error_streak += 1
                     preview = resp.text[:200] if hasattr(resp, "text") else ""
@@ -275,3 +299,16 @@ class TelegramNotifier:
             f"📊 *New Balance:* Updating..."
         )
         await self.send_message(text, use_menu=True)
+
+    async def stop(self):
+        """Stop polling and worker tasks"""
+        logger.info("🛑 Stopping Telegram Notifier...")
+        self._stop_event.set()
+        
+        if self._worker_task:
+            self._worker_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._worker_task
+            self._worker_task = None
+
+        logger.info("✅ Telegram Notifier stopped.")

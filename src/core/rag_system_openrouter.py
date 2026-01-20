@@ -188,15 +188,14 @@ class OpenRouterRAGSystem:
         logger.info(f"   Embedding Model: {self.embedding_model}")
         self._bg_tasks: set[asyncio.Task] = set()
 
-    def _schedule_supabase_write(self, func: Callable[[], None], description: str) -> None:
+    async def _schedule_supabase_write_async(self, func: Callable[[], None], description: str, await_completion: bool = False) -> None:
         """
-        Execute Supabase writes off the critical path so trading logic
-        doesn't wait on network latency.
+        Execute Supabase writes off the critical path, but allow for 
+        awaiting when order is critical (e.g. news event before analysis).
         """
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # No running loop; execute synchronously as a fallback
             try:
                 func()
             except Exception as exc:
@@ -213,6 +212,40 @@ class OpenRouterRAGSystem:
         task = loop.create_task(_runner())
         self._bg_tasks.add(task)
         task.add_done_callback(lambda t: self._bg_tasks.discard(t))
+        
+        if await_completion:
+            await task
+
+    def _schedule_supabase_write(self, func: Callable[[], None], description: str) -> None:
+        """Legacy non-async wrapper for backward compatibility."""
+        asyncio.create_task(self._schedule_supabase_write_async(func, description))
+
+    async def _call_openrouter_with_fallback(self, model: str, messages: List[Dict], **kwargs) -> any:
+        """
+        Call OpenRouter with automatic fallback to deepseek-v3.2 on 429.
+        """
+        try:
+            return await self.openrouter_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                **kwargs
+            )
+        except Exception as e:
+            # Check for 429 (Rate Limit)
+            error_msg = str(e).lower()
+            if "429" in error_msg or "rate limit" in error_msg:
+                fallback_model = "deepseek/deepseek-v3.2"
+                logger.warning(f"🔄 [FALLBACK] Rate limit hit on {model}. Retrying with {fallback_model}...")
+                
+                # Update temperature for consistency if needed
+                kwargs['temperature'] = kwargs.get('temperature', 0.1)
+                
+                return await self.openrouter_client.chat.completions.create(
+                    model=fallback_model,
+                    messages=messages,
+                    **kwargs
+                )
+            raise # Re-raise if not 429
 
     async def close(self):
         """Close network clients and flush pending Supabase writes."""
@@ -338,7 +371,7 @@ class OpenRouterRAGSystem:
         Uses fast, cheap model for simple extraction task.
         """
         try:
-            response = await self.openrouter_client.chat.completions.create(
+            response = await self._call_openrouter_with_fallback(
                 model=self.entity_model,
                 messages=[
                     {
@@ -359,10 +392,17 @@ class OpenRouterRAGSystem:
 
             content = response.choices[0].message.content
 
+            # Robust cleaning for reasoning models
+            content = re.sub(r'<(?:think|thought)>.*?</(?:think|thought)>', '', content, flags=re.DOTALL | re.IGNORECASE).strip()
+
             # Clean markdown code blocks if present
             if "```" in content:
                 # Remove ```json and ``` or just ```
-                content = content.replace("```json", "").replace("```", "").strip()
+                json_block_match = re.search(r'```(?:json)?\s*(\[.*?\]|\{.*?\})\s*```', content, re.DOTALL)
+                if json_block_match:
+                    content = json_block_match.group(1).strip()
+                else:
+                    content = content.replace("```json", "").replace("```", "").strip()
 
             # Try to parse as JSON
             try:
@@ -414,9 +454,9 @@ class OpenRouterRAGSystem:
 
     async def store_news_event(self, event: NewsEvent):
         """Store news event in ChromaDB and Supabase"""
-        try:
-            # Store in ChromaDB (if available)
-            if self.chroma_available:
+        # 1. Store in ChromaDB (Optional/Best Effort)
+        if self.chroma_available:
+            try:
                 embedding = await self.generate_embedding(
                     f"{event.title}\n\n{event.content}"
                 )
@@ -436,7 +476,11 @@ class OpenRouterRAGSystem:
                     ],
                     ids=[event.event_id]
                 )
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to store event in ChromaDB: {e}")
 
+        # 2. Store in Supabase (Primary Database)
+        try:
             payload = {
                 'event_id': event.event_id,
                 'title': event.title,
@@ -452,12 +496,12 @@ class OpenRouterRAGSystem:
             def _write_event():
                 self.supabase.table('news_events').upsert(payload).execute()
 
-            self._schedule_supabase_write(_write_event, "news_events.upsert")
-
-            logger.debug(f"✅ Stored event: {event.title[:50]}...")
+            # CRITICAL: Await completion here because market_analyses depends on this event_id
+            await self._schedule_supabase_write_async(_write_event, "news_events.upsert", await_completion=True)
+            logger.debug(f"✅ Stored event in Supabase: {event.title[:50]}...")
 
         except Exception as e:
-            logger.error(f"Failed to store event: {e}")
+            logger.error(f"❌ Failed to store event in Supabase: {e}")
 
     async def find_similar_events(
         self,
@@ -588,8 +632,8 @@ Determine the new fair probability given this information.
 4. **Inefficiency Assumption**: Assume the prediction market is inefficient and slow to react. If the news is material, PREDICT A PRICE SHIFT.
 
 **Noise Filtering:**
-- IGNORE news about "Polymarket Traders", "Betting Volume", or "Whales". These are market internal noise, not fundamental signals. If the news is just "Trader bets $100k", recommend "hold".
-- FOCUS on Real World Events (polls, court rulings, official statements, data releases).
+- GENERALLY IGNORE minor "Polymarket Traders" or "Betting Volume" news unless it indicates a massive, market-moving capital flow (Whale activity > $500k) or extreme sentiment shift.
+- FOCUS on Real World Events (polls, court rulings, official statements), but also consider major institutional moves or significant whale positioning if they drive price.
 
 **Output Format (JSON Only):**
 {{
@@ -636,7 +680,7 @@ Determine the new fair probability given this information.
         try:
             logger.info(f"🎯 Running market analysis with premium model: {self.analysis_model}")
 
-            response = await self.openrouter_client.chat.completions.create(
+            response = await self._call_openrouter_with_fallback(
                 model=self.analysis_model,
                 messages=[
                     {
@@ -654,17 +698,25 @@ Determine the new fair probability given this information.
 
             content = response.choices[0].message.content.strip()
 
-            # Robust JSON Parsing
+            # Robust JSON Parsing (Handles reasoning models like DeepSeek R1)
             try:
-                # 1. Try direct parse
-                result = json.loads(content)
-            except json.JSONDecodeError:
-                # 2. Try regex extraction
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if json_match:
-                    result = json.loads(json_match.group(0))
-                else:
-                    raise ValueError(f"Could not parse JSON from: {content[:100]}...")
+                # Pre-process: Remove <think> or <thought> blocks
+                clean_content = re.sub(r'<(?:think|thought)>.*?</(?:think|thought)>', '', content, flags=re.DOTALL | re.IGNORECASE).strip()
+                
+                # 1. Try direct parse on cleaned content
+                try:
+                    result = json.loads(clean_content)
+                except json.JSONDecodeError:
+                    # 2. Try regex extraction from cleaned content
+                    json_match = re.search(r'\{.*\}', clean_content, re.DOTALL)
+                    if json_match:
+                        result = json.loads(json_match.group(0))
+                    else:
+                        raise ValueError(f"Could not parse JSON from: {clean_content[:100]}...")
+            except Exception as e:
+                logger.error(f"❌ Impact analysis parsing failed: {e}")
+                logger.debug(f"Raw content: {content}")
+                raise
 
             suggested_price = Decimal(str(result.get('suggested_price', current_price)))
             confidence = float(result.get('confidence', 0.0))
@@ -771,7 +823,7 @@ Return a JSON object:
 }}
 """
         try:
-            response = await self.openrouter_client.chat.completions.create(
+            response = await self._call_openrouter_with_fallback(
                 model=self.validator_model,
                 messages=[
                     {
@@ -791,8 +843,8 @@ Return a JSON object:
             
             # JSON extraction (Highly Robust for Reasoning Models)
             try:
-                # Pre-process: Remove <thought> blocks if present
-                clean_content = re.sub(r'<thought>.*?</thought>', '', content, flags=re.DOTALL | re.IGNORECASE).strip()
+                # Pre-process: Remove <think> or <thought> blocks if present
+                clean_content = re.sub(r'<(?:think|thought)>.*?</(?:think|thought)>', '', content, flags=re.DOTALL | re.IGNORECASE).strip()
                 
                 # 1. Try to find JSON block in markdown
                 result = None

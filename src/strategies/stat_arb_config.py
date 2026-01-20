@@ -192,18 +192,43 @@ CANDIDATE_PAIRS = [
     {
         "name": "XRP_SEC_Lawsuit_Outcome",
         "description": "XRP price vs SEC lawsuit resolution",
-        "token_a": {
-            "condition_id": "",
-            "search_query": "XRP price 2025"
-        },
-        "token_b": {
-            "condition_id": "",
-            "search_query": "Ripple SEC lawsuit win"
-        },
+        "token_a": {"condition_id": "", "search_query": "XRP price 2025"},
+        "token_b": {"condition_id": "", "search_query": "Ripple SEC lawsuit win"},
         "category": "crypto",
         "reason": "Direct legal impact on XRP valuation",
         "expected_correlation": 0.85,
         "priority": "medium"
+    },
+    # ========== NEW: EXPANDED PAIRS (Phase 3.1) ==========
+    {
+        "name": "BTC_Dom_Eth_Strength",
+        "description": "Bitcoin dominance vs Ethereum market share",
+        "token_a": {"condition_id": "", "search_query": "Bitcoin Dominance"},
+        "token_b": {"condition_id": "", "search_query": "Ethereum Market Share"},
+        "category": "crypto",
+        "reason": "Inverse relationship in alt-season",
+        "expected_correlation": -0.75,
+        "priority": "high"
+    },
+    {
+        "name": "Fed_Rate_BTC_Sensitivity",
+        "description": "Fed rates vs Bitcoin price",
+        "token_a": {"condition_id": "", "search_query": "Fed rate cut"},
+        "token_b": {"condition_id": "", "search_query": "Bitcoin price"},
+        "category": "economics",
+        "reason": "BTC as liquidity proxy",
+        "expected_correlation": -0.55,
+        "priority": "medium"
+    },
+    {
+        "name": "Solana_Mobile_Saga_Sales",
+        "description": "SOL price vs Saga phone adoption",
+        "token_a": {"condition_id": "", "search_query": "Solana price"},
+        "token_b": {"condition_id": "", "search_query": "Saga phone sales"},
+        "category": "tech",
+        "reason": "Ecosystem hardware synergy",
+        "expected_correlation": 0.60,
+        "priority": "low"
     }
 ]
 
@@ -213,7 +238,7 @@ CATEGORY_THRESHOLDS = {
     "crypto": {
         "min_correlation": 0.75,
         "max_cointegration_pvalue": 0.10,
-        "min_data_points": 10,
+        "min_data_points": 30, # Reduced from 50 (Phase 3.2)
         "entry_z_threshold": 1.5
     },
     "politics": {
