@@ -20,6 +20,7 @@ import logging
 from typing import Optional, Dict
 from decimal import Decimal
 from datetime import datetime
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +39,36 @@ class BudgetManager:
         self.allocations: Dict[str, Tuple[Decimal, str]] = {} 
         self.locked_funds = Decimal("0") # Total currently allocated
         self._lock = asyncio.Lock()
+        # Strategy Weights (Task 11: Multi-Strategy Weighting)
+        # Default allocation caps
+        self.strategy_weights = {
+            "news_scalper": Decimal("0.40"),
+            "statarb": Decimal("0.35"),
+            "elitemimic": Decimal("0.25")
+        }
+        
+        # Load min order value
+        self.min_order_value = Decimal(str(os.getenv("MIN_ORDER_VALUE_USD", "1.0")))
         
         logger.info(f"💰 BudgetManager initialized with Unified Pool: ${self.total_capital:.2f}")
+        logger.info(f"⚖️  Weights: News={self.strategy_weights['news_scalper']:.0%}, StatArb={self.strategy_weights['statarb']:.0%}, Mimic={self.strategy_weights['elitemimic']:.0%}")
+
+    @property
+    def is_low_capital(self) -> bool:
+        """Check if available capital is below minimum order size"""
+        return (self.total_capital - self.locked_funds) < self.min_order_value
+
+    async def sync_with_real_pnl(self, realized_pnl: float, base_equity: float):
+        """
+        Synchronize total capital based on actual realized PnL.
+        Total Capital = Base Equity + Realized PnL
+        """
+        async with self._lock:
+            old_capital = self.total_capital
+            self.total_capital = Decimal(str(base_equity)) + Decimal(str(realized_pnl))
+            
+            if self.total_capital != old_capital:
+                logger.info(f"🔄 Budget Sync: ${old_capital:.2f} -> ${self.total_capital:.2f} (PnL: ${realized_pnl:+.2f})")
 
     async def connect(self):
         """Mock method for compatibility"""
@@ -64,7 +93,21 @@ class BudgetManager:
             if available_funds < 0:
                 available_funds = Decimal("0")
 
-            # 2. Check Affordability
+            # 2. Weighted Cap Check (Task 11)
+            strategy_weight = self.strategy_weights.get(strategy, Decimal("0.1"))
+            # For News Scalper, we might call it 'news_scalper' or 'arbhunter' (legacy)
+            if strategy == "arbhunter": strategy_weight = self.strategy_weights.get("news_scalper")
+            
+            strategy_cap = self.total_capital * strategy_weight
+            
+            # Calculate current usage for this strategy
+            current_usage = sum(amt for amt, s in self.allocations.values() if s == strategy or (s == "arbhunter" and strategy == "news_scalper"))
+            
+            if current_usage + amount > strategy_cap and priority != "high":
+                logger.warning(f"⚠️  {strategy} cap reached (${strategy_cap:.2f}). Denying normal priority request.")
+                return None
+
+            # 3. Check Affordability
             if amount > available_funds:
                 logger.warning(f"❌ Allocation Denied ({strategy}): Requested ${amount:.2f} > Avail ${available_funds:.2f}")
                 return None

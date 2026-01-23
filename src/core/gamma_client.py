@@ -9,6 +9,8 @@ from src.core.health_monitor import PROM_API_REQUESTS, PROM_API_ERRORS, PROM_LAT
 from .polymarket_mcp_client import get_default_mcp_client, PolymarketMCPClient
 from .market_registry import market_registry
 
+from .config import Config
+
 logger = logging.getLogger(__name__)
 
 class GammaClient:
@@ -19,7 +21,8 @@ class GammaClient:
     """
     BASE_URL = "https://gamma-api.polymarket.com"
 
-    def __init__(self, use_mcp: Optional[bool] = None):
+    def __init__(self, use_mcp: Optional[bool] = None, config: Optional[Config] = None):
+        self.config = config or Config()
         # Auto-enable MCP if URL configured
         if use_mcp is None:
             use_mcp = bool(os.getenv("POLYMARKET_MCP_URL"))
@@ -27,49 +30,71 @@ class GammaClient:
         self._mcp_client: Optional[PolymarketMCPClient] = None
         self._session: Optional[aiohttp.ClientSession] = None
 
-    async def get_active_markets(self, limit=50, volume_min=1000, max_hours_to_close: Optional[int] = None):
+    async def get_active_markets(self, limit=None, volume_min=1000, max_hours_to_close: Optional[int] = None, order: str = "volume"):
         """
         Fetch active markets with significant volume.
         Query: Active, sorted by volume desc.
         """
+        if limit is None:
+            limit = self.config.GLOBAL_MONITOR_LIMIT
+            
         PROM_API_REQUESTS.labels(service="gamma").inc()
         start_time = time.time()
         
+        all_markets = []
+        current_offset = 0
+        max_batch_size = self.config.DISCOVERY_BATCH_SIZE
+        
+        # 1. Try MCP first (Higher speed)
         if await self._maybe_init_mcp():
             res = await self._get_active_markets_via_mcp(limit, volume_min, max_hours_to_close)
-            PROM_LATENCY.labels(service="gamma_mcp").observe(time.time() - start_time)
-            return res
-
-        url = f"{self.BASE_URL}/markets"
-        params = {
-            "active": "true",
-            "closed": "false",
-            "order": "volume",
-            "ascending": "false",
-            "limit": limit,
-            "offset": 0
-        }
-
-        session = await self._ensure_session()
-        try:
-            async with session.get(url, params=params) as resp:
-                PROM_LATENCY.labels(service="gamma").observe(time.time() - start_time)
-                if resp.status == 200:
-                    data = await resp.json()
-                    for market in data:
-                        market_registry.register_market(market)
-                    markets = [m for m in data if float(m.get('volume', 0)) >= volume_min]
-                    if max_hours_to_close:
-                        markets = [m for m in markets if self._within_hours(m, max_hours_to_close)]
-                    return markets
-                else:
-                    PROM_API_ERRORS.labels(service="gamma", error_type=str(resp.status)).inc()
-                    logger.error(f"Gamma API Error: {resp.status}")
-                    return []
-        except Exception as e:
-            PROM_API_ERRORS.labels(service="gamma", error_type="exception").inc()
-            logger.error(f"Gamma Fetch Error: {e}")
-            return []
+            all_markets = res
+        else:
+            # 2. Fallback to Paginated Gamma API
+            session = await self._ensure_session()
+            while len(all_markets) < limit:
+                batch_limit = min(max_batch_size, limit - len(all_markets))
+                url = f"{self.BASE_URL}/markets"
+                params = {
+                    "active": "true",
+                    "closed": "false",
+                    "order": order,
+                    "ascending": "false",
+                    "limit": batch_limit,
+                    "offset": current_offset
+                }
+                
+                try:
+                    async with session.get(url, params=params) as resp:
+                        PROM_LATENCY.labels(service="gamma").observe(time.time() - start_time)
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if not data:
+                                break # No more markets
+                                
+                            for market in data:
+                                market_registry.register_market(market)
+                                
+                            # Filter and add
+                            filtered = [m for m in data if float(m.get('volume', 0)) >= volume_min]
+                            if max_hours_to_close:
+                                filtered = [m for m in filtered if self._within_hours(m, max_hours_to_close)]
+                            
+                            all_markets.extend(filtered)
+                            current_offset += len(data) # Move offset by actual results received
+                            
+                            if len(data) < batch_limit:
+                                break # End of results
+                        else:
+                            PROM_API_ERRORS.labels(service="gamma", error_type=str(resp.status)).inc()
+                            logger.error(f"Gamma API Error: {resp.status}")
+                            break
+                except Exception as e:
+                    PROM_API_ERRORS.labels(service="gamma", error_type="exception").inc()
+                    logger.error(f"Gamma Fetch Error: {e}")
+                    break
+        
+        return all_markets[:limit]
 
     async def search_markets(self, query: str, limit: int = 10) -> list:
         """
@@ -105,6 +130,57 @@ class GammaClient:
         except Exception as e:
             PROM_API_ERRORS.labels(service="gamma_search", error_type="exception").inc()
             logger.error(f"Gamma Search Error: {e}")
+            return []
+
+    async def get_market(self, condition_id: str) -> Optional[dict]:
+        """Fetch a single market by condition ID."""
+        PROM_API_REQUESTS.labels(service="gamma_get_market").inc()
+        url = f"{self.BASE_URL}/markets"
+        params = {"condition_id": condition_id}
+        
+        session = await self._ensure_session()
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        market = data[0]
+                        market_registry.register_market(market)
+                        return market
+                return None
+        except Exception as e:
+            logger.error(f"Gamma GetMarket Error: {e}")
+            return None
+
+    async def get_price_markets_by_tag(self, tag_id: int, limit: int = 50) -> List[dict]:
+        """
+        Fetch markets by tag ID.
+        """
+        PROM_API_REQUESTS.labels(service="gamma_tag").inc()
+        start_time = time.time()
+        
+        # We don't have an MCP specialized for tags yet, use direct API
+        url = f"{self.BASE_URL}/markets"
+        params = {
+            "active": "true",
+            "closed": "false",
+            "limit": limit,
+            "tag_id": tag_id,
+        }
+
+        session = await self._ensure_session()
+        try:
+            async with session.get(url, params=params) as resp:
+                PROM_LATENCY.labels(service="gamma_tag").observe(time.time() - start_time)
+                if resp.status == 200:
+                    data = await resp.json()
+                    for market in data:
+                        market_registry.register_market(market)
+                    return data
+                return []
+        except Exception as e:
+            PROM_API_ERRORS.labels(service="gamma_tag", error_type="exception").inc()
+            logger.error(f"Gamma Tag Fetch Error: {e}")
             return []
 
     async def _maybe_init_mcp(self) -> bool:
@@ -177,6 +253,7 @@ class GammaClient:
         except Exception:
             return False
 
+
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
@@ -186,15 +263,3 @@ class GammaClient:
         if self._session and not self._session.closed:
             await self._session.close()
             logger.info("✅ GammaClient session closed")
-
-    def _within_hours(self, market: dict, max_hours: int) -> bool:
-        ends_at = market.get("ends_at")
-        if not ends_at:
-            return False
-        try:
-            if ends_at.endswith("Z"):
-                ends_at = ends_at.replace("Z", "+00:00")
-            end_dt = datetime.fromisoformat(ends_at)
-            return datetime.now(end_dt.tzinfo or None) < end_dt <= datetime.now(end_dt.tzinfo or None) + timedelta(hours=max_hours)
-        except Exception:
-            return False

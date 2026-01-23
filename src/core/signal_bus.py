@@ -232,6 +232,37 @@ class SignalBus:
             return MarketSignal(token_id=token_id) # 빈 신호 반환
         return self._signals[token_id]
 
+    async def prune_stale_signals(self, max_age_hours: int = 24, max_signals: int = 3000):
+        """
+        Remove old signals to prevent memory bloat.
+        1. Remove signals older than max_age_hours.
+        2. If count > max_signals, remove oldest signals.
+        """
+        async with self._lock:
+            now = datetime.now()
+            initial_count = len(self._signals)
+            
+            # 1. Prune by Age
+            expiry_threshold = now - timedelta(hours=max_age_hours)
+            self._signals = {
+                tid: sig for tid, sig in self._signals.items()
+                if sig.last_updated > expiry_threshold
+            }
+            
+            # 2. Prune by Capacity (Cap to max_signals)
+            if len(self._signals) > max_signals:
+                # Sort by last_updated and keep the most recent ones
+                sorted_signals = sorted(
+                    self._signals.items(),
+                    key=lambda item: item[1].last_updated,
+                    reverse=True
+                )
+                self._signals = dict(sorted_signals[:max_signals])
+            
+            final_count = len(self._signals)
+            if initial_count != final_count:
+                logger.info(f"🧹 SignalBus Pruned: {initial_count} -> {final_count} signals (Age > {max_age_hours}h or Cap > {max_signals})")
+
     async def get_hot_tokens(self, min_sentiment: float = 0.6, min_whale: float = 0.5) -> Dict[str, MarketSignal]:
         """지금 가장 뜨거운(호재+고래) 토큰 목록 조회"""
         return {

@@ -87,16 +87,31 @@ class GlobalRiskManager(RiskManager):
                             await self.signal_bus.update_signal("GLOBAL", "RISK", mode="PANIC_SELL")
                     return False
 
-            # 2. Sector Concentration Check
-            if self.delta_tracker:
-                group_deltas = self.delta_tracker.get_group_snapshot()
-                for group, delta in group_deltas.items():
-                    # Simplified concentration: |Delta| / Equity
-                    concentration = abs(delta) / 1000.0 # Placeholder equity
+            # 2. Sector Concentration Check (Using PnLTracker for USD Exposure)
+            if self.pnl_tracker:
+                # Aggregate USD exposure per market group
+                sector_exposure = {}
+                total_exposure = 0.0
+                for trade in self.pnl_tracker.active_trades.values():
+                    group = trade.metadata.get('group', 'DEFAULT')
+                    sector_exposure[group] = sector_exposure.get(group, 0.0) + trade.size
+                    total_exposure += trade.size
+                
+                # Calculate NLV (Net Liquidation Value) = Cash + Current Exposure
+                # We use the maximum of start_of_day_equity (cash at start) and total current assets
+                # to prevent divide-by-zero or extreme concentration numbers.
+                assets_basis = max(self.start_of_day_equity, total_exposure)
+                equity_base = assets_basis if assets_basis > 0 else 1000.0
+                
+                # Check metrics
+                for group, exposure_usd in sector_exposure.items():
+                    concentration = exposure_usd / equity_base
                     if concentration > self.max_sector_exposure_pct:
-                        logger.warning(f"⚠️ High Concentration in {group}: {concentration:.1%}")
-                        # Could trigger a reduction signal here
-
+                        # Only log if genuinely concerning (> 120% leverage relative to total assets)
+                        if concentration > 1.2:
+                            logger.warning(f"⚠️ High Concentration in {group}: {concentration:.1%} (${exposure_usd:.2f} vs Basis ${equity_base:.2f})")
+                
+            # (Legacy DeltaTracker check removed to prevent false 1500% alarms)
             return not self.circuit_breaker_active
 
     async def set_circuit_breaker(self, active: bool):

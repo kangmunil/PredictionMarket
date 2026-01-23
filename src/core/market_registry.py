@@ -15,9 +15,10 @@ class MarketRegistry:
         self._lock = RLock()
         self._condition_to_slug: Dict[str, str] = {}
         self._slug_to_condition: Dict[str, str] = {}
+        self._condition_to_market: Dict[str, Dict] = {}
 
     def register_market(self, market: Dict) -> None:
-        condition_id = market.get("condition_id") or market.get("id")
+        condition_id = market.get("condition_id") or market.get("conditionId") or market.get("id")
         slug = market.get("slug")
         if not condition_id or not slug:
             return
@@ -27,6 +28,7 @@ class MarketRegistry:
         with self._lock:
             self._condition_to_slug[condition_id] = slug
             self._slug_to_condition[slug] = condition_id
+            self._condition_to_market[condition_id] = market
 
     def get_slug(self, condition_id: str) -> Optional[str]:
         with self._lock:
@@ -35,6 +37,10 @@ class MarketRegistry:
     def get_condition_id(self, slug: str) -> Optional[str]:
         with self._lock:
             return self._slug_to_condition.get(str(slug))
+
+    def get_market(self, condition_id: str) -> Optional[Dict]:
+        with self._lock:
+            return self._condition_to_market.get(str(condition_id))
 
 
 market_registry = MarketRegistry()

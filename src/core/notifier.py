@@ -68,7 +68,12 @@ class TelegramNotifier:
         # startup message moved to orchestrator to avoid duplication
         
         self._polling_task = asyncio.current_task()
+        loop_count = 0
         while not self._stop_event.is_set():
+            loop_count += 1
+            if loop_count % 5 == 0:
+                logger.info(f"🔄 Telegram Poll Heartbeat (Offset: {self.last_update_id + 1})")
+            
             try:
                 async with httpx.AsyncClient() as client:
                     resp = await client.get(
@@ -113,8 +118,10 @@ class TelegramNotifier:
         text = message.get("text", "")
         chat_id = str(message["chat"]["id"])
         
+        logger.info(f"📨 Received message: '{text}' from {chat_id}")
+
         if chat_id != str(self.chat_id).strip():
-            logger.warning(f"🚫 Unauthorized access from {chat_id}")
+            logger.warning(f"🚫 Unauthorized access from {chat_id} (Expected: {self.chat_id})")
             return
 
         if not text.startswith("/"):
@@ -123,19 +130,41 @@ class TelegramNotifier:
             return
 
         cmd = text.split()[0].lower()
+        logger.info(f"🔍 Dispatching command: {cmd}")
+        
         if cmd in self.commands:
-            await self.commands[cmd](text)
+            try:
+                await self.commands[cmd](text)
+                logger.info(f"✅ Executed command: {cmd}")
+            except Exception as e:
+                logger.exception(f"❌ Error executing command {cmd}: {e}")
+                await self.send_message(f"⚠️ Error executing {cmd}: {e}")
         else:
+            logger.warning(f"❓ Unknown command: {cmd}")
             await self.send_message(f"❓ Unknown command: {cmd}", use_menu=True)
 
     async def _handle_callback(self, query: Dict):
         """Handle inline button clicks"""
         data = query.get("data", "")
+        message = query.get("message", {})
+        chat_id = str(query["from"]["id"])
+        
+        logger.info(f"🔘 Received callback: '{data}' from {chat_id}")
+
+        if chat_id != str(self.chat_id).strip():
+            logger.warning(f"🚫 Unauthorized callback from {chat_id}")
+            return
+
         # Map callback data to commands
         if data.startswith("/"):
             if data in self.commands:
-                await self.commands[data]("")
+                try:
+                    await self.commands[data](data)
+                    logger.info(f"✅ Executed callback command: {data}")
+                except Exception as e:
+                    logger.exception(f"❌ Error executing callback {data}: {e}")
             else:
+                logger.warning(f"❓ Callback command {data} not registered.")
                 await self.send_message(f"Command {data} not registered.")
         
         # Acknowledge callback to stop loading spinner in UI
@@ -145,6 +174,25 @@ class TelegramNotifier:
                     "callback_query_id": query["id"]
                 })
         except: pass
+
+    async def edit_message(self, message_id: int, text: str, inline_keyboard: Any = None):
+        """Edit an existing message for live UI updates"""
+        if not self.enabled: return
+        
+        payload = {
+            "chat_id": self.chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        if inline_keyboard:
+            payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
+            
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(f"{self.base_url}/editMessageText", json=payload, timeout=10)
+        except Exception as e:
+            logger.error(f"Telegram edit failed: {e}")
 
     async def _process_queue(self):
         """Background worker to send messages with rate limiting (20/min per chat ~ 3s delay)"""
@@ -217,40 +265,44 @@ class TelegramNotifier:
         reasoning: str = "",
         strategy: str = "Unknown"
     ):
-        """Enhanced HTML trade notification with Brain Score & Reasoning"""
-        emoji = "🟢" if side.upper() in ["YES", "BUY"] else "🔴"
+        """Enhanced HTML trade notification with high-end visual polish"""
+        side_norm = side.upper()
+        if "BUY" in side_norm or "YES" in side_norm:
+            emoji = "🛰"
+            action_tag = "🟢 EXECUTION: BUY"
+        else:
+            emoji = "📡"
+            action_tag = "🔴 EXECUTION: SELL"
         
         market_link = f"https://polymarket.com/event/{condition_id}" if condition_id else ""
-        link_text = f'\n🔗 <a href="{market_link}">View on Polymarket</a>' if market_link else ""
-
-        # Brain Context
-        brain_text = ""
-        if brain_score > 1.0:
-            brain_text = f"🧠 <b>Brain Boost:</b> x{brain_score:.2f} (High Confidence)\n"
-        elif brain_score < 1.0:
-            brain_text = f"🧠 <b>Brain Penalty:</b> x{brain_score:.2f} (Caution)\n"
-
-        # Reasoning Section
-        reasoning_text = ""
-        if reasoning:
-            reasoning_text = f"💡 <b>AI Prediction:</b>\n<i>{reasoning}</i>\n"
-
+        
+        # Build the structured message
         text = (
-            f"{emoji} <b>TRADE EXECUTED</b> | {strategy}\n"
+            f"{emoji} <b>{action_tag}</b>\n"
+            f"<code>STRATEGY: {strategy.upper()}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"<b>Asset:</b> <code>{asset}</code>\n"
-            f"<b>Action:</b> {side.upper()}\n"
-            f"<b>Size:</b> ${size:.2f}\n"
-            f"<b>Price:</b> ${price:.4f}\n"
-            f"{brain_text}"
-            f"{reasoning_text}"
+            f"💎 <b>ASSET:</b> <code>{asset}</code>\n"
+            f"📊 <b>PRICE:</b> <code>${price:.4f}</code>\n"
+            f"💰 <b>SIZE:</b>  <code>${size:.2f}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💰 <b>Exp. PnL:</b> ${profit:+.4f}\n"
-            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-            f"{link_text}"
+        )
+
+        if reasoning:
+            text += f"💡 <b>LOGIC:</b> <i>{reasoning}</i>\n"
+        
+        if brain_score != 1.0:
+            brain_emoji = "🧠" if brain_score > 1.0 else "⚠️"
+            text += f"{brain_emoji} <b>BRAIN:</b> <code>x{brain_score:.2f} confidence</code>\n"
+
+        if profit != 0:
+            text += f"💵 <b>EST. PNL:</b> <code>${profit:+.4f}</code>\n"
+
+        text += (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕒 {datetime.now().strftime('%H:%M:%S')} | <a href='{market_link}'>Polymarket ↗️</a>" if market_link else 
+            f"🕒 {datetime.now().strftime('%H:%M:%S')}"
         )
         
-        # Inline button
         keyboard = None
         if market_link:
             keyboard = [[{"text": "🌐 Open Market", "url": market_link}]]

@@ -59,7 +59,12 @@ class EliteMimicAgent:
             asyncio.create_task(self._status_loop(), name="MimicStatusLoop")
         ]
 
-        if self.news_brain:
+        # 0. Low Capital Check
+        if self.budget_manager and self.budget_manager.is_low_capital:
+            logger.warning("⚠️ EliteMimic: Low capital detected - Mimic trading disabled (Watcher active)")
+            # We still run watcher to collect data, but disable active trading modules
+        
+        elif self.news_brain:
             monitor_keywords = ["bitcoin", "ethereum", "trump", "crypto", "polymarket"]
             tasks.append(asyncio.create_task(self.news_brain.run(keywords=monitor_keywords), name="NewsBrain"))
         elif self.signal_bus:
@@ -215,7 +220,7 @@ class EliteMimicAgent:
         # 🚀 PnL Tracker Logic (Mirror trades as Entries/Exits)
         if self.pnl_tracker:
             if side == "BUY":
-                tid = self.pnl_tracker.record_entry("elitemimic", token_id, "BUY", 0.5, size) # Dry price 0.5
+                tid = self.pnl_tracker.record_entry("elitemimic", token_id, "BUY", 0.5, size, metadata={"group": "CRYPTO"}) # Dry price 0.5
                 self.positions[token_id] = {"tid": tid, "size": size}
             elif side == "SELL" and token_id in self.positions:
                 pos = self.positions.pop(token_id)
@@ -235,6 +240,12 @@ class EliteMimicAgent:
             if hasattr(self, 'news_brain') and self.news_brain and hasattr(self.news_brain, 'shutdown'):
                 await self.news_brain.shutdown()
                 
+            # Cancel all tasks running in this agent
+            for task in asyncio.all_tasks():
+                name = task.get_name()
+                if name in ["WalletWatcher", "MimicStatusLoop", "NewsBrain", "EliteMimicSignalBridge"]:
+                    task.cancel()
+
             logger.info("✅ EliteMimicAgent resources closed")
         except Exception as e:
             logger.error(f"Error during EliteMimicAgent shutdown: {e}")

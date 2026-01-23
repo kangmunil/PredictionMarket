@@ -48,9 +48,25 @@ class PolymarketMCPClient:
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        await self.close()
+
+    async def close(self):
+        """Close both async and sync clients."""
         if self._client:
-            await self._client.aclose()
-            self._client = None
+            try:
+                await self._client.aclose()
+            except Exception as exc:
+                logger.debug(f"MCP async client close error: {exc}")
+            finally:
+                self._client = None
+        
+        if self._sync_client:
+            try:
+                self._sync_client.close()
+            except Exception as exc:
+                logger.debug(f"MCP sync client close error: {exc}")
+            finally:
+                self._sync_client = None
 
     async def _ensure_client(self):
         if not self.base_url:

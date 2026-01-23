@@ -7,11 +7,14 @@ from typing import List, Dict, Optional
 from decimal import Decimal
 
 from src.core.config import Config
-from src.core.clob_client import PolyClient
+from src.core.config import Config
+from src.core.clob_client import PolyClient, MarketDelistedError
+from src.core.gamma_client import GammaClient
 from src.core.gamma_client import GammaClient
 from src.core.price_history_api import PolymarketHistoryAPI
 from src.news.news_aggregator import NewsAggregator
 from src.core.rag_system_openrouter import OpenRouterRAGSystem, NewsEvent
+from src.strategies.crypto_15min_filter import Crypto15MinFilter
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +29,12 @@ class SmartTrendFollower:
     4. Execute trade if Momentum + News Alignment exists.
     """
 
-    def __init__(self, client: PolyClient, budget_manager=None):
+    def __init__(self, client: PolyClient, budget_manager=None, status_reporter=None, pnl_tracker=None, signal_bus=None):
         self.client = client
         self.budget_manager = budget_manager
+        self.status_reporter = status_reporter
+        self.pnl_tracker = pnl_tracker
+        self.signal_bus = signal_bus
         self.config = Config()
         
         # Components
@@ -43,6 +49,7 @@ class SmartTrendFollower:
             supabase_key=os.getenv("SUPABASE_KEY")
         )
         self.history_api = PolymarketHistoryAPI()
+        self.crypto_filter = Crypto15MinFilter()
 
         
         # Strategy Params
@@ -58,6 +65,8 @@ class SmartTrendFollower:
         # Cache to avoid re-trading same trend immediately
         self.cooldowns: Dict[str, datetime] = {}
         self.cooldown_duration = timedelta(hours=4)
+        
+        self.is_running = True
 
     async def run(self):
         """Main Strategy Loop"""
@@ -66,8 +75,16 @@ class SmartTrendFollower:
         # Sync existing positions on startup
         await self._sync_with_account()
         
-        while True:
+        while self.is_running:
             try:
+                # 0. Low Capital Check
+                if self.budget_manager and self.budget_manager.is_low_capital:
+                    logger.debug("⚠️ Low Capital Mode: Skipping new trade scans (Waiting for funds/exits)")
+                    # Still manage existing positions (sell-only mode)
+                    await self._manage_positions()
+                    await asyncio.sleep(self.scan_interval)
+                    continue
+
                 # 1. Normal Trend Scan (Hours/Days)
                 await self._scan_and_trade()
                 
@@ -108,6 +125,14 @@ class SmartTrendFollower:
                     
                 if not current_price or current_price <= 0:
                     continue
+            except MarketDelistedError as e:
+                logger.warning(f"❌ Market Delisted/Invalid: {token_id}. Auto-removing position. ({e})")
+                closed_ids.append(token_id)
+                state_changed = True
+                continue
+            except Exception as e:
+                logger.error(f"Error fetching price for {token_id}: {e}")
+                continue
                 
                 entry_price = pos['entry_price']
                 side = pos['side']
@@ -127,7 +152,10 @@ class SmartTrendFollower:
                         state_changed = True
                     pnl_pct = (entry_price - current_price) / entry_price
                 
-                # Exit Logic
+                # --- Phase 8: Intelligent Signal Fetching ---
+                signal = None
+                if self.signal_bus:
+                    signal = await self.signal_bus.get_signal(token_id)
                 should_close = False
                 close_pct = 1.0 # Default: close 100%
                 reason = ""
@@ -145,13 +173,31 @@ class SmartTrendFollower:
                 elif pnl_pct >= 0.25:
                     should_close = True
                     reason = f"Full Take Profit (+{pnl_pct*100:.1f}%)"
+                
+                # 2a. Phase 8: Sentiment-Driven Emergency Exit
+                elif signal and signal.sentiment_score < -0.6:
+                    should_close = True
+                    reason = f"Emergency Sentiment Exit (Score: {signal.sentiment_score:.2f})"
+                
+                # 2b. Phase 8: Endgame Awareness Exit (< 15m to expiry)
+                elif signal and signal.metadata.get('expiry', {}).get('phase') == 'ENDGAME':
+                    should_close = True
+                    reason = "Endgame Phase Exit (Liquidity Protection)"
                     
-                # 3. Trailing Stop (5% drop from HWM)
+                # 3. Trailing Stop (Volatility-Adjusted in Phase 8)
                 elif side == "BUY" and hwm > entry_price:
+                    # Default 5.0%, but adapt to market regime
+                    trail_pct_threshold = 0.05
+                    if signal:
+                        if signal.spread_regime == "EFFICIENT":
+                            trail_pct_threshold = 0.025 # Tighten to lock gains
+                        elif signal.spread_regime == "INEFFICIENT":
+                            trail_pct_threshold = 0.075 # Give more room
+                            
                     trail_pct = (hwm - current_price) / hwm
-                    if trail_pct >= 0.05:
+                    if trail_pct >= trail_pct_threshold:
                         should_close = True
-                        reason = f"Trailing Stop Triggered (-{trail_pct*100:.1f}% from HWM)"
+                        reason = f"Volatility-Adjusted Trailing Stop ({trail_pct*100:.1f}% vs {trail_pct_threshold*100:.1f}%)"
 
                 # 4. Traditional Stop Loss (-10%)
                 elif pnl_pct <= -0.10:
@@ -172,12 +218,26 @@ class SmartTrendFollower:
                     if not self.config.DRY_RUN:
                         close_amount_usd = shares_to_close * current_price
                         
-                        # 🛡️ Dust Protection: Skip if value < $5.00 (Polymarket Minimum)
-                        if close_amount_usd < 5.00:
-                            logger.warning(f"      ⚠️ Cannot Close: Value ${close_amount_usd:.2f} < $5.00 min. Marking as 'Zombie' to ignore.")
+                        # 🛡️ Dust Protection: Skip if value < Minimum
+                        if close_amount_usd < self.client.min_order_value:
+                            logger.warning(f"      ⚠️ Cannot Close: Value ${close_amount_usd:.2f} < ${self.client.min_order_value:.2f} min. Marking as 'Zombie' to ignore.")
                             pos['zombie'] = True
                             state_changed = True
                             continue
+
+                        # --- Phase 8: Liquidity-Aware Execution Pre-check ---
+                        try:
+                            ob = await self.client.get_order_book(token_id)
+                            # Check top 5 levels of depth
+                            side_key = 'bids' if close_side == 'SELL' else 'asks'
+                            top_depth = sum(float(level['size']) for level in ob.get(side_key, [])[:5])
+                            
+                            if shares_to_close > top_depth * 0.5 and top_depth > 0:
+                                logger.warning(f"      ⚠️ High Slippage Risk: Position {shares_to_close:.1f} > 50% Top Depth {top_depth:.1f}")
+                                # In a real bot, we might choose to split the order here. 
+                                # For now, we proceed but log the warning.
+                        except Exception as nle:
+                            logger.debug(f"      Note: Could not fetch depth for liquidity analysis: {nle}")
 
                         resp = await self.client.place_limit_order_with_slippage_protection(
                             token_id=token_id,
@@ -197,6 +257,8 @@ class SmartTrendFollower:
                         logger.info(f"      📝 [DRY RUN] Would Close {close_pct*100:.0f}%: {reason}")
                         if close_pct >= 1.0:
                             closed_ids.append(token_id)
+                            if self.pnl_tracker and pos.get('pnl_tid'):
+                                self.pnl_tracker.record_exit(pos['pnl_tid'], current_price, reason=reason)
                         else:
                             pos['size'] -= shares_to_close
                             state_changed = True
@@ -243,6 +305,17 @@ class SmartTrendFollower:
                         'strategy': 'sync',
                         'high_water_mark': float(lp.get('avgPrice', 0.5))
                     }
+                    if self.pnl_tracker:
+                        meta = {"group": getattr(self, 'category', 'DEFAULT').upper()}
+                        tid = self.pnl_tracker.record_existing_trade(
+                            "trend_follower", 
+                            token_id, 
+                            "BUY", 
+                            float(lp.get('avgPrice', 0.5)), 
+                            size,
+                            metadata=meta
+                        )
+                        self.active_positions[token_id]['pnl_tid'] = tid
             
             self._save_state()
             logger.info(f"   Sync complete. Tracking {len(self.active_positions)} positions.")
@@ -251,11 +324,31 @@ class SmartTrendFollower:
             logger.error(f"Failed to sync positions: {e}")
 
     def _save_state(self):
-        """Save active positions to disk"""
+        """Save active positions to disk and sync to dashboard"""
         try:
             with open(self.state_file, 'w') as f:
                 json.dump(self.active_positions, f, indent=2)
             logger.debug("💾 Strategy state saved.")
+            
+            # Sync to dashboard for Telegram visibility
+            if self.status_reporter:
+                dashboard_positions = [
+                    {
+                        'symbol': pos.get('market_question', 'Unknown')[:30],
+                        'size': pos.get('size', 0),
+                        'entry': pos.get('entry_price', 0),
+                        'current': pos.get('high_water_mark', pos.get('entry_price', 0)),
+                        'pnl': (pos.get('high_water_mark', pos.get('entry_price', 0)) - pos.get('entry_price', 0)) / pos.get('entry_price', 1) * 100 if pos.get('entry_price') else 0,
+                        'strategy': pos.get('strategy', 'trend')
+                    }
+                    for pos in self.active_positions.values()
+                ]
+                self.status_reporter.update_active_positions(dashboard_positions)
+                
+                # Also update PnL (approximate from positions)
+                total_value = sum(p.get('size', 0) * p.get('entry_price', 0) for p in self.active_positions.values())
+                self.status_reporter.update_metrics(balance=total_value, pnl=0.0)
+                
         except Exception as e:
             logger.error(f"Failed to save state: {e}")
 
@@ -358,23 +451,21 @@ class SmartTrendFollower:
         """
         logger.info("⚡ ScalpScanner: Hunting for 15m crypto opportunities...")
         
-        # 1. Broaden Search (Crypto, Politics, Sports)
-        # Fetch top active markets by volume (Category Agnostic)
-        markets = await self.gamma.get_active_markets(limit=60, volume_min=self.min_volume)
+        # 1. Broaden Search (Dedicated 15m Filter + General Trends)
+        scalp_markets = await self.crypto_filter.get_active_crypto_15min_markets(self.gamma, limit=20)
         
-        # Filter for Expanded Categories
-        allowed_tags = ['Crypto', 'Politics', 'Sports', 'Business', 'Trump', 'Elon', 'Tech']
+        # Also fetch top active markets by volume for general trends that might be scalped
+        general_markets = await self.gamma.get_active_markets(limit=40, volume_min=self.min_volume)
         
-        active_markets = [
-            m for m in markets 
-            if m.get('active') and 
-            (
-                any(tag in str(m.get('tags', [])) for tag in allowed_tags) or 
-                any(k in m.get('question', '') for k in ['ETH', 'BTC', 'Fed', 'Rate', 'Trump', 'Elon', 'Kamala'])
-            )
-        ]
+        # Combine and deduplicate
+        seen_ids = {m.get('id') for m in scalp_markets}
+        active_markets = list(scalp_markets)
         
-        logger.info(f"   ⚡ Found {len(active_markets)} potential scalp markets")
+        for m in general_markets:
+            if m.get('id') not in seen_ids:
+                active_markets.append(m)
+        
+        logger.info(f"   ⚡ Found {len(active_markets)} potential scalp markets (including 15m specialists)")
         
         for market in active_markets:
             logger.debug(f"   👉 Checking candidate: {market.get('question')[:40]}...")
@@ -400,7 +491,10 @@ class SmartTrendFollower:
                 # Use History API to get recent price points
                 logger.debug(f"      ⏳ Fetching history for {token_id}...")
                 history, source = await self.history_api.get_history_with_source(
-                    condition_id=condition_id, days=1, min_points=5
+                    condition_id=condition_id, 
+                    days=1, 
+                    min_points=5,
+                    market_data=market
                 )
                 logger.debug(f"      📊 History fetched: {len(history)} points")
                 
@@ -424,30 +518,23 @@ class SmartTrendFollower:
                 
                 # Scalp Signal: Strong Breakout (>1% move recently)
                 if momentum > 0.01 and 0.02 < current_price < 0.85: 
-                     # --- EXPIRY CHECK ---
-                     # Ensure market has at least 2 hours until resolution
-                     end_date_str = market.get('end_date')
-                     if end_date_str:
-                         try:
-                             # end_date is often ISO format or 'YYYY-MM-DD'
-                             # Gamma usually returns ISO
-                             if 'T' in end_date_str:
-                                 end_dt = datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
-                             else:
-                                 end_dt = datetime.strptime(end_date_str, '%Y-%m-%d')
-                             
-                             time_until_expiry = end_dt.replace(tzinfo=None) - datetime.now()
-                             if time_until_expiry.total_seconds() < 2 * 3600:
-                                 logger.info(f"      ⚠️ Skipping {market.get('question')[:30]}: Too close to expiry ({time_until_expiry})")
-                                 continue
-                         except Exception as ex:
-                             logger.warning(f"      ⚠️ Could not parse end_date {end_date_str}: {ex}")
-                     
                      logger.info(f"   🚀 SCALP SIGNAL: {market.get('question')} | Mom: {momentum*100:.1f}%")
                      
                      # Check Budget
                      if self.config.DRY_RUN:
-                         logger.info(f"      📝 [DRY RUN] Would SCALP BUY $10 on {token_id}")
+                         logger.info(f"      📝 [DRY RUN] Would SCALP BUY $5 on {token_id}")
+                         # Record mock position for PnL tracking
+                         self.active_positions[token_id] = {
+                            'entry_price': current_price,
+                            'size': 5.0 / (current_price or 0.5), 
+                            'market_question': market.get('question'),
+                            'condition_id': condition_id,
+                            'timestamp': datetime.now().isoformat(),
+                            'side': 'BUY',
+                            'strategy': 'scalp',
+                            'high_water_mark': current_price
+                         }
+                         self._save_state()
                          continue
 
                      # Execute Scalp
@@ -457,7 +544,7 @@ class SmartTrendFollower:
                      await self.client.place_limit_order_with_slippage_protection(
                          token_id=token_id,
                          side="BUY",
-                         amount=5.0, # Reduced to $5.0 to fit wallet ($9.89)
+                         amount=self.client.min_order_value, # Automatically matches config
                          priority="high",
                          max_slippage_pct=3.0, # Low liquidity tolerance
                          target_price=target_price
@@ -595,6 +682,7 @@ class SmartTrendFollower:
     async def shutdown(self):
         """Gracefully close all internal client sessions"""
         logger.info("🎬 Shutting down SmartTrendFollower...")
+        self.is_running = False
         try:
             if hasattr(self, 'gamma') and self.gamma:
                 await self.gamma.close()

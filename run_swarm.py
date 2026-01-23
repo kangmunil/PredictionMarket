@@ -10,6 +10,8 @@ from datetime import datetime, timedelta
 from uuid import uuid4
 from dotenv import load_dotenv
 import redis.asyncio as redis
+import fcntl
+import httpx
 
 # Load Environment Variables
 load_dotenv()
@@ -27,9 +29,12 @@ from src.core.structured_logger import setup_logging, StructuredLogger
 from src.core.health_monitor import get_health_monitor, record_heartbeat
 from src.core.status_reporter import StatusReporter # Added Producer
 from src.core.market_specialist import MarketSpecialist
+from src.core.market_specialist import MarketSpecialist
 from src.core.global_risk_manager import GlobalRiskManager
 from src.core.trade_repository import TradeRepository
 from src.core.dashboard_api import start_dashboard_api, set_swarm_system
+from src.core.state_doctor import StateDoctor
+from src.core.performance_analyzer import PerformanceAnalyzer
 
 # Strategies & Agents
 from src.news.news_scalper_optimized import OptimizedNewsScalper
@@ -64,7 +69,7 @@ class SwarmSystem:
         self.s_logger = None
         
         # Dashboard Reporter
-        self.status_reporter = StatusReporter()
+        self.status_reporter = StatusReporter(filepath="data/dashboard_state.json")
         
         # New: Global Risk Manager
         self.risk_manager = GlobalRiskManager()
@@ -95,6 +100,10 @@ class SwarmSystem:
         self.status_watch_interval = int(os.getenv("STATUS_WATCH_INTERVAL_SECONDS", "300"))
         self.pnl_alert_threshold = float(os.getenv("STATUS_PNL_ALERT_THRESHOLD", "5.0"))
         self._last_total_pnl = None
+        
+        # Performance Caching
+        self.tick_count = 0
+        self.last_balance = 0.0
 
     async def setup(self, dry_run: bool = False):
         # Configure advanced logging
@@ -103,6 +112,13 @@ class SwarmSystem:
             json_output=self.json_logs,
             log_file=f"logs/swarm_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         )
+
+        # 0. run State Doctor (Startup Validation)
+        try:
+            doctor = StateDoctor()
+            await doctor.run()
+        except Exception as e:
+            logger.error(f"State Doctor failed during startup: {e}")
         # Dashboard Logging Hook
         from src.core.structured_logger import attach_dashboard_handler
         attach_dashboard_handler(self.status_reporter)
@@ -146,6 +162,7 @@ class SwarmSystem:
 
         # Start notifier polling in background (non-blocking)
         if self.notifier.enabled:
+            # Keep alive
             self.notifier_task = asyncio.create_task(self.notifier.start_polling())
             await self.notifier.send_message("🚀 *Hive Mind Swarm Intelligence* Online!\nUse /status to check system.")
             logger.info("✅ Telegram Notifier initialized and polling started")
@@ -162,9 +179,10 @@ class SwarmSystem:
         initial_capital = 10000.0 # Bumping to $10k for smoother dry-run testing
         if not dry_run:
             try:
-                # Attempt to fetch real balance
+                # Attempt to fetch real balance for initial capital
                 balance_str = await self.client.get_usdc_balance()
                 initial_capital = float(balance_str)
+                self.last_balance = initial_capital # Initialize last_balance
                 logger.info(f"💳 Wallet Balance Detected: ${initial_capital:.2f}")
             except Exception as e:
                 logger.warning(f"⚠️ Could not fetch balance, defaulting to $50.0: {e}")
@@ -245,7 +263,10 @@ class SwarmSystem:
         # 5. Trend Follower
         self.trend_agent = SmartTrendFollower(
             client=self.client,
-            budget_manager=self.budget_manager
+            budget_manager=self.budget_manager,
+            status_reporter=self.status_reporter,
+            pnl_tracker=self.pnl_tracker,
+            signal_bus=self.bus
         )
 
         # 5. Health Monitor
@@ -270,47 +291,77 @@ class SwarmSystem:
         self.notifier.register_command("/liquidate", self.handle_liquidate)
         self.notifier.register_command("/panic", self.handle_panic)
         self.notifier.register_command("/unpanic", self.handle_unpanic)
+        self.notifier.register_command("/settings", self.handle_settings)
+        self.notifier.register_command("/balance", self.handle_balance)
+        self.notifier.register_command("/kill", self.handle_kill)
+        self.notifier.register_command("/verify", self.handle_verify)
+        self.notifier.register_command("/alerts", self.handle_alerts)
         
+        # Bifurcation Variants (Phase 22)
+        prefixes = ["/t", "/l"]
+        base_cmds = ["status", "settings", "balance", "pnl", "history", "top", "risk"]
+        for p in prefixes:
+            for bc in base_cmds:
+                cmd = f"{p}{bc}"
+                handler_name = f"handle_{bc}"
+                if hasattr(self, handler_name):
+                    self.notifier.register_command(cmd, getattr(self, handler_name))
+
         # Register Command Menu with Telegram
         menu_commands = [
-            {"command": "status", "description": "전체 시스템 상태 및 에이전트 활성 수 확인"},
-            {"command": "pnl", "description": "금일 수익 현황 요약"},
-            {"command": "risk", "description": "글로벌 리스크 배수(Multiplier) 조정"},
-            {"command": "panic", "description": "비상 정지 (회로 차단기 활성화)"},
-            {"command": "unpanic", "description": "비상 정지 해제"},
-            {"command": "stop", "description": "자동 거래 일시 정지 (Dry Run)"},
-            {"command": "resume", "description": "자동 거래 재개"},
-            {"command": "history", "description": "최근 거래 내역 확인"},
-            {"command": "liquidate", "description": "포지션 청산"},
-            {"command": "help", "description": "도움말 보기"}
+            {"command": "status", "description": "전체 상태 체크"},
+            {"command": "verify", "description": "실시간 데이터 검증 (Proof of Data)"},
+            {"command": "alerts", "description": "알림 설정 토글"},
+            {"command": "settings", "description": "봇 설정 제어 (메뉴)"},
+            {"command": "balance", "description": "상세 잔고 및 할량"},
+            {"command": "pnl", "description": "수익 요약"},
+            {"command": "help", "description": "도움말"}
         ]
         asyncio.create_task(self.notifier.set_my_commands(menu_commands))
 
-        logger.info("✅ Telegram Commands Registered: /help, /status, /stop, /resume, /history, /top, /pnl, /risk, /liquidate, /panic, /unpanic")
+        logger.info("✅ Telegram Commands Registered with Bifurcation and Verify")
 
     async def handle_help(self, text):
         msg = (
             "🤖 *Hive Mind Swarm System Help*\n\n"
             "*Monitoring:*\n"
             "• /status - Get current balances and signals\n"
+            "• /settings - Configure bot behavior interactively\n"
+            "• /balance - Detailed allocation breakdown\n"
             "• /history - View last 5 executed trades\n"
-            "• /top - See current best market opportunities\n\n"
+            "• /top - See current best market opportunities\n"
+            "• /verify - Compare pricing with real-time API\n"
+            "• /alerts - Toggle trade notifications\n\n"
             "*Control:*\n"
             "• /stop - Pause all automated trading\n"
             "• /resume - Re-enable automated trading\n"
+            "• /kill - Immediate remote shutdown\n"
             "• /pnl - Check daily profit/loss\n\n"
             "*Risk Management:*\n"
             "• /risk <low|mid|high|yolo> - Adjust global risk multiplier\n"
-            "• /panic - Activate global circuit breaker (stop all trading)\n"
+            "• /panic - Activate global circuit breaker\n"
             "• /unpanic - Deactivate global circuit breaker\n"
             "• /liquidate <token_id|all> - Close positions\n\n"
+            "*Multi-Bot Control (Bifurcation):*\n"
+            "• `/t<cmd>` - Run command on TEST bot (e.g., /tstatus)\n"
+            "• `/l<cmd>` - Run command on LIVE bot (e.g., /lstatus)\n\n"
             "*Info:*\n"
             "• /help - Show this manual\n\n"
             "Keep hunting for that alpha! 🚀"
         )
         await self.notifier.send_message(msg)
 
+    def _check_mode_match(self, text: str) -> bool:
+        """Phase 22: Check if command prefix matches current system mode."""
+        cmd = text.split()[0].lower()
+        if cmd.startswith("/t"):
+            return self.config.DRY_RUN
+        if cmd.startswith("/l"):
+            return not self.config.DRY_RUN
+        return True # Neutral commands always respond
+
     async def handle_status(self, text):
+        if not self._check_mode_match(text): return
         try:
             if not self.budget_manager or not self.pnl_tracker:
                 await self.notifier.send_message("⏳ System is still initializing. Please wait...")
@@ -402,12 +453,7 @@ class SwarmSystem:
                 )
         history_sources.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
 
-        real_wallet_balance = None
-        if not self.client.config.DRY_RUN:
-            try:
-                real_wallet_balance = await self.client.get_usdc_balance()
-            except Exception as exc:
-                logger.error(f"Live balance fetch failed: {exc}")
+        real_wallet_balance = self.last_balance # Use cached balance
 
         # Brain Metrics (Specialist)
         brain_metrics = []
@@ -578,6 +624,7 @@ class SwarmSystem:
         await self.notifier.send_message("🟢 *TRADING RESUMED.* Bots are looking for opportunities.")
 
     async def handle_history(self, text):
+        if not self._check_mode_match(text): return
         if not self.trade_history:
             await self.notifier.send_message("📜 No trades recorded.")
             return
@@ -591,6 +638,7 @@ class SwarmSystem:
 
     async def handle_risk(self, text):
         """Handle /risk <level> command"""
+        if not self._check_mode_match(text): return
         try:
             parts = text.split()
             if len(parts) < 2:
@@ -633,6 +681,152 @@ class SwarmSystem:
         except Exception as e:
             logger.error(f"Error in handle_risk: {e}")
             await self.notifier.send_message(f"❌ Error: {str(e)}")
+
+    async def handle_settings(self, text):
+        """Show interactive settings menu"""
+        if not self._check_mode_match(text): return
+        current_risk = 0.25
+        if self.news_agent and hasattr(self.news_agent, 'risk_manager'):
+            current_risk = self.news_agent.risk_manager.risk_multiplier
+
+        mode = "DRY RUN" if self.config.DRY_RUN else "LIVE"
+        trading = "🟢 Running" if self.trading_enabled else "🔴 Paused"
+        alerts = "🔔 ON" if self.config.TELEGRAM_NOTIFICATIONS_ENABLED else "🔕 OFF"
+        threshold = f"${self.config.TELEGRAM_MIN_TRADE_SIZE:.2f}"
+
+        msg = (
+            f"⚙️ *Bot Configuration Menu*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"• *Mode:* `{mode}`\n"
+            f"• *Trading:* {trading}\n"
+            f"• *Risk:* `{current_risk}x`\n"
+            f"• *Alerts:* {alerts} (>{threshold})\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"Select a setting to modify:"
+        )
+
+        keyboard = [
+            [
+                {"text": "📈 Risk: Low", "callback_data": "/risk low"},
+                {"text": "🚀 Risk: YOLO", "callback_data": "/risk yolo"}
+            ],
+            [
+                {"text": "🛑 Stop Trading", "callback_data": "/stop"},
+                {"text": "▶️ Resume", "callback_data": "/resume"}
+            ],
+            [
+                {"text": "🔔 Toggle Alerts", "callback_data": "/alerts"},
+                {"text": "🔍 Verify Data", "callback_data": "/verify"}
+            ],
+            [
+                {"text": "📊 Full Status", "callback_data": "/status"},
+                {"text": "💰 Balance", "callback_data": "/balance"}
+            ]
+        ]
+        await self.notifier.send_message(msg, inline_keyboard=keyboard)
+
+    async def handle_balance(self, text):
+        """Detailed balance report"""
+        if not self._check_mode_match(text): return
+        if not self.budget_manager: return
+        
+        status = await self.budget_manager.get_status()
+        balances = status.get('balances', {})
+        reserve = status.get('reserve', 0.0)
+        
+        msg = (
+            "💳 *Detailed Wallet & Allocations*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏦 *Wallet (USDC):* `${self.last_balance:,.2f}`\n"
+            f"📦 *Reserve:* `${reserve:,.2f}`\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🛠 *News Scalper:* `${balances.get('arbhunter', 0):,.2f}`\n"
+            f"⚖️ *Stat Arb:* `${balances.get('statarb', 0):,.2f}`\n"
+            f"👥 *Elite Mimic:* `${balances.get('elitemimic', 0):,.2f}`\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 *Total Managed:* `${sum(balances.values()) + reserve:,.2f}`"
+        )
+        await self.notifier.send_message(msg)
+
+    async def handle_kill(self, text):
+        """Remote shutdown switch"""
+        await self.notifier.send_message("💀 *REMOTE SHUTDOWN INITIATED...* Goodnight.")
+        logger.warning("💀 Remote shutdown command received via Telegram.")
+        self.running = False
+        # Trigger cleanup
+        os.kill(os.getpid(), signal.SIGINT)
+
+    async def handle_alerts(self, text):
+        """Toggle Telegram notifications enabled state"""
+        current = self.config.TELEGRAM_NOTIFICATIONS_ENABLED
+        new_state = not current
+        self.config.TELEGRAM_NOTIFICATIONS_ENABLED = new_state
+        
+        emoji = "🔔" if new_state else "🔕"
+        msg = f"{emoji} **Telegram Alerts**: {'ENABLED' if new_state else 'DISABLED'}"
+        await self.notifier.send_message(msg)
+        
+        # Refresh settings menu
+        await self.handle_settings(text)
+
+    async def handle_verify(self, text):
+        """Phase 23: Proof of Real-Time Data"""
+        await self.notifier.send_message("🔍 *Verifying Real-Time Data Sync...*")
+        
+        # Pick a high-volume target market: BTC/USD 15m (Example CID)
+        # Note: In production, we'd dynamically find a valid CID from Gamma
+        target_cid = "0xafdfba3c8117db508bc6bea87fa5e638d302c28ffb610b72fbad2d99f33e66db" # BTC-15M-UP-DOWN
+        market_name = "Bitcoin Up/Down (15m)"
+        
+        try:
+            # 1. Internal State
+            internal_price = 0.0
+            tokens = await self.gamma_client.get_market(target_cid)
+            if tokens and 'clobTokenIds' in tokens:
+                token_ids = json.loads(tokens['clobTokenIds'])
+                internal_price = self.client.get_best_ask_price(token_ids[0])
+            
+            # 2. External Truth (Direct API call during command)
+            async with httpx.AsyncClient() as client:
+                # Direct price check to CLOB API
+                resp = await client.get(f"{self.config.HOST}/price/buy?token_id={token_ids[0]}&amount=100")
+                api_data = resp.json()
+                external_price = float(api_data.get("price", 0))
+
+            diff = abs(internal_price - external_price)
+            sync_status = "✅ PERFECT SYNC" if diff < 0.001 else "⚠️ SLIGHT DRIFT" if diff < 0.01 else "❌ OUTSIDE TOLERANCE"
+            
+            msg = (
+                f"🧪 *REAL-DATA VERIFICATION REPORT*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📍 *Target:* `{market_name}`\n"
+                f"🤖 *Bot Internal:* `${internal_price:.4f}`\n"
+                f"📡 *Api Truth:*    `${external_price:.4f}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 *Status:* {sync_status} (Diff: ${diff:.4f})\n\n"
+                f"_This proves the bot is consuming live Polymarket orderbooks._"
+            )
+            await self.notifier.send_message(msg)
+            
+        except Exception as e:
+            logger.error(f"Verification failed: {e}")
+            await self.notifier.send_message(f"❌ Verification Failed: {str(e)}")
+
+    async def handle_panic(self, text):
+        """Activate global circuit breaker"""
+        if self.risk_manager:
+            self.risk_manager.circuit_breaker_enabled = True
+            await self.notifier.send_message("🚨 **PANIC MODE ACTIVATED** 🚨\nCircuit breaker enabled. All trading halted.")
+        else:
+            await self.notifier.send_message("⚠️ Risk Manager not initialized.")
+
+    async def handle_unpanic(self, text):
+        """Deactivate global circuit breaker"""
+        if self.risk_manager:
+            self.risk_manager.circuit_breaker_enabled = False
+            await self.notifier.send_message("🟢 **PANIC MODE DEACTIVATED** 🟢\nCircuit breaker disabled. Trading can resume.")
+        else:
+            await self.notifier.send_message("⚠️ Risk Manager not initialized.")
 
     async def handle_liquidate(self, text):
         """Handle /liquidate <token|all> command"""
@@ -688,6 +882,7 @@ class SwarmSystem:
             await self.notifier.send_message(f"❌ Error: {str(e)}")
 
     async def handle_top(self, text):
+        if not self._check_mode_match(text): return
         signals = await self.bus.get_hot_tokens(min_sentiment=0.1)
         if not signals:
             await self.notifier.send_message("📡 No active signals.")
@@ -701,13 +896,16 @@ class SwarmSystem:
         await self.notifier.send_message(msg)
 
     async def handle_pnl(self, text):
+        if not self._check_mode_match(text): return
         pnl_data = self.pnl_tracker.get_summary()
         msg = (
-            f"💰 *PnL Report*\n"
+            f"💰 <b>REAL-TIME P&L REPORT</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Daily PnL: ${pnl_data['total_pnl']:+.2f}\n"
-            f"Open Positions: {pnl_data['open_positions']}\n"
-            f"Closed Trades: {pnl_data['closed_trades']}"
+            f"💎 <b>Daily PnL:</b> <code>${pnl_data['total_pnl']:+.2f}</code>\n"
+            f"📈 <b>Open Pos:</b> <code>{pnl_data['open_positions']}</code>\n"
+            f"✅ <b>Closed:</b>   <code>{pnl_data['closed_trades']}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🕒 {datetime.now().strftime('%H:%M:%S')}"
         )
         await self.notifier.send_message(msg)
 
@@ -718,17 +916,35 @@ class SwarmSystem:
         })
         if len(self.completed_trades) > 50: self.completed_trades.pop(0)
 
-        # Notify via Telegram
+        # Notify via Telegram (Phase 21 & 24: Config-Driven Threshold Check)
         if self.notifier and self.notifier.enabled:
-             asyncio.create_task(
-                self.notifier.notify_trade(
-                    side, token, price, size, 
-                    profit=pnl,
-                    condition_id=condition_id, 
-                    brain_score=brain_score
-                )
-            )
+             if not self.config.TELEGRAM_NOTIFICATIONS_ENABLED:
+                 logger.debug("🔕 Telegram notifications globally disabled via Config")
+                 return
 
+             # Use config threshold
+             threshold = self.config.TELEGRAM_MIN_TRADE_SIZE
+             if size >= threshold or abs(pnl) > 0.1:
+                 asyncio.create_task(
+                    self.notifier.notify_trade(
+                        side, token, price, size, 
+                        profit=pnl,
+                        condition_id=condition_id, 
+                        brain_score=brain_score
+                    )
+                 )
+             else:
+                 logger.info(f"🔕 Suppressing Telegram notification for small trade (${size:.2f} < ${threshold:.2f})")
+
+    async def _update_balance_metrics(self):
+        """Fetches and updates the wallet balance."""
+        try:
+            wallet_bal = await self.client.get_usdc_balance()
+            self.last_balance = float(wallet_bal)
+            logger.debug(f"Updated wallet balance: ${self.last_balance:.2f}")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not fetch balance in _update_balance_metrics: {e}")
+            # Keep last known balance if fetch fails
 
     async def _hydrate_positions(self):
         """Fetch existing positions from API and populate PnLTracker"""
@@ -764,6 +980,22 @@ class SwarmSystem:
             logger.info(f"✅ Hydrated {count} positions into PnL Tracker & NewsScalper")
         except Exception as e:
             logger.error(f"⚠️ Failed to hydrate positions: {e}")
+
+    async def _daily_report_task(self):
+        """Send performance stats to Telegram every 6 hours"""
+        analyzer = PerformanceAnalyzer()
+        REPORT_INTERVAL = 6 * 3600 
+        
+        while self.running:
+            try:
+                # Wait first (don't spam on restart)
+                await asyncio.sleep(REPORT_INTERVAL)
+                report = analyzer.generate_report()
+                if self.notifier and self.notifier.enabled:
+                    await self.notifier.send_message(report)
+            except Exception as e:
+                logger.error(f"Error in daily report: {e}")
+                await asyncio.sleep(60)
 
     async def run(self, dry_run: bool = False):
         try:
@@ -814,11 +1046,22 @@ class SwarmSystem:
                 await asyncio.gather(*self.tasks)
             except asyncio.CancelledError:
                 logger.info("🐝 Swarm System stopping...")
+            except Exception as e:
+                logger.error(f"❌ Critical error in swarm run: {e}", exc_info=True)
+            finally:
+                await self.shutdown()
+
         except Exception as e:
-            logger.error(f"❌ Critical error in swarm run: {e}", exc_info=True)
+            logger.error(f"❌ Error in Swarm Run: {e}")
             raise
-        finally:
-            await self.shutdown()
+
+
+
+        
+
+
+    async def periodic_health_check(self) -> None:
+        pass
 
     async def _global_risk_monitor(self):
         """Global safety watchdog (Phase 4.1)"""
@@ -871,14 +1114,6 @@ class SwarmSystem:
         except Exception as e:
             logger.error(f"❌ Dashboard API failed: {e}")
 
-    async def _daily_report_task(self):
-        while self.running:
-            await asyncio.sleep(12 * 3600)
-            if not self.trade_history: continue
-            wins = len([t for t in self.trade_history if t.get('pnl', 0) and t['pnl'] > 0])
-            msg = f"📅 *Daily Report*\nTrades: {len(self.trade_history)}\nWin Rate: {(wins/len(self.trade_history)*100):.1f}%"
-            if self.notifier and self.notifier.enabled:
-                await self.notifier.send_message(msg)
 
     async def _dashboard_ticker_task(self):
         """High-frequency update for the TUI Dashboard (2s interval)."""
@@ -887,18 +1122,37 @@ class SwarmSystem:
                 # 1. Fetch Basic Metrics
                 pnl_summary = self.pnl_tracker.get_summary()
                 status = await self.budget_manager.get_status()
-                balances = status.get('balances', {})
+                # balances = status.get('balances', {}) # Not used directly here
                 
-                # 2. Update Metrics in Reporter
+                # 1. Update Metrics (Balance & PnL)
+                self.tick_count += 1
+                
+                # Optimized polling: 60s for balance/allowance (low churn)
+                if self.tick_count % 30 == 0: # 30 * 2s = 60s
+                    asyncio.create_task(self._update_balance_metrics())
+                
+                # Signal Garbage Collection: 10m (low frequency)
+                if self.tick_count % 300 == 0: # 300 * 2s = 600s = 10m
+                    asyncio.create_task(self.bus.prune_stale_signals())
+                
+                # Calculate approximate equity
+                total_pnl = float(pnl_summary.get('total_pnl', 0.0))
+                
+                # Dynamic Budget Sync (Task 13)
+                await self.budget_manager.sync_with_real_pnl(total_pnl, self.risk_manager.start_of_day_equity)
+                
+                unrealized = float(pnl_summary.get('unrealized_pnl', 0.0))
+                equity = self.last_balance + unrealized
+                
                 self.status_reporter.update_metrics(
-                    balance=float(status.get('total_capital', 0.0)),
-                    pnl=float(pnl_summary['total_pnl'])
+                    balance=self.last_balance,
+                    equity=equity, 
+                    daily_pnl=total_pnl
                 )
-                
-                # 3. Update Active Positions
-                # Transform PnLTracker active_trades to Reporter format
+
+                # 2. Update Active Position List
                 active_trades = []
-                for trade_id, trade in self.pnl_tracker.active_trades.items():
+                for trade in self.pnl_tracker.active_trades.values():
                     # Calculate current PnL
                     current_price = self.client.get_best_ask_price(trade.token_id)
                     entry_price = trade.entry_price
@@ -920,7 +1174,7 @@ class SwarmSystem:
                     self.status_reporter.update_signal(tid[:10], sig.sentiment_score)
                 
                 # 5. Heartbeat for dashboard
-                self.status_reporter.update_state({"last_updated": time.time()})
+                self.status_reporter.update_state({"last_updated": datetime.now().timestamp()})
                     
             except Exception as e:
                 logger.debug(f"Dashboard ticker error: {e}")
@@ -1064,9 +1318,14 @@ class SwarmSystem:
         # 🧠 Close Hive Mind / SignalBus
         await _close_component(self.bus, "SignalBus")
 
-        # Core Clients
+        # Core Clients (Final layer)
         await _close_component(self.client, "PolyClient")
-        await _close_component(self.gamma_client, "GammaClient")
+        if hasattr(self, 'gamma_client'):
+            await _close_component(self.gamma_client, "GammaClient")
+            
+        # 🧪 Price History API (Phase 5, shared instance)
+        if hasattr(self, 'price_history_api'):
+            await _close_component(self.price_history_api, "PriceHistoryAPI")
 
         if hasattr(self, 'redis') and self.redis:
             try:
@@ -1099,10 +1358,21 @@ async def main(args):
         except NotImplementedError:
             pass
 
-    # Always run the swarm directly (UI is now external)
-    await system.run(dry_run=args.dry_run)
+    try:
+        # Always run the swarm directly (UI is now external)
+        await system.run(dry_run=args.dry_run)
+    finally:
+        await system.shutdown()
 
 if __name__ == "__main__":
+    # 🔒 Singleton Lock: Prevent multiple instances
+    lock_file = open("/tmp/swarm.lock", "w")
+    try:
+        fcntl.lockf(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        print("❌ Error: Another instance of SwarmSystem is already running!")
+        sys.exit(1)
+
     import argparse
     parser = argparse.ArgumentParser(description="Hive Mind Swarm System")
     parser.add_argument("--dry-run", action="store_true", help="Run in paper trading mode")

@@ -49,16 +49,40 @@ class TreeNewsStreamClient:
 
         logger.info(f"🔌 Connecting to Tree News WebSocket: {self.ws_url}")
         
+        backoff = 5
+        self.last_heartbeat = time.time()
+        
         while True:
             try:
-                async with websockets.connect(self.ws_url) as ws:
+                async with websockets.connect(
+                    self.ws_url,
+                    ping_interval=30,  # Send pings every 30s
+                    ping_timeout=10,   # Wait 10s for pong
+                    close_timeout=5
+                ) as ws:
                     logger.info("✅ Connected to Tree News WebSocket")
-                    
-                    # Heartbeat/Auth if needed
+                    backoff = 5 # Reset on success
                     
                     while True:
-                        message = await ws.recv()
-                        # logger.debug(f"Received message: {message[:100]}...") # Too noisy
+                        try:
+                            # Wait for message with timeout to check aliveness
+                            message = await asyncio.wait_for(ws.recv(), timeout=45)
+                            self.last_heartbeat = time.time()
+                            
+                        except asyncio.TimeoutError:
+                            # It's been 45s since last message.
+                            # websockets lib handles ping/pong automatically with ping_interval,
+                            # so if we are here, connection MIGHT be idle but alive.
+                            # Check for silence (no messages for 15 mins)
+                            # This handles "zombie" connections that don't fail pings but send no data
+                            if time.time() - self.last_heartbeat > 900:
+                                logger.warning("⚠️ Tree News WS silent for 15 mins. Forcing reconnect.")
+                                break
+                            continue
+                            
+                        except websockets.exceptions.ConnectionClosed:
+                            logger.warning("⚠️ Tree News WS connection closed. Reconnecting...")
+                            break
                         
                         try:
                             data = json.loads(message)
@@ -67,7 +91,7 @@ class TreeNewsStreamClient:
                         
                         # Tree News WS sends various message types
                         if isinstance(data, dict) and data.get("title"):
-                            logger.info(f"📨 WS Received: {data.get('title')[:50]}...")
+                            # logger.info(f"📨 WS Received: {data.get('title')[:50]}...")
                             processed = {
                                 "title": data.get("title", ""),
                                 "description": data.get("content", ""),
@@ -81,8 +105,9 @@ class TreeNewsStreamClient:
                             yield processed
                             
             except Exception as e:
-                logger.error(f"❌ WebSocket connection error: {e}. Retrying in 5s...")
-                await asyncio.sleep(5)
+                logger.error(f"❌ WebSocket connection error: {e}. Retrying in {backoff}s...")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
 class TreeNewsClient:
     """

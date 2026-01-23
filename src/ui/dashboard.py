@@ -33,6 +33,7 @@ def make_layout():
     )
     layout["left"].split(
         Layout(name="pnl", size=8),
+        Layout(name="whale", size=7),
         Layout(name="positions"),
     )
     return layout
@@ -110,6 +111,21 @@ def generate_positions_table(state):
         
     return Panel(table, title=f"Active Positions ({len(positions)})")
 
+def generate_whale_panel(state):
+    whales = state.get("whale_activity", {})
+    text = Text()
+    
+    if not whales:
+        text.append("(Waiting for whale signal...)", style="dim")
+    else:
+        for symbol, score in list(whales.items())[:5]:
+            # Score 0.0 to 1.0
+            color = "bold green" if score > 0.7 else "yellow" if score > 0.4 else "dim white"
+            bar = "█" * int(score * 10)
+            text.append(f"🐋 {symbol:10} [{bar:10}] {score:.0%}\n", style=color)
+            
+    return Panel(text, title="Whale Intelligence")
+
 def generate_log_panel(state):
     logs = state.get("recent_logs", [])
     text = Text()
@@ -146,6 +162,7 @@ def run_dashboard():
             
             layout["header"].update(generate_header(state))
             layout["pnl"].update(generate_pnl_panel(state))
+            layout["whale"].update(generate_whale_panel(state))
             layout["positions"].update(generate_positions_table(state))
             layout["right"].update(generate_log_panel(state))
             

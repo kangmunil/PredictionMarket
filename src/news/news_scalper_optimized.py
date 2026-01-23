@@ -124,7 +124,16 @@ class OptimizedNewsScalper:
         # Initialize Decision Logger
         notifier = self.swarm_system.notifier if self.swarm_system else None
         self.decision_logger = DecisionLogger("NewsScalper", notifier=notifier)
-        self.trade_recorder = TradeRecorder(filename="data/trades_log.csv")
+        
+        # CORRECTED RECORDING HEADERS
+        self.trade_recorder = TradeRecorder(
+            filename="data/trades_log.csv",
+            headers=[
+                'timestamp', 'market_question', 'tags', 'strategy', 
+                'side', 'entry_price', 'exit_price', 'size', 
+                'pnl', 'pnl_pct', 'reason'
+            ]
+        )
 
         if self.use_rag:
             logger.info("🤖 Initializing RAG System (Advanced AI Analysis)...")
@@ -151,7 +160,7 @@ class OptimizedNewsScalper:
         # Deduplication state
         self.processed_cache = set()
         self.processed_redis_key = "news:processed_ids"
-        default_hold = "1.5"
+        default_hold = "4.0" # Increased from 1.5h to 4.0h to allow news to play out
         self.signal_cooldown = timedelta(
             minutes=float(os.getenv("NEWS_SIGNAL_COOLDOWN_MINUTES", "15"))
         )
@@ -207,6 +216,8 @@ class OptimizedNewsScalper:
         self.cooldown_until: Dict[str, datetime] = {}
         self.latest_signals: Dict[str, Dict[str, float]] = {}
         self.processed_news = set()
+        self.recent_titles: Dict[str, datetime] = {}  # title string -> timestamp for similarity dedup
+        self.dead_tokens: Set[str] = set()  # Cache for delisted/404 tokens
         self._subscribed_books: Set[str] = set()
         self.stats = {
             "news_checked": 0,
@@ -223,6 +234,59 @@ class OptimizedNewsScalper:
 
         self.start_time = None
         self._is_warmed_up = False
+        
+        # Trading hours config (EST timezone)
+        self.enforce_trading_hours = os.getenv("ENFORCE_TRADING_HOURS", "true").lower() in ("true", "1", "yes")
+        self.trading_start_hour = int(os.getenv("TRADING_START_HOUR_EST", "9"))  # 9 AM EST
+        self.trading_end_hour = int(os.getenv("TRADING_END_HOUR_EST", "17"))  # 5 PM EST
+
+    def _is_trading_hours(self) -> bool:
+        """
+        Check if current time is within US market trading hours (EST).
+        Returns True if trading is allowed.
+        """
+        if not self.enforce_trading_hours:
+            return True
+            
+        from zoneinfo import ZoneInfo
+        now_est = datetime.now(ZoneInfo("America/New_York"))
+        hour = now_est.hour
+        
+        # Also skip weekends
+        if now_est.weekday() >= 5:  # Saturday=5, Sunday=6
+            return False
+            
+        return self.trading_start_hour <= hour < self.trading_end_hour
+
+    def _is_duplicate_title(self, title: str, threshold: float = 0.85) -> bool:
+        """
+        Check if the news title is a fuzzy duplicate of a recently processed title.
+        Prevents processing the same news from multiple sources.
+        """
+        from difflib import SequenceMatcher
+        
+        clean_title = title.strip().lower()
+        now = datetime.now()
+        
+        # 1. Exact match check (fast)
+        if clean_title in self.recent_titles:
+            self.recent_titles[clean_title] = now  # Refresh timestamp
+            return True
+            
+        # 2. Cleanup old titles (older than 1 hour)
+        stale_cutoff = now - timedelta(hours=1)
+        self.recent_titles = {t: ts for t, ts in self.recent_titles.items() if ts > stale_cutoff}
+        
+        # 3. Fuzzy match check
+        for old_title in self.recent_titles.keys():
+            similarity = SequenceMatcher(None, clean_title, old_title).ratio()
+            if similarity >= threshold:
+                logger.info(f"   ⏭️  Dropping duplicate news: '{title[:40]}...' (Similarity: {similarity:.1%})")
+                return True
+                
+        # 4. Store fresh title
+        self.recent_titles[clean_title] = now
+        return False
 
     def _passes_cooldown_gate(
         self,
@@ -284,6 +348,38 @@ class OptimizedNewsScalper:
         self.cooldowns[condition_id] = expiry
         logger.debug(f"   🧊 Cooldown set for {condition_id[:10]} until {expiry.strftime('%H:%M:%S')}")
 
+    async def _cleanup_stale_positions(self):
+        """
+        Remove positions older than 24 hours on startup.
+        Prevents repeated API errors from dead/resolved markets.
+        """
+        if not self.positions:
+            logger.info("   🧹 No stale positions to cleanup")
+            return
+            
+        stale_cutoff = datetime.now() - timedelta(hours=24)
+        stale_tokens = []
+        
+        for token_id, position in list(self.positions.items()):
+            entry_time = position.get("entry_time") or position.get("timestamp")
+            if isinstance(entry_time, str):
+                try:
+                    entry_time = datetime.fromisoformat(entry_time)
+                except:
+                    entry_time = datetime.now()
+            
+            if entry_time and entry_time < stale_cutoff:
+                stale_tokens.append(token_id)
+                self.dead_tokens.add(token_id)  # Also add to dead token cache
+                
+        for token_id in stale_tokens:
+            del self.positions[token_id]
+            
+        if stale_tokens:
+            logger.info(f"   🧹 Purged {len(stale_tokens)} stale positions (24h+ old)")
+        else:
+            logger.info("   🧹 No stale positions found")
+
     async def warmup(self, keywords: List[str]):
         """
         Pre-warm models and cache markets.
@@ -291,6 +387,9 @@ class OptimizedNewsScalper:
         This reduces first-request latency from 3-5s to <500ms.
         """
         logger.info("🔥 Warming up system...")
+
+        # 0. Cleanup stale positions (24h+ old)
+        await self._cleanup_stale_positions()
 
         # 1. Pre-load AI Model (RAG or FinBERT)
         if self.use_rag:
@@ -415,7 +514,7 @@ class OptimizedNewsScalper:
             # Stop stream task
             if self.stream_task:
                 self.stream_task.cancel()
-            await self._shutdown()
+            await self.shutdown()
 
     async def _run_news_stream(self, keywords: List[str]):
         """
@@ -494,6 +593,10 @@ class OptimizedNewsScalper:
         # Robust Deduplication (Redis + SHA256)
         news_id = hashlib.sha256(url.encode()).hexdigest()
         if await self._is_processed(news_id):
+            return None
+
+        # NEW: Fuzzy Title Deduplication (Task 5)
+        if self._is_duplicate_title(title):
             return None
 
         # Optimistically mark as processed (will unmark on error)
@@ -980,7 +1083,7 @@ class OptimizedNewsScalper:
             
             logger.info(f"   📊 Market: Bid ${bid_p:.3f} | Ask ${ask_p:.3f} | Spread {spread_pct:.1%}")
 
-            MAX_SPREAD = 0.05 # 5% Limit
+            MAX_SPREAD = 0.03  # 3% Limit (Tightened for better liquidity)
             if spread_pct > MAX_SPREAD:
                 logger.warning(f"   🛑 Spread too wide ({spread_pct:.1%} > {MAX_SPREAD:.0%}). Aborting trade to avoid instant loss.")
                 return
@@ -1292,6 +1395,7 @@ class OptimizedNewsScalper:
                     "market_group": market_group,
                     "expires_at": market_expiry,
                     "pnl_tids": [],
+                    "max_pnl": 0.0,  # Task 7: Track highest PnL reached
                 }
                 self.stats["trades_executed"] += 1
                 self.stats["positions_opened"] += 1
@@ -1310,9 +1414,22 @@ class OptimizedNewsScalper:
                             token_id=token_id,
                             side=side,
                             price=entry_price,
-                            size=position_size
+                            size=position_size,
+                            metadata={"group": (getattr(self, 'market_group', 'DEFAULT') or 'DEFAULT').upper()}
                         )
                         self.positions[token_id]["pnl_tids"].append(entry_tid)
+
+                    # 📱 TELEGRAM NOTIFICATION (Task 10)
+                    if hasattr(self.swarm_system, 'notifier') and self.swarm_system.notifier.enabled:
+                        asyncio.create_task(self.swarm_system.notifier.notify_trade(
+                            side=side,
+                            asset=market.get("question", token_id[:15]),
+                            price=entry_price,
+                            size=position_size,
+                            condition_id=condition_id,
+                            brain_score=size_multiplier,
+                            strategy="NewsScalper (🧪 PAPER)"
+                        ))
                 await self._record_delta_trade(
                     token_id,
                     side,
@@ -1390,6 +1507,7 @@ class OptimizedNewsScalper:
                         "market_group": market_group,
                         "expires_at": market_expiry,
                         "pnl_tids": [],
+                        "max_pnl": 0.0,
                     }
                     self.stats["trades_executed"] += 1
                     self.stats["positions_opened"] += 1
@@ -1402,9 +1520,22 @@ class OptimizedNewsScalper:
                             token_id=token_id,
                             side=side,
                             price=entry_price,
-                            size=position_size
+                            size=position_size,
+                            metadata={"group": (market_group or "DEFAULT").upper()}
                         )
                         self.positions[token_id]["pnl_tids"].append(entry_tid)
+
+                    # 📱 TELEGRAM NOTIFICATION (Task 10)
+                    if hasattr(self.swarm_system, 'notifier') and self.swarm_system.notifier.enabled:
+                        asyncio.create_task(self.swarm_system.notifier.notify_trade(
+                            side=side,
+                            asset=market.get("question", token_id[:15]),
+                            price=entry_price,
+                            size=position_size,
+                            condition_id=condition_id,
+                            brain_score=size_multiplier,
+                            strategy="NewsScalper (🚀 LIVE)"
+                        ))
                     await self._record_delta_trade(
                         token_id,
                         side,
@@ -1440,7 +1571,8 @@ class OptimizedNewsScalper:
                 "size": size,
                 "entry_price": entry_price,
                 "side": "BUY", # Hydration assumes BUY (long) for now
-                "entry_time": datetime.now()
+                "entry_time": datetime.now(),
+                "max_pnl": 0.0
             }
             logger.info(f"💧 Hydrated position for {token_id[:15]}... ({size} tokens @ ${entry_price})")
             
@@ -1661,7 +1793,8 @@ class OptimizedNewsScalper:
                     token_id=token_id,
                     side=position["side"],
                     price=entry_price,
-                    size=addition_size
+                    size=addition_size,
+                    metadata={"group": (position.get("market_group") or "DEFAULT").upper()}
                 )
                 position.setdefault("pnl_tids", []).append(scale_tid)
 
@@ -1752,11 +1885,35 @@ class OptimizedNewsScalper:
         now = datetime.now()
         elapsed_seconds = (now - entry_time).total_seconds()
 
-        if pnl_pct >= self.take_profit_pct:
-            exit_reason = f"🎯 Take-Profit Reached ({pnl_pct:+.2%})"
-        elif pnl_pct <= -self.stop_loss_pct:
-            exit_reason = f"🛑 Stop-Loss Triggered ({pnl_pct:+.2%})"
-        else:
+        # 1. Update max_pnl for Trailing Stop (Task 7)
+        if pnl_pct > position.get("max_pnl", 0.0):
+            position["max_pnl"] = pnl_pct
+
+        # 2. Calculate Dynamic Stop-Loss (Task 6)
+        base_stop = self.stop_loss_pct
+        market_data = position.get("market_data", {})
+        spread_pct = market_data.get("spread_pct", 0.01) # Default 1% if unknown
+        dynamic_stop = max(base_stop, spread_pct * 1.5)
+        
+        # 3. Check Trailing Stop Condition (Task 7)
+        trailing_stop_triggered = False
+        max_pnl = position.get("max_pnl", 0.0)
+        
+        if max_pnl >= 0.05: # 5% profit threshold
+            trail_distance = 0.02 # 2% trailing distance
+            if pnl_pct <= (max_pnl - trail_distance):
+                trailing_stop_triggered = True
+                exit_reason = f"📉 Trailing Stop Triggered ({pnl_pct:+.2%}, Peak: {max_pnl:+.2%})"
+
+        # 4. Fallback to TP/SL logic if no trailing stop
+        if not exit_reason:
+            if pnl_pct >= self.take_profit_pct:
+                exit_reason = f"🎯 Take-Profit Reached ({pnl_pct:+.2%})"
+            elif pnl_pct <= -dynamic_stop:
+                exit_reason = f"🛑 Dynamic Stop-Loss Triggered ({pnl_pct:+.2%}, Limit: {dynamic_stop:.1%})"
+        
+        # 5. Handle hold time and other signals
+        if not exit_reason:
             # Enforce minimum hold period (default 5 minutes) to avoid spread-churn exits.
             min_hold_seconds = getattr(self, "min_hold_seconds", 300)
             if elapsed_seconds < min_hold_seconds and pnl_pct < 0.02:
@@ -1806,7 +1963,12 @@ class OptimizedNewsScalper:
         Get current market price for token.
 
         Uses CLOB orderbook to get best bid/ask price.
+        Returns None for dead/delisted tokens (cached).
         """
+        # Early exit for known dead tokens
+        if token_id in self.dead_tokens:
+            return None
+            
         try:
             if self.clob_client and hasattr(self.clob_client, "get_real_market_price"):
                 price = await self.clob_client.get_real_market_price(
@@ -1841,6 +2003,12 @@ class OptimizedNewsScalper:
             return 0.5
 
         except Exception as e:
+            error_msg = str(e).lower()
+            # Cache dead/delisted tokens to prevent repeated 404s
+            if "dead/delisted" in error_msg or "404" in error_msg or "no orderbook" in error_msg:
+                self.dead_tokens.add(token_id)
+                logger.info(f"🪦 Token {token_id[:15]}... added to dead token cache (no more queries).")
+                return None
             logger.warning(f"⚠️  Failed to get current price for {token_id}: {e}")
             return 0.5
 
@@ -2013,11 +2181,18 @@ class OptimizedNewsScalper:
         logger.debug(f"   Open Positions: {len(self.positions)}")
         logger.debug(f"   Avg Latency: {avg_latency:.0f}ms")
 
-    async def _shutdown(self):
+    async def shutdown(self):
         """Shutdown with performance report"""
         logger.info("\n" + "=" * 80)
         logger.info("🛑 SHUTTING DOWN")
         logger.info("=" * 80)
+
+        # Stop stream task if running
+        if hasattr(self, 'stream_task') and self.stream_task:
+            self.stream_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.stream_task
+            self.stream_task = None
 
         # Close positions
         if self.positions:
@@ -2069,17 +2244,7 @@ class OptimizedNewsScalper:
         logger.info(f"   Status: {'✅ PASS' if avg_latency < 2000 else '⚠️  SLOW'}")
         logger.info("=" * 80)
 
-    async def shutdown(self):
-        """External shutdown hook for SwarmSystem."""
-        if self.stream_task:
-            self.stream_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self.stream_task
-            self.stream_task = None
 
-        if self.start_time:
-            with suppress(Exception):
-                await self._shutdown()
 
     async def _is_processed(self, news_id: str) -> bool:
         """Check if news_id has been processed (Redis first, then local)"""
@@ -2119,3 +2284,30 @@ class OptimizedNewsScalper:
                 await self.redis.srem(self.processed_redis_key, news_id)
             except Exception as e:
                 logger.error(f"Redis dedupe remove failed: {e}")
+
+    async def shutdown(self):
+        """Shut down all news sub-components and close sessions"""
+        logger.info("🎬 NewsScalper: Shutting down components...")
+        
+        # 1. Close NewsAggregator (aiohttp session)
+        if hasattr(self, 'news_aggregator') and self.news_aggregator:
+            try:
+                await self.news_aggregator.close()
+            except Exception as e:
+                logger.error(f"Error closing NewsAggregator: {e}")
+
+        # 2. Close RAG System
+        if hasattr(self, 'rag_system') and self.rag_system:
+             try:
+                 if hasattr(self.rag_system, 'close'):
+                     await self.rag_system.close()
+             except Exception as e:
+                 logger.error(f"Error closing RAG system: {e}")
+
+        # 3. Clean up stream task if running
+        if self.stream_task and not self.stream_task.done():
+            self.stream_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.stream_task
+        
+        logger.info("✅ NewsScalper: Shutdown complete")

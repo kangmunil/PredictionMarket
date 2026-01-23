@@ -13,6 +13,8 @@ from web3.middleware import ExtraDataToPOAMiddleware
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import MarketOrderArgs, OrderArgs, BalanceAllowanceParams, AssetType
 from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client.constants import AMOY, POLYGON
+from py_clob_client.exceptions import PolyApiException
 
 from src.core.config import Config
 from src.core.market_registry import market_registry
@@ -21,6 +23,10 @@ from src.core.price_history_api import PolymarketHistoryAPI
 from src.core.health_monitor import PROM_API_REQUESTS, PROM_API_ERRORS, PROM_LATENCY
 
 logger = logging.getLogger(__name__)
+
+class MarketDelistedError(Exception):
+    """Raised when a market or token is no longer found (404/delisted)"""
+    pass
 
 class LocalOrderBook:
     """
@@ -150,7 +156,7 @@ class PolyClient:
         self.orderbooks: Dict[str, LocalOrderBook] = {}
         self.callbacks: Dict[str, List[Callable]] = {}
         self.signal_bus = None  # optional: set by SwarmSystem
-        self._last_known_balance: Optional[float] = None
+        self._last_known_balance: Optional[float] = 10000.0 if self.config.DRY_RUN else None
         self.redis = None # Redis caching layer
 
         self._init_rest_client()
@@ -159,6 +165,10 @@ class PolyClient:
                 self._mcp_client = PolymarketMCPClient()
             except Exception as exc:
                 logger.warning(f"⚠️ MCP client init failed: {exc}")
+
+        # Configurable Minimum Order Value (default 5.0 to be safe, can be lowered to 1.0)
+        self.min_order_value = float(os.getenv("MIN_ORDER_VALUE_USD", "5.0"))
+        logger.info(f"💰 Minimum Order Value set to ${self.min_order_value:.2f}")
 
     def _init_web3(self):
         """Initialize optional Web3 + contract state."""
@@ -217,8 +227,8 @@ class PolyClient:
                 # Add keep-alive settings to prevent idle disconnections
                 async with websockets.connect(
                     self.ws_url,
-                    ping_interval=None,  # Disable client-side ping to avoid 1011 errors on heavy load
-                    ping_timeout=None,   # Trust TCP keepalive
+                    ping_interval=30,    # Ping every 30s
+                    ping_timeout=30,     # Wait 30s for pong
                     close_timeout=10,
                     max_size=2**23,    # 8MB message size limit
                 ) as ws:
@@ -240,12 +250,12 @@ class PolyClient:
                             logger.warning(f"⚠️ Limiting WebSocket subscriptions: {len(token_list)} → {max_subscriptions} tokens")
                             token_list = token_list[:max_subscriptions]
 
-                        batch_size = 5
+                        batch_size = 20
                         for i in range(0, len(token_list), batch_size):
                             batch = token_list[i:i+batch_size]
                             await self._send_subscribe(batch)
                             logger.info(f"📡 Subscribed to batch {i//batch_size + 1}: {len(batch)} tokens")
-                            await asyncio.sleep(2.0)  # Throttled delay between batches to prevent ping timeout
+                            await asyncio.sleep(0.5)  # Throttled delay between batches to prevent ping timeout
                         logger.info(f"✅ Total subscribed: {len(token_list)} tokens")
 
                     async for msg in ws:
@@ -289,7 +299,10 @@ class PolyClient:
             await self.ws_connection.send(payload_str)
             logger.info(f"📤 Sent subscription for {len(token_ids)} tokens")
         except Exception as e:
-            logger.error(f"❌ Failed to send subscription: {e}")
+            logger.error(f"❌ Failed to send subscription: {e} - Forcing reconnect")
+            if self.ws_connection:
+                await self.ws_connection.close()
+            self.ws_connection = None # Signal main loop to reconnect
 
     async def _handle_ws_message(self, message: str):
         try:
@@ -619,17 +632,36 @@ class PolyClient:
         try:
             # 1. Minimum Order Value Check
             total_usd = Decimal(str(price)) * Decimal(str(size))
-            min_order_value = float(os.getenv("MIN_ORDER_VALUE_USD", "5.0"))
-
-            if float(total_usd) < min_order_value:
+            
+            # Allow slightly lower than min to account for rounding, but enforce soft limit
+            if float(total_usd) < (self.min_order_value - 0.05):
                 PROM_API_ERRORS.labels(service="clob_limit_order", error_type="order_too_small").inc()
                 logger.warning(
-                    f"⚠️ Order rejected: ${total_usd:.2f} < minimum ${min_order_value:.2f} "
-                    f"(Polymarket typically rejects orders below $5)"
+                    f"⚠️ Order rejected: ${total_usd:.2f} < minimum ${self.min_order_value:.2f} "
+                    f"(Polymarket typically rejects orders below $5, ensure config allows this)"
                 )
                 return None
 
-            # 2. Budget Check
+            # 1.5 Market Validity Check (Prevent 404 errors)
+            try:
+                order_book = self.rest_client.get_order_book(token_id)
+                if not order_book:
+                    logger.warning(f"⚠️ Market invalid or delisted: {token_id[:20]}...")
+                    return None
+            except Exception as e:
+                if "404" in str(e) or "not found" in str(e).lower():
+                    logger.warning(f"⚠️ Market not found: {token_id[:20]}...")
+                    return None
+                # Other errors - proceed anyway
+
+            # 2. Balance Pre-Check (Prevent API rejection)
+            if side.upper() == "BUY":
+                current_balance = await self.get_usdc_balance()
+                if current_balance < float(total_usd):
+                    logger.warning(f"⚠️ Insufficient balance: ${current_balance:.2f} < required ${total_usd:.2f}")
+                    return None
+
+            # 3. Budget Check
             allocation_id = None
             if self.budget_manager:
                 allocation_id = await self.budget_manager.request_allocation(
@@ -642,7 +674,15 @@ class PolyClient:
                     logger.warning(f"⚠️ Limit order denied: Need ${total_usd:.2f}")
                     return None
 
-            # 3. Create Order Args
+            # 3. Clamp price to valid Polymarket range [0.01, 0.99]
+            MIN_PRICE = 0.01
+            MAX_PRICE = 0.99
+            original_price = price
+            price = max(MIN_PRICE, min(MAX_PRICE, price))
+            if price != original_price:
+                logger.warning(f"⚠️ Price clamped: ${original_price:.3f} → ${price:.3f} (valid range: {MIN_PRICE}-{MAX_PRICE})")
+
+            # 4. Create Order Args
             order_args = OrderArgs(
                 price=float(price),
                 size=float(size),
@@ -778,9 +818,9 @@ class PolyClient:
             
             # Recalculate if SELLING (limit < market) brings value below minimum
             limit_val = shares * limit_price
-            if limit_val < 5.0 and amount >= 5.0:
-                logger.info(f"   ⚖️ Limit val ${limit_val:.2f} < $5.00. Adjusting shares using Limit Price ${limit_price:.3f}")
-                shares = 5.0 / limit_price if limit_price > 0 else shares
+            if limit_val < self.min_order_value and amount >= self.min_order_value:
+                logger.info(f"   ⚖️ Limit val ${limit_val:.2f} < ${self.min_order_value:.2f}. Adjusting shares using Limit Price ${limit_price:.3f}")
+                shares = self.min_order_value / limit_price if limit_price > 0 else shares
                 shares *= 1.01 # 1% safety buffer
 
             shares = float(f"{shares:.2f}")
@@ -851,9 +891,9 @@ class PolyClient:
         
         shares = round(shares, 2)
         
-        if shares * limit_price < 4.99:
-             # Bump shares to hit $5
-             shares = 5.0 / limit_price
+        if shares * limit_price < (self.min_order_value - 0.01):
+             # Bump shares to hit min value
+             shares = self.min_order_value / limit_price
              # Safety buffer and round again
              shares *= 1.01 
 
@@ -870,10 +910,10 @@ class PolyClient:
             token_id[:12],
         )
         
-        # Validate minimum order value (allow ~$5.00 with small tolerance)
+        # Validate minimum order value (allow small tolerance)
         order_value = shares * limit_price
-        if order_value < 4.99:
-            logger.warning(f"⚠️ Order rejected: ${order_value:.2f} < minimum $5.00")
+        if order_value < (self.min_order_value - 0.05):
+            logger.warning(f"⚠️ Order rejected: ${order_value:.2f} < minimum ${self.min_order_value:.2f}")
             return None
         
         order_id = await self.place_limit_order(token_id, side, limit_price, shares)
@@ -960,6 +1000,9 @@ class PolyClient:
                     if ob.bids:
                         best_bid = float(ob.bids[0].price)
             except Exception as exc:
+                if "404" in str(exc) or "No orderbook" in str(exc):
+                    # Critical: signal caller to remove this token
+                    raise MarketDelistedError(f"Token {token_id} is dead/delisted: {exc}")
                 logger.debug(f"Order book lookup failed for {token_id}: {exc}")
 
         if best_bid > 0 and best_ask > 0:
@@ -1013,6 +1056,19 @@ class PolyClient:
             finally:
                 self.price_history_api = None
 
+        if self._mcp_client:
+            try:
+                # If it has a close method, use it
+                if hasattr(self._mcp_client, "close"):
+                    await self._mcp_client.close()
+                # Otherwise, try calling its async exit
+                elif hasattr(self._mcp_client, "__aexit__"):
+                    await self._mcp_client.__aexit__(None, None, None)
+            except Exception as exc:
+                logger.debug(f"MCP client close error: {exc}")
+            finally:
+                self._mcp_client = None
+
     async def _broadcast_orderbook_snapshot(self, token_id: str, book: "LocalOrderBook"):
         if not self.signal_bus:
             return
@@ -1034,6 +1090,9 @@ class PolyClient:
         Return the live collateral (USDC) balance.
         Prefers authenticated REST client, falls back to public endpoint.
         """
+        if self.config.DRY_RUN:
+            return 10000.0
+
         # Method 1: Use authenticated client (Reliable)
         if self.rest_client:
             try:
@@ -1086,9 +1145,10 @@ class PolyClient:
                     logger.warning(f"Failed to fetch balance after {max_retries} attempts: {exc}")
 
         if self._last_known_balance is not None:
-            logger.info(
-                "Using cached balance ($%.2f) due to connection failure.",
-                self._last_known_balance,
-            )
+            if not self.config.DRY_RUN:
+                logger.info(
+                    "Using cached balance ($%.2f) due to connection failure.",
+                    self._last_known_balance,
+                )
             return self._last_known_balance
-        return None
+        return 0.0 if self.config.DRY_RUN else None

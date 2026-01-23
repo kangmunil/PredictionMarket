@@ -387,7 +387,7 @@ class OpenRouterRAGSystem:
                     }
                 ],
                 temperature=0.3,
-                max_tokens=500
+                max_tokens=8000  # Maximum for rich AI output
             )
 
             content = response.choices[0].message.content
@@ -693,7 +693,7 @@ Determine the new fair probability given this information.
                     }
                 ],
                 temperature=0.3, # Lower temperature for more consistent JSON
-                max_tokens=1000
+                max_tokens=8000  # Maximum for rich AI output
             )
 
             content = response.choices[0].message.content.strip()
@@ -836,7 +836,7 @@ Return a JSON object:
                     }
                 ],
                 temperature=0.1,
-                max_tokens=500
+                max_tokens=8000  # Maximum for rich AI output
             )
 
             content = response.choices[0].message.content.strip()

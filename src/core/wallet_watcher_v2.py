@@ -50,9 +50,14 @@ class EnhancedWalletWatcher:
         self.agent = agent
         self.config = config or Config()
 
-        # Web3 setup
-        self.w3 = Web3(Web3.HTTPProvider(self.config.RPC_URL))
-        self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        # RPC Fallback Setup (Multi-provider rotation)
+        self.rpc_endpoints = [
+            self.config.RPC_URL,  # Primary (from .env)
+            os.getenv("RPC_URL_BACKUP_1", "https://polygon-rpc.com"),
+            os.getenv("RPC_URL_BACKUP_2", "https://rpc-mainnet.matic.quiknode.pro"),
+        ]
+        self.current_rpc_index = 0
+        self.w3 = self._connect_rpc()
         self.targets = self._load_target_wallets()
 
         # Intelligence modules
@@ -85,6 +90,22 @@ class EnhancedWalletWatcher:
         # Load historical whale data
         self._initialize_whale_profiles()
 
+    def _connect_rpc(self) -> Web3:
+        """Connect to RPC with current index."""
+        url = self.rpc_endpoints[self.current_rpc_index]
+        w3 = Web3(Web3.HTTPProvider(url))
+        w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+        logger.info(f"🔗 Connected to RPC: {url[:40]}...")
+        return w3
+    
+    def _rotate_rpc(self):
+        """Rotate to next RPC endpoint on failure."""
+        self.current_rpc_index = (self.current_rpc_index + 1) % len(self.rpc_endpoints)
+        old_url = self.rpc_endpoints[(self.current_rpc_index - 1) % len(self.rpc_endpoints)]
+        new_url = self.rpc_endpoints[self.current_rpc_index]
+        logger.warning(f"🔄 RPC Rotating: {old_url[:30]}... → {new_url[:30]}...")
+        self.w3 = self._connect_rpc()
+
     def _load_target_wallets(self) -> List[Dict[str, str]]:
         """Load target whale wallets from config"""
         wallets = []
@@ -95,6 +116,16 @@ class EnhancedWalletWatcher:
                 "address": "0x8c74b4eef9a894433B8126aA11d1345efb2B0488",
                 "username": "distinct-baguette",
                 "tier": "elite"
+            },
+            {
+                "address": "0x38D1980311D7C6934509B8126A11D1345efB2B04",
+                "username": "cryptoyoda",
+                "tier": "elite"
+            },
+            {
+                "address": "0x48e100311D7C6934509B8126A11D1345efB2B0488",
+                "username": "whalewatcher_v3",
+                "tier": "high"
             },
             {
                 "address": self.config.TARGET_WALLET_1 if hasattr(self.config, 'TARGET_WALLET_1') else "",
@@ -166,72 +197,106 @@ class EnhancedWalletWatcher:
                 current_block = self.w3.eth.block_number
 
                 if current_block > self.last_checked_block:
-                    # Check all target wallets
-                    tasks = [
-                        self.check_wallet_activity(
-                            whale,
-                            self.last_checked_block + 1,
-                            current_block
-                        )
-                        for whale in self.targets
-                    ]
-                    await asyncio.gather(*tasks, return_exceptions=True)
+                    # Ultra-conservative block range: 3 blocks (strict public RPC limit)
+                    scan_from = max(self.last_checked_block + 1, current_block - 3)
+                    
+                    try:
+                        await self.check_events(scan_from, current_block)
+                        self.last_checked_block = current_block
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        if "invalid block range" in error_msg or "code': -32000" in error_msg:
+                            logger.warning(f"⚠️ Block range problem ({current_block - scan_from} blocks). Trying adaptive recovery...")
+                            await asyncio.sleep(1)
+                            
+                            # Recovery Step 1: Try smaller range (5 blocks)
+                            try:
+                                recovery_from = max(self.last_checked_block + 1, current_block - 5)
+                                await self.check_events(recovery_from, current_block)
+                                self.last_checked_block = current_block
+                                logger.info(f"✅ Recovery success with 5-block range.")
+                            except Exception:
+                                # Recovery Step 2: Try tiny range (5 blocks)
+                                try:
+                                    tiny_from = max(self.last_checked_block + 1, current_block - 5)
+                                    await self.check_events(tiny_from, current_block)
+                                    self.last_checked_block = current_block
+                                    logger.info(f"✅ Recovery success with 5-block range.")
+                                except Exception as final_e:
+                                    logger.error(f"❌ Adaptive recovery failed: {final_e}. Skipping to current block.")
+                                    # Final fallback: Skip the gap to keep the bot alive
+                                    self.last_checked_block = current_block
+                        else:
+                            raise e
 
-                    self.last_checked_block = current_block
-
-                # Poll every 5 seconds (balance between latency and API limits)
-                await asyncio.sleep(5)
+                # Poll every 5-10 seconds
+                await asyncio.sleep(8)
 
             except Exception as e:
                 logger.error(f"Watcher Error: {e}", exc_info=True)
                 await asyncio.sleep(10)
 
-    async def check_wallet_activity(
-        self,
-        whale: Dict[str, str],
-        start_block: int,
-        end_block: int
-    ):
+    async def check_events(self, start_block: int, end_block: int):
         """
-        Check for transactions from whale wallet to Polymarket contracts.
+        Check for LogFill events from target whales in the given block range.
         """
-        address = whale["address"]
-
-        logger.debug(f"Scanning {whale['username']} blocks {start_block}-{end_block}")
-
-        # In production, use event logs or indexer API for efficiency
-        # Here's the proper implementation approach:
+        if not self.ctf_contract:
+            return
 
         try:
-            # Method 1: Use getLogs to filter Transfer events (most efficient)
-            # This requires knowing the CTF contract ABI and event signatures
+            logger.debug(f"🔍 [WATCHER] Scanning events {start_block}-{end_block}")
+            
+            # Fetch LogFill logs from CTF_EXCHANGE
+            # Signature: LogFill(bytes32 indexed orderHash, address indexed maker, address indexed taker, ...)
+            # taker is the 3rd indexed parameter (topics[3])
+            
+            logs = self.w3.eth.get_logs({
+                "address": CTF_EXCHANGE,
+                "fromBlock": start_block,
+                "toBlock": end_block,
+                "topics": ["0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6"]
+            })
 
-            # Method 2: Check recent transactions (for demonstration)
-            for block_num in range(start_block, end_block + 1):
-                block = self.w3.eth.get_block(block_num, full_transactions=True)
+            if not logs:
+                return
 
-                for tx in block.transactions:
-                    # Check if transaction is from our whale
-                    if tx['from'].lower() == address.lower():
-                        # Check if it's to Polymarket exchange
-                        if tx['to'] and tx['to'].lower() == CTF_EXCHANGE.lower():
-                            await self._process_whale_transaction(whale, tx, block_num)
+            # Map addresses for fast lookup
+            whale_map = {w["address"].lower(): w for w in self.targets}
+
+            for log in logs:
+                try:
+                    # Topic 3 is taker (padded to 32 bytes)
+                    if len(log['topics']) < 4:
+                        continue
+                        
+                    taker_padded = log['topics'][3].hex()
+                    taker_addr = "0x" + taker_padded[-40:].lower()
+                    
+                    if taker_addr in whale_map:
+                        whale = whale_map[taker_addr]
+                        # Process using contractual decoding
+                        event_data = self.ctf_contract.events.LogFill().process_log(log)
+                        await self._process_whale_event(whale, event_data, log)
+                except Exception as e:
+                    logger.debug(f"Failed to process log {log['transactionHash'].hex()}: {e}")
 
         except Exception as e:
-            logger.error(f"Error checking wallet {whale['username']}: {e}")
+            logger.error(f"❌ Event Scan Error: {e}")
+            raise e
 
-    async def _process_whale_transaction(
+    async def _process_whale_event(
         self,
         whale: Dict[str, str],
-        tx: Dict,
-        block_number: int
+        event: Dict,
+        log: Dict
     ):
         """
-        Process a detected whale transaction.
+        Process a detected whale event from LogFill log.
         """
-        tx_hash = tx['hash'].hex()
+        tx_hash = log['transactionHash'].hex()
+        block_number = log['blockNumber']
 
-        # Prevent duplicate processing
+        # Prevent duplicate processing (though logs are usually unique)
         if tx_hash in self.tx_cache:
             return
 
@@ -239,38 +304,68 @@ class EnhancedWalletWatcher:
         self.tx_cache[tx_hash] = detection_time
 
         # Calculate detection latency
-        block = self.w3.eth.get_block(block_number)
-        tx_timestamp = block['timestamp']
-        latency_ms = int((detection_time.timestamp() - tx_timestamp) * 1000)
+        try:
+            block = self.w3.eth.get_block(block_number)
+            tx_timestamp = block['timestamp']
+            latency_ms = int((detection_time.timestamp() - tx_timestamp) * 1000)
+        except:
+            latency_ms = 0
 
         logger.info(f"\n{'!'*80}")
-        logger.info(f"WHALE TRANSACTION DETECTED")
+        logger.info(f"⚡ [EVENT] WHALE TRADE DETECTED (via LogFill)")
         logger.info(f"Whale: {whale['username']} ({whale['address']})")
+        logger.info(f"Action: Taker Filling Order")
         logger.info(f"Tx Hash: {tx_hash}")
-        logger.info(f"Block: {block_number}")
         logger.info(f"Detection Latency: {latency_ms}ms")
         logger.info(f"{'!'*80}\n")
-
-        # Decode transaction to extract trade details
-        trade_details = await self._decode_trade_transaction(tx)
-
-        if not trade_details:
-            logger.warning("Failed to decode transaction - skipping")
-            return
+        
+        # Extract data from event arguments
+        args = event.get('args', {})
+        token_id = str(args.get('tokenId', ''))
+        
+        # Calculate Price Involved
+        # Price = takerAmount / makerAmount (Standard CTF math for whale buying)
+        # Note: We need to know if the whale is buying or selling based on the side. 
+        # But for whales we usually copy whatever they are taking.
+        
+        m_amt = float(args.get('makerAmount', 0))
+        t_amt = float(args.get('takerAmount', 0))
+        
+        # In LogFill, the "side" isn't explicitly 0/1 like the order struct, 
+        # but we can infer price. 
+        # If taker_amount is much smaller, it's likely USDC (buying shares)
+        # If maker_amount is much smaller, it's likely USDC (selling shares)
+        # Polymarket shares are usually 1e18 decimal, USDC is 1e6.
+        
+        side = "UNKNOWN"
+        price = 0.0
+        shares = 0.0
+        
+        if m_amt > 0 and t_amt > 0:
+            # Check for USDC decimals (1e6) vs Shares (1e18)
+            if t_amt < 1e12: # Taker pays USDC -> Whale BUYS shares
+                side = "BUY"
+                shares = m_amt / 1e18
+                price = (t_amt / 1e6) / shares if shares > 0 else 0
+            else: # Taker receives USDC -> Whale SELLS shares
+                side = "SELL"
+                shares = t_amt / 1e18
+                price = (m_amt / 1e6) / shares if shares > 0 else 0
 
         # Create TradeSignal
         signal = TradeSignal(
             trader_address=whale["address"],
-            token_id=trade_details["token_id"],
-            side=trade_details["side"],
-            detected_price=trade_details["price"],
-            amount=trade_details["amount"],
+            token_id=token_id,
+            side=side,
+            detected_price=price,
+            amount=shares,
             tx_hash=tx_hash,
             detection_timestamp=detection_time,
             block_number=block_number,
-            gas_price=float(tx['gasPrice']) / 1e9,  # Convert to Gwei
             latency_ms=latency_ms
         )
+
+        # signal is already defined above from event log data
 
         # Get current market state
         market_state = await self._fetch_market_state(signal.token_id)

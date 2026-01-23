@@ -83,7 +83,8 @@ class ArbitrageStrategy:
             try:
                 if self.gamma_client:
                     # 1. Crypto 마켓 스캔 (모든 크립토)
-                    markets = await self.gamma_client.get_active_markets(limit=200, volume_min=10)
+                    limit = self.gamma_client.config.STRATEGY_MARKET_CAP
+                    markets = await self.gamma_client.get_active_markets(limit=limit, volume_min=10)
                     new_assets = []
                     crypto_count = 0
                     general_count = 0

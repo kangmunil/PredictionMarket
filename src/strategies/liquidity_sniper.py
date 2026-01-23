@@ -125,3 +125,9 @@ class LiquiditySniper:
                     score=0.8, 
                     side='SELL' # Interpret as Bearish
                 )
+
+    async def shutdown(self):
+        """Stop the monitoring loop"""
+        logger.info("🎬 Shutting down LiquiditySniper...")
+        self.running = False
+        logger.info("✅ LiquiditySniper shutdown complete")

@@ -6,6 +6,8 @@ load_dotenv()
 
 class Config:
     _dry_run_override = None
+    _tg_alerts_override = None
+    _tg_min_size_override = None
     
     def __init__(self):
         pass
@@ -115,6 +117,16 @@ class Config:
         return float(os.getenv("TAKER_FEE", "0.002"))
 
     @property
+    def DRY_RUN_SLIPPAGE_BPS(self) -> int:
+        """Simulated slippage in basis points (1 = 0.01%)"""
+        return int(os.getenv("DRY_RUN_SLIPPAGE_BPS", "20")) # 0.2%
+
+    @property
+    def DRY_RUN_FEE_BPS(self) -> int:
+        """Simulated trading fee in basis points"""
+        return int(os.getenv("DRY_RUN_FEE_BPS", "10")) # 0.1%
+
+    @property
     def SLIPPAGE_BUFFER(self) -> float:
         return float(os.getenv("SLIPPAGE_BUFFER", "0.001"))  # 0.0015 -> 0.001 (0.1%)
 
@@ -195,3 +207,43 @@ class Config:
     def ENABLE_ENSEMBLE_VERIFICATION(self) -> bool:
         val = os.getenv("ENABLE_ENSEMBLE_VERIFICATION", "true").lower()
         return val in ("true", "1", "yes", "on")
+
+    # --- Unified Token Management ---
+    @property
+    def GLOBAL_MONITOR_LIMIT(self) -> int:
+        """Total number of tokens/markets to track in the system."""
+        return int(os.getenv("GLOBAL_MONITOR_LIMIT", "2000"))
+
+    @property
+    def DISCOVERY_BATCH_SIZE(self) -> int:
+        """Maximum number of markets to fetch in a single discovery scan batch."""
+        return int(os.getenv("DISCOVERY_BATCH_SIZE", "500"))
+
+    @property
+    def STRATEGY_MARKET_CAP(self) -> int:
+        """Maximum number of markets a single strategy agent should monitor."""
+        return int(os.getenv("STRATEGY_MARKET_CAP", "1000"))
+
+    # --- Telegram & Notifications ---
+    @property
+    def TELEGRAM_MIN_TRADE_SIZE(self) -> float:
+        """Minimum trade size in USD to trigger a Telegram notification."""
+        if Config._tg_min_size_override is not None:
+            return Config._tg_min_size_override
+        return float(os.getenv("TELEGRAM_MIN_TRADE_SIZE", "1.0"))
+
+    @TELEGRAM_MIN_TRADE_SIZE.setter
+    def TELEGRAM_MIN_TRADE_SIZE(self, value: float):
+        Config._tg_min_size_override = float(value)
+
+    @property
+    def TELEGRAM_NOTIFICATIONS_ENABLED(self) -> bool:
+        """Global toggle for Telegram trade notifications."""
+        if Config._tg_alerts_override is not None:
+            return Config._tg_alerts_override
+        val = os.getenv("TELEGRAM_NOTIFICATIONS_ENABLED", "True").lower()
+        return val in ("true", "1", "yes", "on")
+
+    @TELEGRAM_NOTIFICATIONS_ENABLED.setter
+    def TELEGRAM_NOTIFICATIONS_ENABLED(self, value: bool):
+        Config._tg_alerts_override = bool(value)

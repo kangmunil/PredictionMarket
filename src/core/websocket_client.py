@@ -249,14 +249,17 @@ class PolymarketWebSocket:
         for asset_id in asset_ids:
             self.orderbooks[asset_id] = LocalOrderBook(asset_id)
 
+        backoff = self.reconnect_delay
         while self.running:
             try:
                 await self._connect_and_listen()
+                backoff = self.reconnect_delay # Reset on success
             except Exception as e:
                 logger.error(f"❌ WebSocket error: {e}")
                 if self.running:
-                    logger.info(f"🔄 Reconnecting in {self.reconnect_delay}s...")
-                    await asyncio.sleep(self.reconnect_delay)
+                    logger.info(f"🔄 Reconnecting in {backoff}s...")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
                 else:
                     break
 

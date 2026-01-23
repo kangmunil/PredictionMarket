@@ -24,6 +24,7 @@ import json
 import os
 from datetime import datetime, timedelta
 
+from src.core.config import Config
 from src.core.polymarket_mcp_client import (
     get_default_mcp_client,
     PolymarketMCPClient,
@@ -79,7 +80,9 @@ class MarketMatcher:
         self,
         gamma_api_url: str = "https://gamma-api.polymarket.com",
         use_mcp: Optional[bool] = None,
+        config: Optional[Config] = None,
     ):
+        self.config = config or Config()
         self.gamma_api_url = gamma_api_url
         self.cache = {}  # Cache market searches
         if use_mcp is None:
@@ -126,7 +129,7 @@ class MarketMatcher:
         self,
         news_text: str,
         min_volume: float = 10.0,
-        max_results: int = 5,
+        max_results: int = 20,
         override_keywords: Optional[List[str]] = None
     ) -> List[Dict]:
         """
@@ -254,7 +257,9 @@ class MarketMatcher:
         url = f"{self.gamma_api_url}/markets"
 
         async def fetch_query(q):
-            params = {"active": "true", "closed": "false", "limit": 100, "query": q}
+            # Use halved batch size for sub-queries
+            sub_limit = self.config.DISCOVERY_BATCH_SIZE // 2
+            params = {"active": "true", "closed": "false", "limit": sub_limit, "query": q}
             try:
                 loop = asyncio.get_event_loop()
                 resp = await loop.run_in_executor(None, lambda: requests.get(url, params=params, timeout=10))
@@ -295,7 +300,9 @@ class MarketMatcher:
         assert self._mcp_client
         tasks = []
         for q in list(queries)[:5]:
-            tasks.append(self._mcp_client.search_markets(query=q, limit=50, closed=False))
+            # Use smaller batch for MCP search relative to global limit
+            mcp_limit = self.config.DISCOVERY_BATCH_SIZE // 2
+            tasks.append(self._mcp_client.search_markets(query=q, limit=mcp_limit, closed=False))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 

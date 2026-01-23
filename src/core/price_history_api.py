@@ -13,10 +13,10 @@ from src.core.polymarket_mcp_client import (
     get_default_mcp_client,
     PolymarketMCPClient,
 )
+from src.core.config import Config
 from src.core.market_registry import market_registry
 
 logger = logging.getLogger(__name__)
-
 
 class PolymarketHistoryAPI:
     """
@@ -27,7 +27,9 @@ class PolymarketHistoryAPI:
         self,
         gamma_url: str = "https://gamma-api.polymarket.com",
         use_mcp: Optional[bool] = None,
+        config: Optional[Config] = None,
     ):
+        self.config = config or Config()
         self.gamma_url = gamma_url
         self.session: Optional[aiohttp.ClientSession] = None
         if use_mcp is None:
@@ -70,8 +72,9 @@ class PolymarketHistoryAPI:
         condition_id: str,
         start_time: datetime,
         end_time: datetime,
-        interval: str = "1h"
-    ) -> List[Dict]:
+        interval: str = "1h",
+        market_data: Optional[Dict] = None,
+    ):
         """
         Fetch historical price data for a specific market
 
@@ -107,12 +110,16 @@ class PolymarketHistoryAPI:
         condition_id: str,
         days: int = 30,
         min_points: int = 10,
+        market_data: Optional[Dict] = None,
     ) -> Tuple[List[Dict], str]:
         """
         Return historical points along with the data source that produced them.
         This is the primary entrypoint for strategies that need to reason
         about data quality.
         """
+        if market_data:
+            market_registry.register_market(market_data)
+
         await self._ensure_session()
 
         end_time = datetime.now()
@@ -228,7 +235,7 @@ class PolymarketHistoryAPI:
             url = "https://clob.polymarket.com/prices-history"
             params = {"interval": interval, "market": token_id, "fidelity": 500}
             
-            async with self.session.get(url, params=params, timeout=10) as resp:
+            async with self.session.get(url, params=params, timeout=20) as resp:
                 if resp.status != 200:
                     return []
                 data = await resp.json()
@@ -257,16 +264,37 @@ class PolymarketHistoryAPI:
 
     async def _fetch_market_snapshot(self, condition_id: str) -> Optional[Dict]:
         """Get Token IDs from Gamma API (Required for CLOB history)"""
+        # 1. Check Registry Cache first
+        cached = market_registry.get_market(condition_id)
+        if cached:
+            return cached
+
         await self._ensure_session()
         if not self.session:
             return None
 
-        # Gamma API doesn't support direct condition_id lookup reliably.
-        # We must fetch active markets and find it.
+        # 2. Direct lookup by condition_id (Polymarket Gamma API supports query=CID)
         url = f"{self.gamma_url}/markets"
-        params = {"active": "true", "limit": "500", "closed": "false"}
+        params = {"active": "true", "query": condition_id} # Direct query is much faster
         try:
-            async with self.session.get(url, params=params, timeout=10) as response:
+            async with self.session.get(url, params=params, timeout=20) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if isinstance(data, list) and data:
+                        # Find exact match in case of multiple results
+                        for m in data:
+                            if m.get('conditionId') == condition_id:
+                                market_registry.register_market(m)
+                                return m
+
+        except Exception as exc:
+            logger.debug(f"Direct CID lookup failed for {condition_id}: {exc}")
+
+        # 3. Fallback to scanning active markets (Legacy/Slow)
+        limit = str(self.config.GLOBAL_MONITOR_LIMIT)
+        params = {"active": "true", "limit": limit, "closed": "false"}
+        try:
+            async with self.session.get(url, params=params, timeout=20) as response:
                 if response.status != 200:
                     logger.error(f"Failed to fetch markets list: HTTP {response.status}")
                     return None
@@ -277,7 +305,7 @@ class PolymarketHistoryAPI:
                         if market.get('conditionId') == condition_id:
                             return market
                             
-                    logger.warning(f"Market {condition_id} not found in active list (limit 500)")
+                    logger.warning(f"Market {condition_id} not found in active list (limit {limit})")
                     return None
                 return None
         except asyncio.TimeoutError:
@@ -305,7 +333,8 @@ class PolymarketHistoryAPI:
         }
 
         try:
-            async with self.session.get(url, params=params, timeout=15) as response:
+            # Polymarket Gamma /events can be slow for high-volume markets
+            async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as response:
                 if response.status != 200:
                     logger.error(f"Failed to fetch events for {condition_id}: HTTP {response.status}")
                     return None

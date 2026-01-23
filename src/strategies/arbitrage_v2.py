@@ -48,14 +48,34 @@ class PureArbitrageV2:
         logger.info(">>> Pure Arbitrage V2 (Maker-Taker) Online <<<")
         
         # 1. 마켓 탐색 및 구독 루프
-        asyncio.create_task(self._market_update_loop())
+        self.market_task = asyncio.create_task(self._market_update_loop())
         
         # 2. 버스 업데이트 모니터링
+        self.bus_task = None
         if self.signal_bus:
-            asyncio.create_task(self._monitor_bus_updates())
+            self.bus_task = asyncio.create_task(self._monitor_bus_updates())
 
         while self.is_running:
             await asyncio.sleep(1)
+
+    async def shutdown(self):
+        """Stop all background tasks and clean up"""
+        logger.info("🛑 Shutting down PureArbitrageV2...")
+        self.is_running = False
+        
+        if hasattr(self, 'market_task') and self.market_task:
+            self.market_task.cancel()
+        
+        if hasattr(self, 'bus_task') and self.bus_task:
+            self.bus_task.cancel()
+            
+        if self.notifier and hasattr(self.notifier, 'stop'):
+            try:
+                await self.notifier.stop()
+            except Exception as e:
+                logger.error(f"Error stopping notifier: {e}")
+
+        logger.info("✅ PureArbitrageV2 shutdown complete")
 
     async def _market_update_loop(self):
         """15분 크립토 마켓을 정밀 타겟팅하여 구독 관리"""
@@ -183,11 +203,19 @@ class PureArbitrageV2:
             profit_pct = (1.0 - float(combined_price)) * 100
 
             if getattr(self.client, 'dry_run', True):
-                logger.info(f"🧪 [DRY RUN] ArbV2 Success | Spread: {profit_pct:.2f}% | PnL: ${estimated_pnl:.2f}")
+                # Phase 18: Latency Emulation
+                import random
+                latency = random.uniform(0.1, 0.4) # 100ms - 400ms
+                await asyncio.sleep(latency)
+                
+                # Apply 1bp "Latency Slip" (Market moves while we wait)
+                combined_price_calibrated = combined_price * Decimal("1.0001") 
+                
+                logger.info(f"🧪 [DRY RUN] ArbV2 Success | Spread: {profit_pct:.2f}% | Latency: {latency:.2f}s")
                 
                 # PnL Tracker 기록 (Phase 4.3)
                 if self.pnl_tracker:
-                    tid = self.pnl_tracker.record_entry("arbhunter", id_y, "BUY", float(combined_price), size)
+                    tid = self.pnl_tracker.record_entry("arbhunter", id_y, "BUY", float(combined_price_calibrated), size, metadata={"group": "CRYPTO"})
                     self.pnl_tracker.record_exit(tid, 1.0, reason=f"Arb V2 Spread: {profit_pct:.2f}%")
 
                 if self.notifier:

@@ -10,8 +10,14 @@ class TradeRecorder:
     """
     Records simulated or real trades to a CSV file for analysis.
     """
-    def __init__(self, filename="data/sim_trades.csv"):
+    def __init__(self, filename="data/sim_trades.csv", headers=None):
         self.filename = filename
+        self.headers = headers or [
+            'timestamp', 'pair_name', 'action', 
+            'price_a', 'price_b', 'z_score', 
+            'ai_confidence', 'ai_reason', 
+            'status', 'pnl'
+        ]
         self._ensure_file_exists()
 
     def _ensure_file_exists(self):
@@ -21,12 +27,7 @@ class TradeRecorder:
         if not os.path.exists(self.filename):
             with open(self.filename, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow([
-                    'timestamp', 'pair_name', 'action', 
-                    'price_a', 'price_b', 'z_score', 
-                    'ai_confidence', 'ai_reason', 
-                    'status', 'pnl'
-                ])
+                writer.writerow(self.headers)
 
     def log_entry(self, pair_name, action, price_a, price_b, z_score, ai_result):
         """Log a trade entry"""

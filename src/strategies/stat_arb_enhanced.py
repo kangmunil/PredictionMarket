@@ -140,6 +140,9 @@ class EnhancedStatArbStrategy:
         self.pair_metrics_cache: Dict[str, PairMetrics] = {}
         self.last_analysis: Dict[str, datetime] = {}
         self.disabled_pairs: Dict[str, datetime] = {}
+        
+        self.is_running = True
+        self.discover_task = None
 
     def add_pair(
         self,
@@ -256,10 +259,18 @@ class EnhancedStatArbStrategy:
         logger.info("🛡️ Enhanced Stat Arb Strategy Started")
         
         # 🚀 실시간 핫 마켓 자동 탐색 시작
-        asyncio.create_task(self.auto_discover_pairs_loop())
+        self.discover_task = asyncio.create_task(self.auto_discover_pairs_loop())
 
-        while True:
+        while self.is_running:
             try:
+                # 0. Low Capital Check
+                if self.budget_manager and self.budget_manager.is_low_capital:
+                    logger.debug("⚠️ Low Capital Mode: Skipping StatArb scans (Waiting for funds)")
+                    # Manage existing positions only
+                    await self.manage_positions()
+                    await asyncio.sleep(60)
+                    continue
+
                 # Phase 1: Analyze all pairs for cointegration
                 await self.analyze_all_pairs()
 
@@ -445,7 +456,8 @@ class EnhancedStatArbStrategy:
         """
         try:
             # High volume ensures liquidity for 'Sure Bets'
-            markets = await self.gamma.get_active_markets(limit=20, volume_min=10000.0)
+            limit = self.gamma.config.STRATEGY_MARKET_CAP // 5
+            markets = await self.gamma.get_active_markets(limit=limit, volume_min=10000.0)
             
             for market in markets:
                 # Check simplified price (Gamma snapshot)
@@ -789,14 +801,16 @@ class EnhancedStatArbStrategy:
                     token_id=tid_a,
                     side="SELL" if "SHORT_A" in signal.action else "BUY",
                     price=0.5,
-                    size=trade_size
+                    size=trade_size,
+                    metadata={"group": (signal.category or "crypto").upper()}
                 )
                 entry_tid_b = self.pnl_tracker.record_entry(
                     strategy="statarb",
                     token_id=tid_b,
                     side="BUY" if "LONG_B" in signal.action else "SELL",
                     price=0.5,
-                    size=trade_size
+                    size=trade_size,
+                    metadata={"group": (signal.category or "crypto").upper()}
                 )
                 trade_ids = [entry_tid_a, entry_tid_b]
 
@@ -1031,7 +1045,13 @@ class EnhancedStatArbStrategy:
             return None
 
     async def shutdown(self):
-        """Release data clients."""
+        """Gracefully close internal clients and stop background tasks"""
+        logger.info("🎬 Shutting down EnhancedStatArbStrategy...")
+        self.is_running = False
+        
+        if self.discover_task:
+            self.discover_task.cancel()
+
         api = getattr(self, "_price_api", None)
         if api:
             try:
@@ -1039,6 +1059,13 @@ class EnhancedStatArbStrategy:
             except Exception as exc:
                 logger.debug(f"StatArb price API close error: {exc}")
             self._price_api = None
+
+        try:
+            if hasattr(self, 'gamma') and self.gamma:
+                await self.gamma.close()
+            logger.info("✅ EnhancedStatArbStrategy resources closed")
+        except Exception as e:
+            logger.error(f"Error during EnhancedStatArbStrategy shutdown: {e}")
 
     async def auto_discover_pairs_loop(self):
         """1시간마다 전략적으로 최적화된 마켓 페어를 탐색합니다."""
@@ -1049,7 +1076,8 @@ class EnhancedStatArbStrategy:
             try:
                 logger.info("🔍 StatArb: Running Advanced Market Discovery...")
                 # 더 많은 후보군 확보 (200개)
-                markets = await gamma.get_active_markets(limit=200, volume_min=1000, max_hours_to_close=48)
+                limit = gamma.config.STRATEGY_MARKET_CAP
+                markets = await gamma.get_active_markets(limit=limit, volume_min=1000, max_hours_to_close=48)
                 
                 # ======= NEW: 15m 크립토 마켓 동적 탐색 =======
                 # 15m 마켓은 매 15분마다 새로운 Condition ID로 생성됨
@@ -1163,12 +1191,24 @@ class EnhancedStatArbStrategy:
 
         return df
 
+
     async def shutdown(self):
-        """Gracefully close internal clients"""
-        logger.info("🎬 Shutting down EnhancedStatArbStrategy...")
-        try:
-            if hasattr(self, 'gamma') and self.gamma:
+        """Shut down resources used by StatArb"""
+        logger.info("🎬 StatArb: Shutting down...")
+        
+        # 1. Close GammaClient
+        if hasattr(self, 'gamma') and self.gamma:
+            try:
                 await self.gamma.close()
-            logger.info("✅ EnhancedStatArbStrategy resources closed")
-        except Exception as e:
-            logger.error(f"Error during EnhancedStatArbStrategy shutdown: {e}")
+            except Exception as e:
+                logger.error(f"Error closing StatArb GammaClient: {e}")
+                
+        # 2. Close PriceHistoryAPI
+        if hasattr(self, '_price_api') and self._price_api:
+            try:
+                if hasattr(self._price_api, 'close'):
+                    await self._price_api.close()
+            except Exception as e:
+                logger.error(f"Error closing StatArb PriceHistoryAPI: {e}")
+                
+        logger.info("✅ StatArb: Shutdown complete")

@@ -83,9 +83,9 @@ class Crypto15MinFilter:
         except:
             pass
 
-        # 5. 거래량 체크
+        # 5. 거래량 체크 (0인 신규 시장도 허용)
         volume = float(market.get('volume', 0))
-        if volume < 10:  # Relaxed to $10 to catch fresh markets
+        if volume < 0.0:
             return False
 
         return True
@@ -96,21 +96,53 @@ class Crypto15MinFilter:
         limit: int = 50
     ) -> List[Dict]:
         """
-        활성화된 15분 크립토 마켓을 가져와 필터링합니다.
+        활성화된 15분 크립토 마켓을 가져와 필터링합니다. (Tag 기반 검색 병행)
         """
-        # 모든 활성 마켓 가져오기 (GammaClient는 closed 파라미터를 내부적으로 false로 설정함)
-        all_markets = await gamma_api.get_active_markets(
-            limit=limit * 3  # 필터링을 고려해 넉넉히 가져옴
-        )
+        all_candidates = []
+        
+        # 1. Tag 기반 검색 (BTC:235, ETH:?, SOL:968, Crypto:744)
+        # GammaClient에 get_price_markets_by_tag가 있다고 가정 (있음)
+        tags = [235, 968, 744]
+        for tag_id in tags:
+            try:
+                # Increased limit to 100 to catch low-volume 15m markets
+                limit = gamma_api.config.STRATEGY_MARKET_CAP // 2
+                tag_markets = await gamma_api.get_price_markets_by_tag(tag_id=tag_id, limit=limit)
+                all_candidates.extend(tag_markets)
+            except Exception as e:
+                logger.error(f"Error fetching markets for tag {tag_id}: {e}")
 
-        # 15분 크립토 마켓 필터링
+        # 2. 신규 시장 기반 검색 (Zero-Volume 15m 시장을 찾기 위해 ID 역순 검색)
+        try:
+            # Fetch absolute newest markets (category agnostic, zero volume possible)
+            limit = gamma_api.config.GLOBAL_MONITOR_LIMIT // 2
+            newest_markets = await gamma_api.get_active_markets(limit=limit, volume_min=0, order="id")
+            all_candidates.extend(newest_markets)
+            
+            # Also keep top volume markets for general context
+            limit = gamma_api.config.STRATEGY_MARKET_CAP // 2
+            active_markets = await gamma_api.get_active_markets(limit=limit, volume_min=10)
+            all_candidates.extend(active_markets)
+        except Exception as e:
+            logger.error(f"Error fetching active/newest markets: {e}")
+
+        # 중복 제거 (id 기준)
+        seen_ids = set()
+        unique_candidates = []
+        for m in all_candidates:
+            mid = m.get('id')
+            if mid and mid not in seen_ids:
+                seen_ids.add(mid)
+                unique_candidates.append(m)
+
+        # 3. 15분 크립토 마켓 필터링
         crypto_15min = [
-            m for m in all_markets
+            m for m in unique_candidates
             if self.is_crypto_15min_market(m)
         ]
 
         # 거래량 순으로 정렬
         crypto_15min.sort(key=lambda m: float(m.get('volume', 0)), reverse=True)
 
-        logger.info(f"🔍 Found {len(crypto_15min)} active crypto 15min markets")
+        logger.info(f"🔍 Found {len(crypto_15min)} active crypto 15min markets (Tag & Keyword Scan)")
         return crypto_15min[:limit]

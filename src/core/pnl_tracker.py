@@ -12,7 +12,7 @@ Created: 2026-01-07
 import logging
 from typing import Dict, List, Optional
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from src.core.health_monitor import PROM_TRADES, PROM_PNL_DAILY
 
@@ -27,6 +27,7 @@ class TradeEntry:
     entry_price: float
     size: float
     entry_time: datetime
+    metadata: Dict = field(default_factory=dict)
     
 @dataclass
 class TradeExit:
@@ -50,7 +51,7 @@ class PnLTracker:
         }
         self.trade_repository = trade_repository  # PostgreSQL persistence (optional)
 
-    def record_entry(self, strategy: str, token_id: str, side: str, price: float, size: float) -> str:
+    def record_entry(self, strategy: str, token_id: str, side: str, price: float, size: float, metadata: Optional[Dict] = None) -> str:
         """
         Record a new trade entry. Returns a trade_id.
         """
@@ -62,7 +63,8 @@ class PnLTracker:
             side=side,
             entry_price=float(price),
             size=float(size),
-            entry_time=datetime.now()
+            entry_time=datetime.now(),
+            metadata=metadata or {}
         )
         self.active_trades[trade_id] = entry
         logger.info(f"📝 [PnL] Entry Recorded: {strategy} {side} {token_id[:10]} @ ${price:.3f} (${size:.2f})")
@@ -70,7 +72,7 @@ class PnLTracker:
         logger.info(f"📝 [PnL] Entry Recorded: {strategy} {side} {token_id[:10]} @ ${price:.3f} (${size:.2f})")
         return trade_id
 
-    def record_existing_trade(self, strategy: str, token_id: str, side: str, price: float, size: float):
+    def record_existing_trade(self, strategy: str, token_id: str, side: str, price: float, size: float, metadata: Optional[Dict] = None):
         """
         Hydrate an existing trade from API data (for restart persistence).
         """
@@ -83,7 +85,8 @@ class PnLTracker:
             side=side,
             entry_price=float(price),
             size=float(size),
-            entry_time=datetime.now() # We don't know original time, use now
+            entry_time=datetime.now(), # We don't know original time, use now
+            metadata=metadata or {}
         )
         self.active_trades[trade_id] = entry
         return trade_id
@@ -109,8 +112,27 @@ class PnLTracker:
             pnl_amount = (entry.entry_price - exit_price) * shares
 
         fee_rate = 0.001
-        fee_cost = entry.size * fee_rate * 2  # Assume round-trip fees
-        net_pnl = pnl_amount - fee_cost
+        from src.core.config import Config
+        cfg = Config()
+        
+        # Apply Realism Penalties in Dry-Run
+        if cfg.DRY_RUN:
+            # 1. Trading Fees
+            fee_rate = cfg.DRY_RUN_FEE_BPS / 10000.0
+            fee_cost = entry.size * fee_rate * 2 # Round-trip
+            
+            # 2. Slippage Penalty (Reality Gap)
+            slippage_rate = cfg.DRY_RUN_SLIPPAGE_BPS / 10000.0
+            slippage_cost = entry.size * slippage_rate
+            
+            penalty = fee_cost + slippage_cost
+            net_pnl = pnl_amount - penalty
+            
+            logger.info(f"⚖️ [PnL] Realism Penalty applied: -${penalty:.2f} (Fee: {cfg.DRY_RUN_FEE_BPS}bps, Slip: {cfg.DRY_RUN_SLIPPAGE_BPS}bps)")
+        else:
+            fee_cost = entry.size * fee_rate * 2
+            net_pnl = pnl_amount - fee_cost
+
         pnl_percent = (net_pnl / entry.size) * 100 if entry.size > 0 else 0.0
 
         # Update stats
