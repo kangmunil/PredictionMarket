@@ -62,6 +62,7 @@ class TreeNewsStreamClient:
                 ) as ws:
                     logger.info("✅ Connected to Tree News WebSocket")
                     backoff = 5 # Reset on success
+                    self.last_heartbeat = time.time()  # Reset heartbeat on new connection
                     
                     while True:
                         try:

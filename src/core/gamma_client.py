@@ -30,10 +30,18 @@ class GammaClient:
         self._mcp_client: Optional[PolymarketMCPClient] = None
         self._session: Optional[aiohttp.ClientSession] = None
 
-    async def get_active_markets(self, limit=None, volume_min=1000, max_hours_to_close: Optional[int] = None, order: str = "volume"):
+    async def get_active_markets(
+        self, 
+        limit=None, 
+        volume_min=1000, 
+        max_hours_to_close: Optional[int] = None, 
+        order: str = "volume", 
+        neg_risk: bool = False,
+        open_interest_min: Optional[float] = None,
+        open_interest_max: Optional[float] = None
+    ):
         """
-        Fetch active markets with significant volume.
-        Query: Active, sorted by volume desc.
+        Fetch active markets with significant volume and optional Open Interest gating.
         """
         if limit is None:
             limit = self.config.GLOBAL_MONITOR_LIMIT
@@ -46,7 +54,7 @@ class GammaClient:
         max_batch_size = self.config.DISCOVERY_BATCH_SIZE
         
         # 1. Try MCP first (Higher speed)
-        if await self._maybe_init_mcp():
+        if not neg_risk and open_interest_min is None and open_interest_max is None and await self._maybe_init_mcp():
             res = await self._get_active_markets_via_mcp(limit, volume_min, max_hours_to_close)
             all_markets = res
         else:
@@ -64,6 +72,9 @@ class GammaClient:
                     "offset": current_offset
                 }
                 
+                if neg_risk:
+                    params["negative_risk"] = "true"
+                
                 try:
                     async with session.get(url, params=params) as resp:
                         PROM_LATENCY.labels(service="gamma").observe(time.time() - start_time)
@@ -75,10 +86,38 @@ class GammaClient:
                             for market in data:
                                 market_registry.register_market(market)
                                 
+                            def _get_market_cap_metric(m):
+                                # 1. Check top-level Open Interest
+                                oi = m.get('openInterest')
+                                # 2. Check top-level Liquidity
+                                liq = m.get('liquidity') or 0.0
+                                
+                                val_oi = float(oi) if oi is not None else 0.0
+                                val_liq = float(liq)
+                                
+                                # 3. Check nested events for OI
+                                events = m.get('events', [])
+                                if events and isinstance(events, list):
+                                    event_oi = float(events[0].get('openInterest', 0))
+                                    val_oi = max(val_oi, event_oi)
+                                
+                                # Return the highest of the two as 'Market Cap Proxy'
+                                return max(val_oi, val_liq)
+
                             # Filter and add
                             filtered = [m for m in data if float(m.get('volume', 0)) >= volume_min]
+                            
+                            # Phase 9: Market-Cap (OI/Liquidity) Gating
+                            if open_interest_min is not None:
+                                filtered = [m for m in filtered if _get_market_cap_metric(m) >= open_interest_min]
+                            if open_interest_max is not None:
+                                filtered = [m for m in filtered if _get_market_cap_metric(m) <= open_interest_max]
+                                
                             if max_hours_to_close:
                                 filtered = [m for m in filtered if self._within_hours(m, max_hours_to_close)]
+                            
+                            # Phase 11: Final CLOB-only filter
+                            filtered = [m for m in filtered if self._is_clob_compatible(m)]
                             
                             all_markets.extend(filtered)
                             current_offset += len(data) # Move offset by actual results received
@@ -124,8 +163,8 @@ class GammaClient:
                     data = await resp.json()
                     for market in data:
                         market_registry.register_market(market)
-                    # Only return markets that are tradeable on CLOB
-                    return [m for m in data if m.get('enableOrderBook')]
+                    # Phase 11: Only return markets that are tradeable on CLOB
+                    return [m for m in data if self._is_clob_compatible(m)]
                 return []
         except Exception as e:
             PROM_API_ERRORS.labels(service="gamma_search", error_type="exception").inc()
@@ -176,7 +215,8 @@ class GammaClient:
                     data = await resp.json()
                     for market in data:
                         market_registry.register_market(market)
-                    return data
+                    # Phase 11 & 12: Only return markets tradeable on CLOB
+                    return [m for m in data if self._is_clob_compatible(m)]
                 return []
         except Exception as e:
             PROM_API_ERRORS.labels(service="gamma_tag", error_type="exception").inc()
@@ -221,6 +261,27 @@ class GammaClient:
             logger.error("MCP active market fetch failed, falling back: %s", exc)
             self._mcp_enabled = False
             return await self.get_active_markets(limit, volume_min)
+
+    def _is_clob_compatible(self, market: dict) -> bool:
+        """Helper to check if a market is tradeable via CLOB (Orderbook)"""
+        if not market: return False
+        
+        # 1. Check enableOrderBook flag (Polymarket standard)
+        if market.get('enableOrderBook'):
+            return True
+            
+        # 2. Safety Fallback: Markets MUST have clobTokenIds to be tradeable via current PolyClient
+        clob_ids = market.get('clobTokenIds')
+        if clob_ids:
+            try:
+                if isinstance(clob_ids, str):
+                    ids = json.loads(clob_ids)
+                else:
+                    ids = clob_ids
+                return len(ids) >= 2
+            except:
+                pass
+        return False
 
     async def _search_markets_via_mcp(self, query: str, limit: int) -> List[dict]:
         assert self._mcp_client

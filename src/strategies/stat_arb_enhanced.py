@@ -119,8 +119,8 @@ class EnhancedStatArbStrategy:
 
         # Trading thresholds
         self.entry_z_threshold = 2.0  # Enter when |Z| > 2.0
-        self.exit_z_threshold = 1.0   # Exit when |Z| < 1.0 (sooner realization)
-        self.stop_loss_z = 3.0        # Stop loss at |Z| > 3.0
+        self.exit_z_threshold = 0.5   # 1.0 -> 0.5 for faster turnover
+        self.stop_loss_z = 2.5        # 3.0 -> 2.5 for tighter loss control
 
         # Cointegration requirements
         self.max_cointegration_pvalue = 0.10  # Relaxed from 0.05 to 0.10 for better signaling
@@ -796,13 +796,32 @@ class EnhancedStatArbStrategy:
             # Store in active positions
             trade_ids = []
             if self.pnl_tracker:
+                # Build unified trade thesis
+                thesis = {
+                    "entry_reason": signal.entry_reason,
+                    "entry_conditions": {
+                        "z_score": float(signal.z_score),
+                        "confidence": float(signal.confidence),
+                        "half_life": float(signal.expected_half_life)
+                    },
+                    "exit_hypotheses": [
+                        {"type": "MEAN_REVERSION", "threshold": self.exit_z_threshold},
+                        {"type": "STOP_LOSS", "threshold": self.stop_loss_z},
+                        {"type": "TIMEOUT", "multiplier": 2.0}
+                    ],
+                    "expected_window": f"{signal.expected_half_life * 2:.1f} days"
+                }
+
                 entry_tid_a = self.pnl_tracker.record_entry(
                     strategy="statarb",
                     token_id=tid_a,
                     side="SELL" if "SHORT_A" in signal.action else "BUY",
                     price=0.5,
                     size=trade_size,
-                    metadata={"group": (signal.category or "crypto").upper()}
+                    metadata={
+                        "group": (signal.category or "crypto").upper(),
+                        "thesis": thesis
+                    }
                 )
                 entry_tid_b = self.pnl_tracker.record_entry(
                     strategy="statarb",
@@ -810,7 +829,10 @@ class EnhancedStatArbStrategy:
                     side="BUY" if "LONG_B" in signal.action else "SELL",
                     price=0.5,
                     size=trade_size,
-                    metadata={"group": (signal.category or "crypto").upper()}
+                    metadata={
+                        "group": (signal.category or "crypto").upper(),
+                        "thesis": thesis
+                    }
                 )
                 trade_ids = [entry_tid_a, entry_tid_b]
 

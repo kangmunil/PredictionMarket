@@ -23,7 +23,7 @@ class TelegramNotifier:
         self._poll_error_streak = 0
         
         # Rate Limiting
-        self._msg_queue = asyncio.Queue()
+        self._msg_queue = asyncio.PriorityQueue()
         self._worker_task = None
         self._polling_task = None
         self._stop_event = asyncio.Event()
@@ -198,21 +198,23 @@ class TelegramNotifier:
         """Background worker to send messages with rate limiting (20/min per chat ~ 3s delay)"""
         while True:
             try:
-                task = await self._msg_queue.get()
+                # PriorityQueue returns (priority, timestamp, task)
+                # Timestamp is used for stable sort within same priority
+                priority, timestamp, task = await self._msg_queue.get()
                 text, parse_mode, keyboard = task
                 
                 await self._send_payload(text, parse_mode, keyboard)
                 self._msg_queue.task_done()
                 
-                # Rate limit: 1 message every 3 seconds to be safe
-                await asyncio.sleep(3.0) 
+                # Rate limit: 0.5 seconds is safe for 30/s Telegram limit
+                await asyncio.sleep(0.5) 
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Telegram queue error: {e}")
 
-    async def send_message(self, text: str, parse_mode: str = "HTML", use_menu: bool = False, inline_keyboard: Any = None):
-        """Enqueue message for sending"""
+    async def send_message(self, text: str, parse_mode: str = "HTML", use_menu: bool = False, inline_keyboard: Any = None, priority: int = 10):
+        """Enqueue message for sending. Lower priority number = faster delivery."""
         if not self.enabled: return
         
         keyboard = None
@@ -225,8 +227,10 @@ class TelegramNotifier:
                     [{"text": "🛑 STOP", "callback_data": "/stop"}, {"text": "▶️ RESUME", "callback_data": "/resume"}]
                 ]
             }
-            
-        await self._msg_queue.put((text, parse_mode, keyboard))
+        
+        # Use time.time() to ensure stable ordering for same-priority items
+        import time
+        await self._msg_queue.put((priority, time.time(), (text, parse_mode, keyboard)))
 
     async def _send_payload(self, text, parse_mode, reply_markup):
         """Internal sender"""

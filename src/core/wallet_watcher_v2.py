@@ -198,34 +198,38 @@ class EnhancedWalletWatcher:
 
                 if current_block > self.last_checked_block:
                     # Ultra-conservative block range: 3 blocks (strict public RPC limit)
-                    scan_from = max(self.last_checked_block + 1, current_block - 3)
+                    # Use safe tip (delayed by 2 blocks) to ensure propagation stability across load-balanced RPCs
+                    safe_tip = current_block - 2
+                    if safe_tip <= self.last_checked_block:
+                        await asyncio.sleep(2)
+                        continue
+
+                    scan_from = max(self.last_checked_block + 1, safe_tip - 3)
                     
+                    if scan_from > safe_tip:
+                        logger.debug(f"Scan range invalid: {scan_from} > {safe_tip}. Waiting.")
+                        await asyncio.sleep(8)
+                        continue
+
                     try:
-                        await self.check_events(scan_from, current_block)
-                        self.last_checked_block = current_block
+                        await self.check_events(scan_from, safe_tip)
+                        self.last_checked_block = safe_tip
                     except Exception as e:
                         error_msg = str(e).lower()
                         if "invalid block range" in error_msg or "code': -32000" in error_msg:
                             logger.warning(f"⚠️ Block range problem ({current_block - scan_from} blocks). Trying adaptive recovery...")
                             await asyncio.sleep(1)
                             
-                            # Recovery Step 1: Try smaller range (5 blocks)
+                            # Recovery Step 1: Try smaller range (1 block)
                             try:
-                                recovery_from = max(self.last_checked_block + 1, current_block - 5)
+                                recovery_from = current_block
                                 await self.check_events(recovery_from, current_block)
                                 self.last_checked_block = current_block
-                                logger.info(f"✅ Recovery success with 5-block range.")
+                                logger.info(f"✅ Recovery success with 1-block range.")
                             except Exception:
-                                # Recovery Step 2: Try tiny range (5 blocks)
-                                try:
-                                    tiny_from = max(self.last_checked_block + 1, current_block - 5)
-                                    await self.check_events(tiny_from, current_block)
-                                    self.last_checked_block = current_block
-                                    logger.info(f"✅ Recovery success with 5-block range.")
-                                except Exception as final_e:
-                                    logger.error(f"❌ Adaptive recovery failed: {final_e}. Skipping to current block.")
-                                    # Final fallback: Skip the gap to keep the bot alive
-                                    self.last_checked_block = current_block
+                                # Recovery Step 2: Skip gap to stay alive
+                                logger.error(f"❌ Adaptive recovery failed. Skipping to current block.")
+                                self.last_checked_block = current_block
                         else:
                             raise e
 

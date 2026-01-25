@@ -85,16 +85,28 @@ class StateDoctor:
         
         # Strategy State (Dictionary of positions)
         if isinstance(data, dict) and filename == "trend_follower_state.json":
+            token_ids = list(data.keys())
+            logger.info(f"👨‍⚕️ StateDoctor: Concurrently validating {len(token_ids)} tokens for {filename}...")
+            
+            # Use a semaphore to avoid hitting rate limits too hard
+            sem = asyncio.Semaphore(10)
+            async def fast_check(tid):
+                async with sem:
+                    return tid, await self.check_token_validity(tid)
+            
+            results = await asyncio.gather(*(fast_check(tid) for tid in token_ids))
+            
             valid_data = {}
-            for token_id, pos in data.items():
-                if await self.check_token_validity(token_id):
-                    valid_data[token_id] = pos
+            for tid, is_valid in results:
+                if is_valid:
+                    valid_data[tid] = data[tid]
                 else:
-                    logger.warning(f"🗑️ Pruning INVALID token from {filename}: {token_id} ({pos.get('market_question', 'N/A')})")
+                    logger.warning(f"🗑️ Pruning INVALID token from {filename}: {tid}")
                     is_modified = True
         
         # Dashboard State (Dict with 'active_positions' list)
         elif isinstance(data, dict) and "active_positions" in data:
+            # Similar optimization could be added but usually this list is small
             valid_positions = []
             for pos in data["active_positions"]:
                 # Check for "Larry Kudlow" anomaly (Hardcoded rule)

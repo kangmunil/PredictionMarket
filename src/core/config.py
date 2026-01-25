@@ -29,6 +29,10 @@ class Config:
         return os.getenv("PRIVATE_KEY")
 
     @property
+    def ARB_EXECUTOR_ADDRESS(self):
+        return os.getenv("ARB_EXECUTOR_ADDRESS")
+
+    @property
     def FUNDER_ADDRESS(self):
         return os.getenv("FUNDER_ADDRESS")
     

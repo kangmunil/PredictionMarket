@@ -161,10 +161,14 @@ class TradeRepository:
             with open(self._fallback_csv, 'a', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=[
                     'timestamp', 'trade_id', 'strategy', 'token_id',
-                    'side', 'entry_price', 'exit_price', 'size', 'pnl', 'pnl_pct'
+                    'side', 'entry_price', 'exit_price', 'size', 'pnl', 'pnl_pct',
+                    'thesis_summary'
                 ])
                 if not file_exists:
                     writer.writeheader()
+                
+                thesis = trade.get("metadata", {}).get("thesis", {})
+                thesis_summary = thesis.get("entry_reason", "N/A")
                     
                 writer.writerow({
                     'timestamp': datetime.now().isoformat(),
@@ -176,7 +180,8 @@ class TradeRepository:
                     'exit_price': trade.get('exit_price', 0),
                     'size': trade.get('size', 0),
                     'pnl': trade.get('pnl', 0),
-                    'pnl_pct': trade.get('pnl_pct', 0)
+                    'pnl_pct': trade.get('pnl_pct', 0),
+                    'thesis_summary': thesis_summary
                 })
             logger.debug(f"💾 Trade saved to CSV fallback: {self._fallback_csv}")
             return True

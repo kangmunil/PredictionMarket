@@ -54,6 +54,16 @@ class PnLTracker:
     def record_entry(self, strategy: str, token_id: str, side: str, price: float, size: float, metadata: Optional[Dict] = None) -> str:
         """
         Record a new trade entry. Returns a trade_id.
+        Standard Metadata Structure:
+        {
+            "thesis": {
+                "entry_reason": str,
+                "entry_conditions": dict,
+                "exit_hypotheses": list,
+                "expected_window": str
+            },
+            ... other fields ...
+        }
         """
         trade_id = f"{strategy}_{token_id}_{datetime.now().timestamp()}"
         entry = TradeEntry(
@@ -67,9 +77,11 @@ class PnLTracker:
             metadata=metadata or {}
         )
         self.active_trades[trade_id] = entry
-        logger.info(f"📝 [PnL] Entry Recorded: {strategy} {side} {token_id[:10]} @ ${price:.3f} (${size:.2f})")
-        self.active_trades[trade_id] = entry
-        logger.info(f"📝 [PnL] Entry Recorded: {strategy} {side} {token_id[:10]} @ ${price:.3f} (${size:.2f})")
+        
+        thesis = entry.metadata.get("thesis", {})
+        reason_str = thesis.get("entry_reason", "No reason provided")
+        logger.info(f"📝 [PnL] Entry Recorded: {strategy} {side} {token_id[:10]} @ ${price:.3f} (${size:.2f}) | Reason: {reason_str}")
+        
         return trade_id
 
     def record_existing_trade(self, strategy: str, token_id: str, side: str, price: float, size: float, metadata: Optional[Dict] = None):
@@ -157,7 +169,8 @@ class PnLTracker:
             "pnl_pct": pnl_percent,
             "entry_time": entry.entry_time.isoformat(),
             "exit_time": datetime.now().isoformat(),
-            "reason": reason
+            "reason": reason,
+            "metadata": entry.metadata
         }
         self.history.append(record)
         del self.active_trades[trade_id]
@@ -203,6 +216,28 @@ class PnLTracker:
             total_unrealized += trade_pnl
             
         return total_unrealized
+
+    def add_thesis_challenge(self, trade_id: str, challenge_packet: Dict):
+        """
+        Attach a 'Challenge' or 'Anti-Thesis' to an active trade.
+        Challenge Packet Structure:
+        {
+            "source": str,
+            "reasoning": str,
+            "severity": float (0.0 to 1.0),
+            "timestamp": isoformat
+        }
+        """
+        entry = self.active_trades.get(trade_id)
+        if not entry:
+            logger.warning(f"⚠️ Cannot challenge unknown trade: {trade_id}")
+            return
+            
+        if "challenges" not in entry.metadata:
+            entry.metadata["challenges"] = []
+            
+        entry.metadata["challenges"].append(challenge_packet)
+        logger.info(f"🚩 [PnL] Thesis challenged for {trade_id} by {challenge_packet.get('source')}")
 
     def get_summary(self) -> Dict:
         return {

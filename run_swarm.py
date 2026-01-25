@@ -35,6 +35,8 @@ from src.core.trade_repository import TradeRepository
 from src.core.dashboard_api import start_dashboard_api, set_swarm_system
 from src.core.state_doctor import StateDoctor
 from src.core.performance_analyzer import PerformanceAnalyzer
+from src.core.revaluation_engine import RevaluationEngine
+from src.core.market_ranker import MarketRanker
 
 # Strategies & Agents
 from src.news.news_scalper_optimized import OptimizedNewsScalper
@@ -43,6 +45,7 @@ from src.strategies.elite_mimic import EliteMimicAgent
 from src.strategies.arbitrage_v2 import PureArbitrageV2
 from src.strategies.trend_follower import SmartTrendFollower
 from src.strategies.liquidity_sniper import LiquiditySniper
+from src.strategies.spread_scalper import SpreadScalper # NEW: HFT Module
 
 # Setup Logging
 # Initial logging before args are parsed
@@ -92,6 +95,7 @@ class SwarmSystem:
         self.arb_agent = None
         self.trend_agent = None
         self.liquidity_sniper = None
+        self.spread_scalper = None # HFT Agent
 
         self.running = True
         self.tasks = []
@@ -104,13 +108,16 @@ class SwarmSystem:
         # Performance Caching
         self.tick_count = 0
         self.last_balance = 0.0
+        self.revaluation_engine = None
+        self.market_ranker = None
 
     async def setup(self, dry_run: bool = False):
         # Configure advanced logging
+        mode_suffix = "dry" if dry_run else "live"
         setup_logging(
             level=logging.INFO,
             json_output=self.json_logs,
-            log_file=f"logs/swarm_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+            log_file=f"logs/swarm_{mode_suffix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         )
 
         # 0. run State Doctor (Startup Validation)
@@ -162,10 +169,13 @@ class SwarmSystem:
 
         # Start notifier polling in background (non-blocking)
         if self.notifier.enabled:
-            # Keep alive
-            self.notifier_task = asyncio.create_task(self.notifier.start_polling())
+            if not dry_run:
+                self.notifier_task = asyncio.create_task(self.notifier.start_polling())
+                logger.info("✅ Telegram Notifier initialized and polling started (LIVE mode)")
+            else:
+                logger.info("ℹ️ Telegram Notifier Active (Send-Only in DRY RUN mode)")
+            
             await self.notifier.send_message("🚀 *Hive Mind Swarm Intelligence* Online!\nUse /status to check system.")
-            logger.info("✅ Telegram Notifier initialized and polling started")
         else:
             logger.warning("⚠️  Telegram Notifier disabled - check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
 
@@ -247,7 +257,7 @@ class SwarmSystem:
             swarm_system=self
         )
 
-        # 4. Pure Arb V2 (Crypto 15min Optimized)
+        # 4. Pure Arb V2 (Global NegRisk Optimized)
         self.arb_agent = PureArbitrageV2(
             client=self.client, 
             gamma_client=self.gamma_client, 
@@ -256,7 +266,9 @@ class SwarmSystem:
             min_profit=0.010, # 1.0% Threshold
             default_trade_size=50.0,
             risk_manager=self.risk_manager,
-            pnl_tracker=self.pnl_tracker # Phase 4.3
+            pnl_tracker=self.pnl_tracker, # Phase 4.3
+            market_ranker=self.market_ranker, # Phase 7
+            dry_run=dry_run
         )
         self.arb_agent.notifier = self.notifier
 
@@ -269,6 +281,13 @@ class SwarmSystem:
             signal_bus=self.bus
         )
 
+        # 6. Spread Scalper (HFT)
+        self.spread_scalper = SpreadScalper(
+            client=self.client,
+            gamma_client=self.gamma_client,
+            budget_manager=self.budget_manager
+        )
+
         # 5. Health Monitor
         # Use shared redis connection
         self.health_monitor = await get_health_monitor(
@@ -277,7 +296,22 @@ class SwarmSystem:
             metrics_port=int(os.getenv("METRICS_PORT", "8000"))
         )
 
-        logger.info("✅ All Agents Initialized & Connected to Hive Mind")
+        from src.core.reasoning_engine import LLMReasoningEngine
+        self.reasoning_engine = LLMReasoningEngine(model_name="gpt-4o")
+        logger.info("🧠 AI Brain (Reasoning Engine) Online")
+
+        # --- Phase 5: Revaluation Engine ---
+        self.revaluation_engine = RevaluationEngine(
+            pnl_tracker=self.pnl_tracker,
+            rag_system=getattr(self.news_agent, 'rag_system', None)
+        )
+        logger.info("⚖️ AI Revaluation Engine Online (Auto-Liquidation ready)")
+
+        # --- Phase 7: Market Ranker (Alpha Heatmap) ---
+        self.market_ranker = MarketRanker(self.gamma_client, self.bus)
+        logger.info("🔥 Alpha Heatmap Ranker Online")
+
+        logger.info("✅ All Agents & Revaluation Engine Initialized")
 
     def _register_commands(self):
         self.notifier.register_command("/help", self.handle_help)
@@ -289,6 +323,7 @@ class SwarmSystem:
         self.notifier.register_command("/pnl", self.handle_pnl)
         self.notifier.register_command("/risk", self.handle_risk)
         self.notifier.register_command("/liquidate", self.handle_liquidate)
+        self.notifier.register_command("/audit", self.handle_audit)
         self.notifier.register_command("/panic", self.handle_panic)
         self.notifier.register_command("/unpanic", self.handle_unpanic)
         self.notifier.register_command("/settings", self.handle_settings)
@@ -364,16 +399,16 @@ class SwarmSystem:
         if not self._check_mode_match(text): return
         try:
             if not self.budget_manager or not self.pnl_tracker:
-                await self.notifier.send_message("⏳ System is still initializing. Please wait...")
+                await self.notifier.send_message("⏳ System is still initializing. Please wait...", priority=1)
                 return
 
             payload = await self._build_status_payload()
             self._log_status_snapshot(payload)
             message = self._format_status_message(payload)
-            await self.notifier.send_message(message)
+            await self.notifier.send_message(message, priority=1)
         except Exception as e:
             logger.exception("❌ Failed to generate status report")
-            await self.notifier.send_message(f"⚠️ Failed to fetch status: {e}")
+            await self.notifier.send_message(f"⚠️ Failed to fetch status: {e}", priority=1)
 
     async def _build_status_payload(self) -> dict:
         """Collect a single source-of-truth payload for /status reporting."""
@@ -924,17 +959,23 @@ class SwarmSystem:
 
              # Use config threshold
              threshold = self.config.TELEGRAM_MIN_TRADE_SIZE
+             
+             # Silenced in Dry Run per user request
+             if self.client.config.DRY_RUN:
+                 return
+
              if size >= threshold or abs(pnl) > 0.1:
                  asyncio.create_task(
                     self.notifier.notify_trade(
                         side, token, price, size, 
                         profit=pnl,
                         condition_id=condition_id, 
-                        brain_score=brain_score
+                        brain_score=brain_score,
+                        strategy="Swarm"
                     )
                  )
              else:
-                 logger.info(f"🔕 Suppressing Telegram notification for small trade (${size:.2f} < ${threshold:.2f})")
+                 logger.debug(f"🔕 Suppressing Telegram notification for small trade (${size:.2f} < ${threshold:.2f})")
 
     async def _update_balance_metrics(self):
         """Fetches and updates the wallet balance."""
@@ -1026,6 +1067,7 @@ class SwarmSystem:
                 asyncio.create_task(self.mimic_agent.run(), name="EliteMimic"), # ✅ Re-enabled (Bug Fixed)
                 asyncio.create_task(self.arb_agent.run(), name="PureArb"),
                 asyncio.create_task(self.trend_agent.run(), name="TrendFollower"),
+                asyncio.create_task(self.spread_scalper.run(), name="SpreadScalper"), # HFT Module
                 asyncio.create_task(self.health_monitor.run(), name="HealthMonitor"),
                 asyncio.create_task(self._daily_report_task(), name="DailyReport"),
                 asyncio.create_task(self._status_watchdog_task(), name="StatusWatchdog"),
@@ -1034,6 +1076,8 @@ class SwarmSystem:
                 asyncio.create_task(self.liquidity_sniper.run(), name="LiquiditySniper"),
                 asyncio.create_task(self._global_risk_monitor(), name="GlobalRiskMonitor"),
                 asyncio.create_task(self._dashboard_api_task(), name="DashboardAPI"),
+                asyncio.create_task(self._reevaluation_watchdog_task(), name="RevaluationWatchdog"),
+                asyncio.create_task(self.market_ranker.run_periodic_ranking(), name="MarketRanker"),
             ]
 
             # Add WebSocket task only if enabled
@@ -1095,6 +1139,42 @@ class SwarmSystem:
                 logger.error(f"Error in risk monitor loop: {e}")
             
             await asyncio.sleep(30) # Check every 30 seconds
+
+    async def _reevaluation_watchdog_task(self):
+        """Periodic audit of active positions against domain expertise (Phase 24)"""
+        logger.info("🔎 Revaluation Watchdog active.")
+        await asyncio.sleep(60) # Initial cooldown
+        
+        while self.running:
+            try:
+                if self.revaluation_engine:
+                    logger.info("🔎 [Audit] Running periodic thesis re-evaluation...")
+                    flags = await self.revaluation_engine.reevaluate_all()
+                    
+                    for flag in flags:
+                        action = flag.get("verdict", "CONTINUE")
+                        trade_id = flag.get("trade_id")
+                        reason = flag.get("reasoning")
+                        
+                        if action in ("EXIT", "REDUCE"):
+                            logger.warning(f"🚨 [AUDIT ACTION] {trade_id} requires {action}: {reason}")
+                            if self.notifier and not self.client.config.DRY_RUN:
+                                await self.notifier.send_message(
+                                    f"🚨 *Expert Audit Triggered Exit*\n\n"
+                                    f"Trade: `{trade_id}`\n"
+                                    f"Verdict: *{action}*\n"
+                                    f"Reason: {reason}"
+                                )
+                            
+                            # 🔥 PHASE 2: Trigger actual liquidation
+                            if action == "EXIT":
+                                await self.liquidate_trade(trade_id, reason=f"AI Audit: {reason[:100]}")
+                
+            except Exception as e:
+                logger.error(f"Error in reevaluation watchdog: {e}")
+                
+            # Run every 4 hours for fundamental audit (low frequency but high importance)
+            await asyncio.sleep(4 * 3600) 
 
     async def _dashboard_api_task(self):
         """Run Dashboard API server (Phase 4.4)"""
@@ -1294,6 +1374,109 @@ class SwarmSystem:
         await self._shutdown_agents()
         logger.info("👋 Swarm Disconnected")
 
+    async def liquidate_trade(self, trade_id: str, reason: str = "Expert Audit Liquidation"):
+        """
+        Automatically close a specific trade position via PolyClient.
+        """
+        entry = self.pnl_tracker.active_trades.get(trade_id)
+        if not entry:
+            logger.warning(f"⚠️ [Swarm] Cannot liquidate unknown trade: {trade_id}")
+            return False
+
+        token_id = entry.token_id
+        entry_side = entry.side.upper()
+        # To close: BUY -> SELL, SELL -> BUY
+        exit_side = "SELL" if entry_side == "BUY" else "BUY"
+        
+        # Determine size (shares). PnLTracker 'size' for entries is usually USD, 
+        # but for ArbV2 it might be shares.
+        # Let's assume size is SHARES if coming from ArbV2, or calculate from USD.
+        # In record_entry: price, size.
+        # shares = size / price
+        shares = entry.size / entry.entry_price if entry.entry_price > 0 else 0
+        
+        if shares <= 0:
+            logger.error(f"❌ [Swarm] Cannot liquidate {trade_id}: Zero shares calculated.")
+            return False
+
+        logger.warning(f"🔥 [Swarm] AUTO-LIQUIDATING {trade_id} | Token: {token_id[:10]} | Side: {exit_side} | Shares: {shares:.2f} | Reason: {reason}")
+        
+        try:
+            # 1. Execute Market Order (Aggressive)
+            # In PolyClient: place_market_order(token_id, side, amount=0, size=shares)
+            order_result = await self.client.place_market_order(
+                token_id=token_id,
+                side=exit_side,
+                size=shares
+            )
+            
+            if order_result or self.client.config.DRY_RUN:
+                # 2. Extract fill price (fallback to current market midpoint)
+                fill_price = 0.50 # Dry run default
+                if isinstance(order_result, dict) and order_result.get("price"):
+                    fill_price = float(order_result["price"])
+                else:
+                    # Fallback to book price
+                    fill_price = await self.client.get_real_market_price(token_id) or 0.0
+
+                # 3. Record the exit in PnL tracker
+                self.pnl_tracker.record_exit(trade_id, fill_price, reason=reason)
+                logger.info(f"✅ [Swarm] Liquidated {trade_id} successfully.")
+                
+                if self.notifier and not self.client.config.DRY_RUN:
+                    await self.notifier.notify_trade(
+                        side=f"EXIT ({exit_side})",
+                        asset=token_id[:10],
+                        price=fill_price,
+                        size=shares,
+                        profit=0.0, # Will be calculated by PnLTracker
+                        reasoning=f"AUTO-LIQUIDATION: {reason}",
+                        strategy="SwarmAuditor"
+                    )
+                return True
+            else:
+                logger.error(f"❌ [Swarm] Rapid liquidation FAILED for {trade_id}")
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ [Swarm] Liquidation CRASH for {trade_id}: {e}", exc_info=True)
+            return False
+
+    async def handle_audit(self, text):
+        """Manually trigger a thesis re-evaluation audit"""
+        if not self._check_mode_match(text): return
+        
+        await self.notifier.send_message("🔎 *Manual Audit Initiated*... Auditing all active positions.")
+        
+        try:
+            if not self.revaluation_engine:
+                await self.notifier.send_message("⚠️ Revaluation Engine not initialized.")
+                return
+                
+            flags = await self.revaluation_engine.reevaluate_all()
+            
+            if not flags:
+                await self.notifier.send_message("✅ Audit Complete: All positions confirmed valid.")
+                return
+                
+            for flag in flags:
+                action = flag.get("verdict", "CONTINUE")
+                trade_id = flag.get("trade_id")
+                reason = flag.get("reasoning")
+                
+                msg = f"🔎 *Audit Verdict*: `{trade_id}`\nAction: *{action}*\nReason: {reason}"
+                await self.notifier.send_message(msg)
+                
+                if action == "EXIT":
+                    success = await self.liquidate_trade(trade_id, reason=f"Manual Audit: {reason[:100]}")
+                    if success:
+                        await self.notifier.send_message(f"🔥 Auto-Liquidation Executed for `{trade_id}`")
+                    else:
+                        await self.notifier.send_message(f"❌ Auto-Liquidation Failed for `{trade_id}`")
+        except Exception as e:
+            logger.error(f"Manual audit failed: {e}")
+            await self.notifier.send_message(f"❌ Audit Error: {e}")
+
     async def _shutdown_agents(self):
         """Invoke shutdown/close on all sub-components"""
         async def _close_component(comp, name):
@@ -1313,6 +1496,7 @@ class SwarmSystem:
         await _close_component(self.arb_agent, "PureArb")
         await _close_component(self.trend_agent, "TrendFollower")
         await _close_component(self.liquidity_sniper, "LiquiditySniper")
+        await _close_component(self.spread_scalper, "SpreadScalper")
         await _close_component(self.health_monitor, "HealthMonitor")
 
         # 🧠 Close Hive Mind / SignalBus
@@ -1365,20 +1549,23 @@ async def main(args):
         await system.shutdown()
 
 if __name__ == "__main__":
-    # 🔒 Singleton Lock: Prevent multiple instances
-    lock_file = open("/tmp/swarm.lock", "w")
-    try:
-        fcntl.lockf(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except IOError:
-        print("❌ Error: Another instance of SwarmSystem is already running!")
-        sys.exit(1)
-
     import argparse
     parser = argparse.ArgumentParser(description="Hive Mind Swarm System")
     parser.add_argument("--dry-run", action="store_true", help="Run in paper trading mode")
     parser.add_argument("--ui", action="store_true", help="Launch TUI Dashboard")
     parser.add_argument("--json-logs", action="store_true", help="Enable JSON logging output")
     args = parser.parse_args()
+
+    # 🛡️ Singleton Lock (Phase 25): Mode-specific instance protection
+    lock_name = "swarm_test.lock" if args.dry_run else "swarm_live.lock"
+    lock_path = os.path.join("/tmp", lock_name)
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.lockf(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        mode_str = "DRY RUN" if args.dry_run else "LIVE"
+        print(f"❌ Error: Another instance of SwarmSystem ({mode_str}) is already running!")
+        sys.exit(1)
 
     try:
         import asyncio

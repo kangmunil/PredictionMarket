@@ -130,7 +130,8 @@ class MarketMatcher:
         news_text: str,
         min_volume: float = 10.0,
         max_results: int = 20,
-        override_keywords: Optional[List[str]] = None
+        override_keywords: Optional[List[str]] = None,
+        max_oi: Optional[float] = None
     ) -> List[Dict]:
         """
         Find Polymarket markets matching news.
@@ -167,7 +168,7 @@ class MarketMatcher:
         logger.debug(f"Extracted keywords: {keywords}")
 
         # Search markets
-        markets = await self._search_markets(keywords, min_volume)
+        markets = await self._search_markets(keywords, min_volume, max_oi=max_oi)
         for market in markets:
             market_registry.register_market(market)
 
@@ -216,7 +217,8 @@ class MarketMatcher:
     async def _search_markets(
         self,
         keywords: List[str],
-        min_volume: float
+        min_volume: float,
+        max_oi: Optional[float] = None
     ) -> List[Dict]:
         """
         Hyper-relaxed search for news trading.
@@ -231,11 +233,11 @@ class MarketMatcher:
                 search_queries.update(self.TOPIC_MAPPING[kw_l])
 
         if await self._maybe_init_mcp():
-            markets = await self._search_markets_via_mcp(search_queries, min_volume)
+            markets = await self._search_markets_via_mcp(search_queries, min_volume, max_oi=max_oi)
             if markets is not None:
                 return markets
 
-        return await self._search_markets_via_gamma(search_queries, min_volume)
+        return await self._search_markets_via_gamma(search_queries, min_volume, max_oi=max_oi)
 
     async def _maybe_init_mcp(self) -> bool:
         if not self._mcp_enabled:
@@ -253,13 +255,17 @@ class MarketMatcher:
             return False
         return True
 
-    async def _search_markets_via_gamma(self, search_queries: set, min_volume: float) -> List[Dict]:
+    async def _search_markets_via_gamma(self, search_queries: set, min_volume: float, max_oi: Optional[float] = None) -> List[Dict]:
         url = f"{self.gamma_api_url}/markets"
 
         async def fetch_query(q):
             # Use halved batch size for sub-queries
             sub_limit = self.config.DISCOVERY_BATCH_SIZE // 2
             params = {"active": "true", "closed": "false", "limit": sub_limit, "query": q}
+            
+            # Phase 9: Open Interest filtering at API layer if supported (hypothetically)
+            # Gamma API might not support OI filter in 'markets' endpoint params directly,
+            # so we'll likely need to filter the results.
             try:
                 loop = asyncio.get_event_loop()
                 resp = await loop.run_in_executor(None, lambda: requests.get(url, params=params, timeout=10))
@@ -274,11 +280,17 @@ class MarketMatcher:
         for market_list in results:
             if isinstance(market_list, dict):
                 market_list = market_list.get("data", [])
-            for market in market_list or []:
-                m_id = market.get("condition_id") or market.get("id")
-                if not m_id or m_id in unique_markets:
-                    continue
                 try:
+                    # Phase 9: OI/Volume Gating
+                    vol = float(market.get("volume", 0))
+                    if vol < min_volume:
+                        continue
+                    
+                    if max_oi is not None:
+                        oi = float(market.get("openInterest", 0))
+                        if oi > max_oi:
+                            continue
+
                     clob_ids = market.get("clobTokenIds", [])
                     if isinstance(clob_ids, str):
                         clob_ids = json.loads(clob_ids)
@@ -296,7 +308,7 @@ class MarketMatcher:
             return filtered
         return markets
 
-    async def _search_markets_via_mcp(self, queries: set, min_volume: float) -> Optional[List[Dict]]:
+    async def _search_markets_via_mcp(self, queries: set, min_volume: float, max_oi: Optional[float] = None) -> Optional[List[Dict]]:
         assert self._mcp_client
         tasks = []
         for q in list(queries)[:5]:
@@ -325,6 +337,16 @@ class MarketMatcher:
                     volume = 0
                 if volume < min_volume:
                     continue
+
+                # Phase 9: OI Gating
+                if max_oi is not None:
+                    try:
+                        oi = float(market.get("openInterest", 0))
+                        if oi > max_oi:
+                            continue
+                    except:
+                        pass
+
                 unique_markets[m_id] = market
                 market_registry.register_market(market)
                 market_registry.register_market(market)

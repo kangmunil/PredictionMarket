@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 
 from .news_client import TreeNewsStreamClient
+from src.core.clob_client import MarketDelistedError
 
 class OptimizedNewsScalper:
     """
@@ -417,7 +418,8 @@ class OptimizedNewsScalper:
             markets = await self.market_matcher.find_matching_markets(
                 keyword,
                 min_volume=10.0,  # Low threshold for caching
-                max_results=20
+                max_results=20,
+                max_oi=50000.0 # Phase 9: Micro-cap focused cache
             )
             if markets:
                 self.preloaded_markets[keyword] = markets
@@ -848,7 +850,8 @@ class OptimizedNewsScalper:
             news_text,
             min_volume=self.min_market_volume,
             max_results=10, # Request more to allow for filtering
-            override_keywords=override_keywords
+            override_keywords=override_keywords,
+            max_oi=50000.0 # Phase 9: AI edge focus
         )
 
         # Apply duration filter
@@ -904,7 +907,8 @@ class OptimizedNewsScalper:
                 markets = await self.market_matcher.find_matching_markets(
                     query, 
                     min_volume=1000, 
-                    max_results=5
+                    max_results=5,
+                    max_oi=50000.0 # Phase 9: AI focus
                 )
                 if markets:
                      # Filter for currently relevant (active)
@@ -1128,16 +1132,27 @@ class OptimizedNewsScalper:
                     category="crypto", 
                     volatility_score=0.1,
                     confidence=sentiment.get("confidence", 1.0)
-            )
+                )
             
             # Apply Specialist Multiplier
             position_size = position_size * size_multiplier
             
-            # Additional logic for scaling in...
             # Enforce minimum order size (Polymarket requirement)
             if position_size > 0 and position_size < 5.0 and not self.dry_run:
                 logger.info(f"   ⚠️ Enforcing minimum order size: ${position_size:.2f} -> $5.00")
                 position_size = 5.0
+
+            # 💰 BUDGET MANAGER CHECK (Strict Tier 2 Enforcement)
+            if self.budget_manager:
+                allocation_id = await self.budget_manager.request_allocation(
+                    strategy="news_scalper",
+                    amount=Decimal(str(position_size)),
+                    priority="normal"
+                )
+                if not allocation_id:
+                    logger.warning(f"   🛑 Budget Allocation Denied for ${position_size:.2f} (Tier 2 Limit Exceeded)")
+                    return
+                allocation_amount = Decimal(str(position_size))
 
             # 🛡️ MAX EXPOSURE CHECK (Moved here to ensure position_size is valid)
             # Calculate Total Equity (Cash + Positions)
@@ -1409,18 +1424,35 @@ class OptimizedNewsScalper:
                     )
                     # 🚀 PnL Tracker 기록 추가
                     if hasattr(self.swarm_system, 'pnl_tracker'):
+                        thesis = {
+                            "entry_reason": sentiment.get("reasoning", "High impact news detected"),
+                            "entry_conditions": {
+                                "sentiment_score": float(sentiment["score"]),
+                                "model": sentiment.get("model", "FinBERT"),
+                                "news_title": article.get("title", "")[:100]
+                            },
+                            "exit_hypotheses": [
+                                {"type": "TIME_DECAY", "description": "News alpha exhaustion"},
+                                {"type": "REVERSAL_NEWS", "description": "Opposing news detected"}
+                            ],
+                            "expected_window": "15m - 2h"
+                        }
                         entry_tid = self.swarm_system.pnl_tracker.record_entry(
                             strategy="news_scalper",
                             token_id=token_id,
                             side=side,
                             price=entry_price,
                             size=position_size,
-                            metadata={"group": (getattr(self, 'market_group', 'DEFAULT') or 'DEFAULT').upper()}
+                            metadata={
+                                "group": (getattr(self, 'market_group', 'DEFAULT') or 'DEFAULT').upper(),
+                                "news_title": article.get("title", "")[:50],
+                                "thesis": thesis
+                            }
                         )
                         self.positions[token_id]["pnl_tids"].append(entry_tid)
 
                     # 📱 TELEGRAM NOTIFICATION (Task 10)
-                    if hasattr(self.swarm_system, 'notifier') and self.swarm_system.notifier.enabled:
+                    if hasattr(self.swarm_system, 'notifier') and self.swarm_system.notifier.enabled and not self.dry_run:
                         asyncio.create_task(self.swarm_system.notifier.notify_trade(
                             side=side,
                             asset=market.get("question", token_id[:15]),
@@ -1515,18 +1547,35 @@ class OptimizedNewsScalper:
                     
                     # 🚀 PnL Tracker 기록 추가 (Live)
                     if self.swarm_system and hasattr(self.swarm_system, 'pnl_tracker'):
+                        thesis = {
+                            "entry_reason": sentiment.get("reasoning", "High impact news detected"),
+                            "entry_conditions": {
+                                "sentiment_score": float(sentiment["score"]),
+                                "model": sentiment.get("model", "FinBERT"),
+                                "news_title": article.get("title", "")[:100]
+                            },
+                            "exit_hypotheses": [
+                                {"type": "TIME_DECAY", "description": "News alpha exhaustion"},
+                                {"type": "REVERSAL_NEWS", "description": "Opposing news detected"}
+                            ],
+                            "expected_window": "15m - 2h"
+                        }
                         entry_tid = self.swarm_system.pnl_tracker.record_entry(
                             strategy="news_scalper",
                             token_id=token_id,
                             side=side,
                             price=entry_price,
                             size=position_size,
-                            metadata={"group": (market_group or "DEFAULT").upper()}
+                            metadata={
+                                "group": (market_group or "DEFAULT").upper(),
+                                "news_title": article.get("title", "")[:50],
+                                "thesis": thesis
+                            }
                         )
                         self.positions[token_id]["pnl_tids"].append(entry_tid)
 
                     # 📱 TELEGRAM NOTIFICATION (Task 10)
-                    if hasattr(self.swarm_system, 'notifier') and self.swarm_system.notifier.enabled:
+                    if hasattr(self.swarm_system, 'notifier') and self.swarm_system.notifier.enabled and not self.dry_run:
                         asyncio.create_task(self.swarm_system.notifier.notify_trade(
                             side=side,
                             asset=market.get("question", token_id[:15]),
@@ -1788,13 +1837,27 @@ class OptimizedNewsScalper:
         if self.swarm_system:
             self.swarm_system.add_trade_record("SCALE", token_id, entry_price, addition_size)
             if hasattr(self.swarm_system, 'pnl_tracker'):
+                thesis = {
+                    "entry_reason": f"Scale-in: {sentiment.get('reasoning', 'Continued strong sentiment')}",
+                    "entry_conditions": {
+                        "sentiment_score": float(sentiment["score"]),
+                        "added_size": addition_size
+                    },
+                    "exit_hypotheses": [
+                        {"type": "CONVERGENCE", "description": "Price reached target range"}
+                    ],
+                    "expected_window": "Short-term momentum"
+                }
                 scale_tid = self.swarm_system.pnl_tracker.record_entry(
                     strategy="news_scalper_scale",
                     token_id=token_id,
                     side=position["side"],
                     price=entry_price,
                     size=addition_size,
-                    metadata={"group": (position.get("market_group") or "DEFAULT").upper()}
+                    metadata={
+                        "group": (position.get("market_group") or "DEFAULT").upper(),
+                        "thesis": thesis
+                    }
                 )
                 position.setdefault("pnl_tids", []).append(scale_tid)
 
@@ -2002,9 +2065,13 @@ class OptimizedNewsScalper:
             # Last resort: assume 50%
             return 0.5
 
+        except MarketDelistedError as e:
+            self.dead_tokens.add(token_id)
+            logger.info(f"🪦 Market {token_id[:15]}... is delisted/not found on CLOB. Adding to dead tokens. ({e})")
+            return None
         except Exception as e:
             error_msg = str(e).lower()
-            # Cache dead/delisted tokens to prevent repeated 404s
+            # Cache dead/delisted tokens to prevent repeated 404s (Fallback)
             if "dead/delisted" in error_msg or "404" in error_msg or "no orderbook" in error_msg:
                 self.dead_tokens.add(token_id)
                 logger.info(f"🪦 Token {token_id[:15]}... added to dead token cache (no more queries).")

@@ -149,18 +149,47 @@ async def get_hot_signals(min_sentiment: float = 0.5):
     }
 
 async def start_dashboard_api(swarm_system, port: int = 8080):
-    """Start the dashboard API server"""
+    """Start the dashboard API server with port fallback"""
     set_swarm_system(swarm_system)
     
-    config = uvicorn.Config(
-        app,
-        host="0.0.0.0",
-        port=port,
-        log_level="warning"
-    )
-    server = uvicorn.Server(config)
-    logger.info(f"📊 Dashboard API starting on http://0.0.0.0:{port}")
-    await server.serve()
+    max_retries = 10
+    current_port = port
+    
+    for i in range(max_retries):
+        try:
+            config = uvicorn.Config(
+                app,
+                host="0.0.0.0",
+                port=current_port,
+                log_level="warning"
+            )
+            server = uvicorn.Server(config)
+            
+            # Monkey-patch startup to avoid hard crash if bind fails immediately?
+            # Actually uvicorn raises on startup.
+            logger.info(f"📊 Dashboard API attempting to bind on http://0.0.0.0:{current_port}")
+            await server.serve()
+            break # If successful (though serve blocks), we are good.
+            
+        except (OSError, SystemExit) as e:
+            # Uvicorn might raise SystemExit or OSError on bind fail
+            if i < max_retries - 1:
+                logger.warning(f"⚠️ Port {current_port} busy, trying {current_port + 1}...")
+                current_port += 1
+            else:
+                logger.error(f"❌ Could not bind any port for Dashboard API after {max_retries} attempts.")
+                # Non-critical failure: Allow swarm to continue without dashboard
+                return
+        except Exception as e:
+             # Check for the specific Errno 48 in string if exception type is generic
+             if "address already in use" in str(e).lower() or "[errno 48]" in str(e).lower():
+                 if i < max_retries - 1:
+                    logger.warning(f"⚠️ Port {current_port} busy (exc), trying {current_port + 1}...")
+                    current_port += 1
+                    continue
+             
+             logger.error(f"❌ Dashboard API failed: {e}")
+             return
 
 
 if __name__ == "__main__":

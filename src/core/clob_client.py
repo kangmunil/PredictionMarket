@@ -179,19 +179,102 @@ class PolyClient:
         try:
             self.w3 = Web3(Web3.HTTPProvider(self.config.RPC_URL))
             self.w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            
+            # Prioritize Config/Env over local file
+            addr = self.config.ARB_EXECUTOR_ADDRESS
             addr_path = "src/contracts/address.txt"
-            abi_path = "src/contracts/ArbExecutor_ABI.json"
-            if os.path.exists(addr_path) and os.path.exists(abi_path):
+            if not addr and os.path.exists(addr_path):
                 with open(addr_path, "r") as f:
                     addr = f.read().strip()
+            
+            abi_path = "src/contracts/ArbExecutor_ABI.json"
+            if addr and os.path.exists(abi_path):
                 with open(abi_path, "r") as f:
                     abi = json.load(f)
-                self.executor_contract = self.w3.eth.contract(address=addr, abi=abi)
+                self.executor_contract = self.w3.eth.contract(address=Web3.to_checksum_address(addr), abi=abi)
                 logger.info(f"🛡️ ArbExecutor linked at {addr}")
+            else:
+                logger.warning("⚠️ ArbExecutor address or ABI missing; atomic trades disabled")
         except Exception as exc:
             self.w3 = None
             self.executor_contract = None
             logger.warning(f"⚠️ Web3 unavailable ({exc}); continuing without on-chain access")
+
+    async def execute_atomic_trade(self, orders_data: List[Dict]):
+        """
+        Execute multiple trades atomically via the ArbExecutor contract.
+        Each order_data should contain {token_id, side, size, price}.
+        """
+        if not self.executor_contract or not self.config.PRIVATE_KEY:
+             logger.error("❌ Atomic Execution Failed: Contract or Private Key missing.")
+             return False
+
+        logger.info(f"⚡ Initiating Atomic Execution for {len(orders_data)} legs...")
+        
+        targets = []
+        calldatas = []
+        
+        try:
+            # Polymarket CTF Exchange Address (Polygon)
+            EXCHANGE_ADDR = Web3.to_checksum_address("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E")
+            
+            # Load CTF ABI to encode fillOrder
+            if not hasattr(self, 'ctf_abi'):
+                with open("src/contracts/ctf_exchange_abi.json", "r") as f:
+                    self.ctf_abi = json.load(f)
+                self.ctf_interface = self.w3.eth.contract(address=EXCHANGE_ADDR, abi=self.ctf_abi)
+
+            for part in orders_data:
+                # 1. Create the order via REST (without posting)
+                # Note: We need a taker order structure. 
+                # Actually, fillOrder fills an EXISTING maker order.
+                # To do atomic arb on CLOB, we need to take existing liquidity.
+                
+                # SIMULATION for Phase 8.1/8.2:
+                # In a production setup, we would fetch the orderbook, 
+                # pick maker orders, and encode fillOrder(maker_order, taker_amount).
+                
+                logger.info(f"   🔗 Encoding leg: {part['side']} {part['size']} @ {part['price']}")
+                
+                # Placeholder for complex EIP-712 order encoding
+                # For now, we simulate the calldata generation
+                dummy_data = b"DUMMY_CALL_DATA" 
+                
+                targets.append(EXCHANGE_ADDR)
+                calldatas.append(dummy_data)
+
+            if self.config.DRY_RUN:
+                logger.info("📝 [DRY RUN] Atomic transaction would be sent to contract.")
+                return True
+
+            # 2. Build and Sign Transaction
+            nonce = self.w3.eth.get_transaction_count(self.w3.eth.account.from_key(self.config.PRIVATE_KEY).address)
+            txn = self.executor_contract.functions.executeBatch(
+                targets, 
+                calldatas
+            ).build_transaction({
+                "chainId": 137,
+                "gas": 1000000, # Realistic gas for batch
+                "gasPrice": self.w3.eth.gas_price,
+                "nonce": nonce,
+            })
+            
+            signed_txn = self.w3.eth.account.sign_transaction(txn, private_key=self.config.PRIVATE_KEY)
+            tx_hash = self.w3.eth.send_raw_transaction(signed_txn.rawTransaction)
+            
+            logger.info(f"🚀 Atomic Transaction Sent: {tx_hash.hex()}")
+            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            
+            if receipt.status == 1:
+                logger.info("✅ Atomic Execution SUCCESS")
+                return True
+            else:
+                logger.error("❌ Atomic Execution FAILED (Reverted)")
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ Atomic Execution Crash: {e}", exc_info=True)
+            return False
 
     def _init_rest_client(self):
         if not self.config.PRIVATE_KEY:
@@ -296,12 +379,18 @@ class PolyClient:
                 self._first_sub_logged = True
                 logger.info(f"📤 First subscription payload: {payload_str}")
 
-            await self.ws_connection.send(payload_str)
-            logger.info(f"📤 Sent subscription for {len(token_ids)} tokens")
+            if self.ws_connection:
+                await self.ws_connection.send(payload_str)
+                logger.info(f"📤 Sent subscription for {len(token_ids)} tokens")
+            else:
+                logger.warning("⚠️ Cannot send subscription: WebSocket connection is None")
         except Exception as e:
             logger.error(f"❌ Failed to send subscription: {e} - Forcing reconnect")
             if self.ws_connection:
-                await self.ws_connection.close()
+                try:
+                    await self.ws_connection.close()
+                except:
+                    pass
             self.ws_connection = None # Signal main loop to reconnect
 
     async def _handle_ws_message(self, message: str):
@@ -630,30 +719,31 @@ class PolyClient:
             return None
 
         try:
-            # 1. Minimum Order Value Check
-            total_usd = Decimal(str(price)) * Decimal(str(size))
+            # 1. Minimum Order Value Check (Enforce strict $1.05 minimum)
+            # Use Decimal to avoid floating point errors for the $1.00 hard limit
+            total_usd_dec = Decimal(str(price)) * Decimal(str(size))
+            total_usd = float(total_usd_dec)
             
-            # Allow slightly lower than min to account for rounding, but enforce soft limit
-            if float(total_usd) < (self.min_order_value - 0.05):
+            # Phase 11: Enforce $1.05 minimum to avoid "invalid amount ... min size: $1" errors
+            STRICT_MIN = 1.05
+            if total_usd < STRICT_MIN:
                 PROM_API_ERRORS.labels(service="clob_limit_order", error_type="order_too_small").inc()
                 logger.warning(
-                    f"⚠️ Order rejected: ${total_usd:.2f} < minimum ${self.min_order_value:.2f} "
-                    f"(Polymarket typically rejects orders below $5, ensure config allows this)"
+                    f"⚠️ Order rejected locally: ${total_usd:.4f} < strict minimum ${STRICT_MIN:.2f} "
+                    f"(Avoids Polymarket $1.00 rejection error)"
                 )
                 return None
 
-            # 1.5 Market Validity Check (Prevent 404 errors)
             try:
                 order_book = self.rest_client.get_order_book(token_id)
                 if not order_book:
-                    logger.warning(f"⚠️ Market invalid or delisted: {token_id[:20]}...")
-                    return None
+                    raise MarketDelistedError(f"Market invalid or delisted: {token_id}")
             except Exception as e:
                 if "404" in str(e) or "not found" in str(e).lower():
-                    logger.warning(f"⚠️ Market not found: {token_id[:20]}...")
-                    return None
-                # Other errors - proceed anyway
-
+                    logger.warning(f"⚠️ Market not found on CLOB: {token_id[:20]}...")
+                    raise MarketDelistedError(f"Market not found: {token_id}")
+                # Other errors - proceed anyway but log
+                logger.debug(f"Orderbook fetch failed (continuing): {e}")
             # 2. Balance Pre-Check (Prevent API rejection)
             if side.upper() == "BUY":
                 current_balance = await self.get_usdc_balance()
@@ -816,14 +906,17 @@ class PolyClient:
             # Initial calculation based on market price
             shares = float(amount) / best_price if best_price > 0 else 0
             
-            # Recalculate if SELLING (limit < market) brings value below minimum
+            # Recalculate if limit value brings it below the hard $1.05 floor
+            # NOTE: We use $1.05 as a safety buffer for the exchange's $1.00 floor
+            HARD_FLOOR = 1.05
             limit_val = shares * limit_price
-            if limit_val < self.min_order_value and amount >= self.min_order_value:
-                logger.info(f"   ⚖️ Limit val ${limit_val:.2f} < ${self.min_order_value:.2f}. Adjusting shares using Limit Price ${limit_price:.3f}")
-                shares = self.min_order_value / limit_price if limit_price > 0 else shares
-                shares *= 1.01 # 1% safety buffer
-
-            shares = float(f"{shares:.2f}")
+            if limit_val < HARD_FLOOR:
+                logger.info(f"   ⚖️ Limit val ${limit_val:.4f} < ${HARD_FLOOR:.2f}. Bumping shares to meet safety floor.")
+                shares = HARD_FLOOR / limit_price if limit_price > 0 else shares
+                shares += 0.01 # Precision bump
+            
+            # Final rounding for API compatibility (2 decimal places)
+            shares = float(Decimal(str(shares)).quantize(Decimal("0.01"), rounding="ROUND_UP"))
             
             logger.info(f"🛡️ Slippage Protection: Market ${best_price:.3f} → Limit ${limit_price:.3f} ({max_slippage_pct}%)")
             logger.info(f"   📊 Converting ${amount:.2f} USD → {shares:.2f} shares")

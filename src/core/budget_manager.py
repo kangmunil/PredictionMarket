@@ -93,15 +93,30 @@ class BudgetManager:
             if available_funds < 0:
                 available_funds = Decimal("0")
 
-            # 2. Weighted Cap Check (Task 11)
+            # 2. Tiered Allocation & Strategy Caps
+            # TIER 1: Structural Strategies (High Limits)
+            # TIER 2: Predictive Strategies (Strict Micro-Limits)
+            
+            # Default to TIER 2 (Safe by default)
+            tier = "TIER_2"
+            if strategy in ["arbhunter", "neg_risk_arb", "latency_sniper"]:
+                tier = "TIER_1"
+            elif strategy in ["news_scalper", "statarb", "elitemimic"]:
+                tier = "TIER_2"
+            
+            # Tier Limits
+            if tier == "TIER_2":
+                MICRO_CAP = Decimal("5.0")
+                if amount > MICRO_CAP:
+                    logger.warning(f"🛑 [Tier 2 Restriction] {strategy} requested ${amount:.2f} > ${MICRO_CAP:.2f} limit. Denied.")
+                    return None
+            
+            # Weighted Cap Check (Task 11) for TIER 1
             strategy_weight = self.strategy_weights.get(strategy, Decimal("0.1"))
-            # For News Scalper, we might call it 'news_scalper' or 'arbhunter' (legacy)
-            if strategy == "arbhunter": strategy_weight = self.strategy_weights.get("news_scalper")
+            if strategy == "arbhunter": strategy_weight = self.strategy_weights.get("news_scalper") # Legacy mapping
             
             strategy_cap = self.total_capital * strategy_weight
-            
-            # Calculate current usage for this strategy
-            current_usage = sum(amt for amt, s in self.allocations.values() if s == strategy or (s == "arbhunter" and strategy == "news_scalper"))
+            current_usage = sum(amt for amt, s in self.allocations.values() if s == strategy)
             
             if current_usage + amount > strategy_cap and priority != "high":
                 logger.warning(f"⚠️  {strategy} cap reached (${strategy_cap:.2f}). Denying normal priority request.")
