@@ -145,7 +145,6 @@ class NewsAggregator:
         return articles
 
     async def _fetch_from_newsapi(self, keywords: List[str], limit: int) -> List[Dict]:
-        # ... (same as original newsapi fetch) ...
         try:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(
@@ -155,11 +154,13 @@ class NewsAggregator:
         except Exception as e:
             error_text = str(e).lower()
             if any(keyword in error_text for keyword in ("429", "too many requests", "rate limit")):
-                backoff_seconds = 60
-                self.newsapi_cooldown_until = time.time() + backoff_seconds
+                # Exponential backoff: Start at 60s, increase if repeated
+                current_backoff = getattr(self, '_newsapi_backoff', 60)
+                self.newsapi_cooldown_until = time.time() + current_backoff
+                self._newsapi_backoff = min(current_backoff * 2, 3600) # Max 1 hour
                 logger.warning(
-                    "🛑 NewsAPI rate limit detected (via exception). Backing off for %ss",
-                    backoff_seconds,
+                    "🛑 NewsAPI rate limit detected. Backing off for %ss. Next backoff: %ss",
+                    current_backoff, self._newsapi_backoff
                 )
             else:
                 logger.error(f"NewsAPI fetch error: {e}")
@@ -237,7 +238,7 @@ async def test_aggregator():
 
     stats = aggregator.get_stats()
     print(f"\n📊 Aggregator Stats:")
-    print(f"   Sources enabled: {stats['sources_enabled']}")
+    print(f"   Sources enabled: {len(stats['sources'])}")
     print(f"   Sources: {', '.join(stats['sources'])}")
 
     # Fetch Bitcoin news

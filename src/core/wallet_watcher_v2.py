@@ -281,6 +281,44 @@ class EnhancedWalletWatcher:
                         # Process using contractual decoding
                         event_data = self.ctf_contract.events.LogFill().process_log(log)
                         await self._process_whale_event(whale, event_data, log)
+                    else:
+                        # 🔎 DYNAMIC DISCOVERY: Check if this is a "Hidden Whale"
+                        event_data = self.ctf_contract.events.LogFill().process_log(log)
+                        args = event_data.get('args', {})
+                        
+                        # Check value (Approximate USDC part)
+                        m_amt = float(args.get('makerAmount', 0))
+                        t_amt = float(args.get('takerAmount', 0))
+                        
+                        # If either side is > $5,000 (USDC has 6 decimals, so 5000 * 1e6 = 5e9)
+                        # We don't know which is USDC easily without token check, 
+                        # but 5000 tokens (shares) is also significant if price is high.
+                        # Let's use a raw threshold of 5,000*1e6 = 5,000,000,000 for USDC checks
+                        # Or just strictly check for very large numbers.
+                        
+                        is_big = False
+                        
+                        # Check for USDC-like values (> $5000)
+                        # 5000 USDC = 5,000,000,000 units
+                        threshold = 5_000_000_000 
+                        
+                        if (t_amt > threshold and t_amt < 1e14) or (m_amt > threshold and m_amt < 1e14):
+                             # Likely USDC side (shares are usually 1e18, so >1e14 typically)
+                             is_big = True
+                             
+                        if is_big:
+                            logger.info(f"🐋 DISCOVERED NEW WHALE: {taker_addr} (Trade Val > $5k)")
+                            # Add to tracking temporarily
+                            new_whale = {
+                                "address": taker_addr,
+                                "username": f"Discovered-{taker_addr[:6]}",
+                                "tier": "discovered"
+                            }
+                            whale_map[taker_addr] = new_whale
+                            self.targets.append(new_whale)
+                            
+                            # Process this event immediately
+                            await self._process_whale_event(new_whale, event_data, log)
                 except Exception as e:
                     logger.debug(f"Failed to process log {log['transactionHash'].hex()}: {e}")
 

@@ -93,20 +93,20 @@ class BudgetManager:
             if available_funds < 0:
                 available_funds = Decimal("0")
 
-            # 2. Tiered Allocation & Strategy Caps
+            # Tiered Allocation & Strategy Caps
             # TIER 1: Structural Strategies (High Limits)
             # TIER 2: Predictive Strategies (Strict Micro-Limits)
             
             # Default to TIER 2 (Safe by default)
             tier = "TIER_2"
-            if strategy in ["arbhunter", "neg_risk_arb", "latency_sniper"]:
+            if strategy in ["arbhunter", "neg_risk_arb", "latency_sniper", "trend_follower", "spread_scalper"]:
                 tier = "TIER_1"
             elif strategy in ["news_scalper", "statarb", "elitemimic"]:
                 tier = "TIER_2"
             
             # Tier Limits
             if tier == "TIER_2":
-                MICRO_CAP = Decimal("5.0")
+                MICRO_CAP = Decimal("25.0")
                 if amount > MICRO_CAP:
                     logger.warning(f"🛑 [Tier 2 Restriction] {strategy} requested ${amount:.2f} > ${MICRO_CAP:.2f} limit. Denied.")
                     return None

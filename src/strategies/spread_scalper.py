@@ -152,28 +152,26 @@ class SpreadScalper:
             ob = await self.client.get_order_book(token_id)
             if not ob: continue
             
-            best_bid = float(ob.bids[0].price) if ob.bids else 0
-            best_ask = float(ob.asks[0].price) if ob.asks else 0
+            best_bid_price, best_bid_size = ob.get_best_bid()
+            best_ask_price, best_ask_size = ob.get_best_ask()
             
-            if best_bid == 0 or best_ask == 0: continue
+            if best_bid_price == 0 or best_ask_price == 0: continue
             
-            spread = (best_ask - best_bid) / best_bid
+            spread = (best_ask_price - best_bid_price) / best_bid_price
             
             # 🛡️ Spread Guard
             if spread < self.min_spread or spread > self.max_spread:
                 continue
                 
-            # 🛡️ Depth Guard (Check top 3 levels roughly)
-            # Simplified: Check best bid size
-            bid_depth = float(ob.bids[0].size) * best_bid
+            # 🛡️ Depth Guard (Check top level)
+            bid_depth = best_bid_size * best_bid_price
             if bid_depth < self.min_depth:
                 continue
                 
             # Opportunity Found: Place Maker Order at Best Bid
-            # (In a real strategy, we'd place Best Bid + 1 tick, but let's match Best Bid to join queue)
             logger.info(f"🎯 Spread Opp: {market.get('question')[:20]} | Spread: {spread*100:.2f}% | Depth: ${bid_depth:.0f}")
             
-            await self._place_maker_buy(token_id, best_bid)
+            await self._place_maker_buy(token_id, best_bid_price)
 
     async def _place_maker_buy(self, token_id: str, price: float):
         """Place a limit buy order"""

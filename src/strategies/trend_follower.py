@@ -56,7 +56,8 @@ class SmartTrendFollower:
         self.min_volume = 3000.0 # Lowered from 5000 to catch emerging trends
         self.scan_interval = 300 # 5 minutes
         self.min_confidence = 0.75
-        self.max_position = 20.0 # Small aggressive bets
+        self.min_roi = 0.02 # 2% Minimum ROI to scalp
+        self.min_roi = 0.02 # 2% Minimum ROI to scalp
         
         # Position Management
         self.state_file = "data/trend_follower_state.json"
@@ -120,10 +121,10 @@ class SmartTrendFollower:
                 
                 if current_price is None:
                     # Fallback to orderbook bid/ask if MCP/REST fails
-                    bid_price, _ = self.client.get_best_bid(token_id)
-                    current_price = bid_price
+                    current_price = self.client.get_best_bid_price(token_id)
                     
                 if not current_price or current_price <= 0:
+                    logger.debug(f"⚠️ No price available for {token_id}, skipping management.")
                     continue
             except MarketDelistedError as e:
                 logger.warning(f"❌ Market Delisted/Invalid: {token_id}. Auto-removing position. ({e})")
@@ -467,43 +468,48 @@ class SmartTrendFollower:
         
         logger.info(f"   ⚡ Found {len(active_markets)} potential scalp markets (including 15m specialists)")
         
-        for market in active_markets:
-            logger.debug(f"   👉 Checking candidate: {market.get('question')[:40]}...")
+        tasks = []
+        # Chunk the markets to avoid rate limits (20 at a time)
+        chunk_size = 20
+        for i in range(0, len(active_markets), chunk_size):
+            chunk = active_markets[i:i + chunk_size]
+            batch_tasks = [self._analyze_market_safe(market) for market in chunk]
+            await asyncio.gather(*batch_tasks)
+            # Yield to event loop to allow heartbeats
+            await asyncio.sleep(0.1)
+
+    async def _analyze_market_safe(self, market):
+        """Wrapper to catch errors during parallel scan"""
+        try:
+            await self._analyze_scalp_candidate(market)
+        except Exception as e:
+            logger.debug(f"Error scanning {market.get('question', 'unknown')}: {e}")
+
+    async def _analyze_scalp_candidate(self, market):
             condition_id = market.get('condition_id') or market.get('conditionId')
-            logger.debug(f"      🆔 Condition ID: {condition_id}")
-            if not condition_id:
-                logger.warning(f"      ❌ Missing condition_id for {market.get('question')[:20]}")
-                continue
+            if not condition_id: return
                 
             if self._is_cooldown(condition_id):
-                logger.info(f"      ❄️ Cooldown active for {market.get('question')[:20]}...")
-                continue
+                return
                 
             # Get Yes Token ID
             token_id = self._get_yes_token(market)
-            logger.debug(f"      🔑 Token ID: {token_id}")
-            if not token_id: 
-                logger.warning(f"      ⚠️ No 'Yes' token found for {market.get('question')[:30]}")
-                continue
+            if not token_id: return
             
             # 2. Check Price Momentum (Last 30 mins)
             try:
                 # Use History API to get recent price points
-                logger.debug(f"      ⏳ Fetching history for {token_id}...")
                 history, source = await self.history_api.get_history_with_source(
                     condition_id=condition_id, 
                     days=1, 
                     min_points=5,
                     market_data=market
                 )
-                logger.debug(f"      📊 History fetched: {len(history)} points")
                 
                 if len(history) < 5:
-                    logger.info(f"      📉 Insufficient history for {market.get('question')[:20]} ({len(history)} points)")
-                    continue
+                    return
                     
                 # Analyze last few ticks
-                # history is a list of {'price': float, 'timestamp': datetime}
                 current = history[-1]
                 prev = history[-min(len(history), 3)] # 2-3 ticks ago
                 
@@ -511,10 +517,8 @@ class SmartTrendFollower:
                 prev_price = float(prev['price'])
                 
                 # Calculate simple return
-                if prev_price == 0: continue
+                if prev_price == 0: return
                 momentum = (current_price - prev_price) / prev_price
-                
-                logger.debug(f"      📈 {market.get('question')[:30]} Mom: {momentum*100:.2f}% (${current_price})")
                 
                 # Scalp Signal: Strong Breakout (>1% move recently)
                 if momentum > 0.01 and 0.02 < current_price < 0.85: 
@@ -535,7 +539,7 @@ class SmartTrendFollower:
                             'high_water_mark': current_price
                          }
                          self._save_state()
-                         continue
+                         return
 
                      # Execute Scalp
                      # Use aggressive limit (target = current * 1.01)
@@ -565,8 +569,6 @@ class SmartTrendFollower:
                      
                      # Cooldown
                      self.cooldowns[condition_id] = datetime.now()
-                else:
-                    logger.info(f"      🚫 Rejected scalp: {market.get('question')[:30]} | Mom: {momentum*100:.2f}% (req >1.0%), Price: {current_price} (req <0.85)")
                      
             except Exception as e:
                 logger.error(f"Error scanning scalp candidate {token_id}: {e}")

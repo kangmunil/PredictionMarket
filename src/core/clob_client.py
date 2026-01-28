@@ -678,11 +678,44 @@ class PolyClient:
              return self.orderbooks[token_id].get_best_ask()
         return (0.0, 0.0)
 
+    def get_best_bid_price(self, token_id: str) -> float:
+        if token_id in self.orderbooks:
+            price, _ = self.orderbooks[token_id].get_best_bid()
+            if price > 0: return price
+        return 0.0
+
     def get_best_bid(self, token_id: str) -> Tuple[float, float]:
         """Get best bid (price, size)"""
         if token_id in self.orderbooks:
              return self.orderbooks[token_id].get_best_bid()
-        return (0.0, 0.0) # Or fallback to REST if needed
+        return (0.0, 0.0)
+
+    async def get_order_book(self, token_id: str) -> Optional[LocalOrderBook]:
+        """
+        Returns the local order book for a token. 
+        If not subscribed, it will attempt a one-time REST fetch.
+        """
+        book = self.orderbooks.get(token_id)
+        if book and (book.bids or book.asks):
+            return book
+            
+        # REST Fallback if WS not available/subscribed
+        try:
+            url = f"{self.config.HOST}/book?token_id={token_id}"
+            async with self.rest_session.get(url, timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    new_book = LocalOrderBook(token_id)
+                    # Data format: {bids: [{price, size}], asks: [...]}
+                    for b in data.get('bids', []):
+                        new_book.update("BUY", float(b['price']), float(b['size']))
+                    for a in data.get('asks', []):
+                        new_book.update("SELL", float(a['price']), float(a['size']))
+                    return new_book
+        except Exception as e:
+            logger.debug(f"REST book fetch failed for {token_id}: {e}")
+            
+        return None
 
     async def place_market_order(self, token_id: str, side: str, amount: float = 0.0, size: float = 0.0):
         """
